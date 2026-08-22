@@ -106,6 +106,236 @@ func TestModelRequestSchedulesBeforeFileOpenAndReleasesOnCompletion(t *testing.T
 	awaitBlockTransferRequest(t, lowResult).Close()
 }
 
+func TestNetworkPriorityPrototypeEqualPriorityShareThroughModelRequest(t *testing.T) {
+	wrapper, controls := newBlockTransferRequestConfig(t, map[string]int{
+		"gate": 100,
+		"a":    0,
+		"b":    0,
+	})
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	gatePayload := make([]byte, 1024)
+	aPayload := make([]byte, 4*1024)
+	bPayload := make([]byte, 1024)
+	for folder, payload := range map[string][]byte{
+		"gate": gatePayload,
+		"a":    aPayload,
+		"b":    bPayload,
+	} {
+		writeFile(t, controls[folder].filesystem, "payload", payload)
+	}
+
+	gateHash := sha256.Sum256(gatePayload)
+	gate, err := m.Request(device1Conn, &protocol.Request{Folder: "gate", Name: "payload", Size: len(gatePayload), Hash: gateHash[:]})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enqueued := observeEnqueuedBlockTransfers(m.model)
+	results := make(chan namedBlockTransferRequestResult)
+	queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "a", "payload", aPayload, enqueued, results)
+	queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "a", "payload", aPayload, enqueued, results)
+	for range 4 {
+		queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "b", "payload", bPayload, enqueued, results)
+	}
+
+	gate.Close()
+	for _, wantFolder := range []string{"a", "b", "b", "b", "b", "a"} {
+		result := awaitNamedBlockTransferRequest(t, results)
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.folder != wantFolder {
+			result.response.Close()
+			t.Fatalf("Equal-Priority Share admitted folder %q, want %q", result.folder, wantFolder)
+		}
+		result.response.Close()
+	}
+}
+
+func TestNetworkPriorityPrototypeEqualPriorityShareAcrossDevicesThroughModelRequest(t *testing.T) {
+	const blockSize = protocol.MaxBlockSize
+	wrapper, controls := newBlockTransferRequestConfigWithLimits(t, map[string]int{
+		"gate":   100,
+		"shared": 0,
+	}, 2*blockSize/1024, -1, device1, device2)
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	payload := make([]byte, blockSize)
+	hash := sha256.Sum256(payload)
+	for _, control := range controls {
+		writeFile(t, control.filesystem, "payload", payload)
+	}
+	gate1, err := m.Request(device1Conn, &protocol.Request{Folder: "gate", Name: "payload", Size: len(payload), Hash: hash[:]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate2, err := m.Request(device2Conn, &protocol.Request{Folder: "gate", Name: "payload", Size: len(payload), Hash: hash[:]})
+	if err != nil {
+		gate1.Close()
+		t.Fatal(err)
+	}
+
+	enqueued := observeEnqueuedBlockTransfers(m.model)
+	results := make(chan namedBlockTransferRequestResult)
+	queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "shared", "payload", payload, enqueued, results)
+	queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "shared", "payload", payload, enqueued, results)
+	queueNamedBlockTransferRequest(t, m.model, device2Conn, device2, "shared", "payload", payload, enqueued, results)
+
+	gate1.Close()
+	for _, wantDevice := range []protocol.DeviceID{device1, device2, device1} {
+		result := awaitNamedBlockTransferRequest(t, results)
+		if result.err != nil {
+			gate2.Close()
+			t.Fatal(result.err)
+		}
+		if result.device != wantDevice {
+			result.response.Close()
+			gate2.Close()
+			t.Fatalf("device Equal-Priority Share admitted %s, want %s", result.device, wantDevice)
+		}
+		result.response.Close()
+	}
+	gate2.Close()
+}
+
+func TestNetworkPriorityPrototypeRepeatedLowPriorityRefillThroughModelRequest(t *testing.T) {
+	const (
+		largeBlock = protocol.MaxBlockSize
+		tailBlock  = protocol.MaxBlockSize / 2
+		smallBlock = protocol.MinBlockSize
+		lowCount   = 8
+	)
+	wrapper, controls := newBlockTransferRequestConfigWithLimits(t, map[string]int{
+		"active": 0,
+		"high":   100,
+		"low":    -100,
+	}, 2*largeBlock/1024, -1, device1)
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	payloads := map[string][]byte{
+		"active-large": make([]byte, largeBlock),
+		"active-tail":  make([]byte, tailBlock),
+		"high":         make([]byte, largeBlock),
+		"low":          make([]byte, smallBlock),
+	}
+	writeFile(t, controls["active"].filesystem, "large", payloads["active-large"])
+	writeFile(t, controls["active"].filesystem, "tail", payloads["active-tail"])
+	writeFile(t, controls["high"].filesystem, "payload", payloads["high"])
+	writeFile(t, controls["low"].filesystem, "payload", payloads["low"])
+	request := func(folder, name, payloadKey string) protocol.RequestResponse {
+		payload := payloads[payloadKey]
+		hash := sha256.Sum256(payload)
+		response, err := m.Request(device1Conn, &protocol.Request{Folder: folder, Name: name, Size: len(payload), Hash: hash[:]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	activeLarge := request("active", "large", "active-large")
+	activeTail := request("active", "tail", "active-tail")
+
+	enqueued := observeEnqueuedBlockTransfers(m.model)
+	results := make(chan namedBlockTransferRequestResult)
+	queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "high", "payload", payloads["high"], enqueued, results)
+	for range lowCount {
+		queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "low", "payload", payloads["low"], enqueued, results)
+	}
+	assertFileNotOpened(t, controls["low"])
+
+	activeTail.Close()
+	high := awaitNamedBlockTransferRequest(t, results)
+	if high.err != nil {
+		activeLarge.Close()
+		t.Fatal(high.err)
+	}
+	if high.folder != "high" {
+		high.response.Close()
+		activeLarge.Close()
+		t.Fatalf("first request after capacity accumulated is %q, want high", high.folder)
+	}
+	assertFileNotOpened(t, controls["low"])
+	high.response.Close()
+	activeLarge.Close()
+	for range lowCount {
+		low := awaitNamedBlockTransferRequest(t, results)
+		if low.err != nil {
+			t.Fatal(low.err)
+		}
+		if low.folder != "low" {
+			low.response.Close()
+			t.Fatalf("request after protected high-priority admission is %q, want low", low.folder)
+		}
+		low.response.Close()
+	}
+}
+
+func TestNetworkPriorityPrototypeLiveReprioritizationThroughModelRequest(t *testing.T) {
+	wrapper, controls := newBlockTransferRequestConfig(t, map[string]int{
+		"bulk":  0,
+		"focus": -100,
+	})
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	payload := make([]byte, 1024)
+	hash := sha256.Sum256(payload)
+	for _, control := range controls {
+		writeFile(t, control.filesystem, "payload", payload)
+	}
+	active, err := m.Request(device1Conn, &protocol.Request{Folder: "bulk", Name: "payload", Size: len(payload), Hash: hash[:]})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enqueued := observeEnqueuedBlockTransfers(m.model)
+	results := make(chan namedBlockTransferRequestResult)
+	for _, folder := range []string{"bulk", "focus"} {
+		queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, folder, "payload", payload, enqueued, results)
+	}
+
+	found := false
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		folder, index, ok := cfg.Folder("focus")
+		if !ok {
+			return
+		}
+		found = true
+		folder.NetworkPriority = 100
+		cfg.Folders[index] = folder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	if !found {
+		t.Fatal("focus folder disappeared before reprioritization")
+	}
+
+	active.Close()
+	first := awaitNamedBlockTransferRequest(t, results)
+	if first.err != nil {
+		t.Fatal(first.err)
+	}
+	if first.folder != "focus" {
+		first.response.Close()
+		t.Fatalf("first request after reprioritization is %q, want focus", first.folder)
+	}
+	first.response.Close()
+	second := awaitNamedBlockTransferRequest(t, results)
+	if second.err != nil {
+		t.Fatal(second.err)
+	}
+	if second.folder != "bulk" {
+		second.response.Close()
+		t.Fatalf("second request after reprioritization is %q, want bulk", second.folder)
+	}
+	second.response.Close()
+}
+
 func TestModelRequestCancelsQueuedTransferWhenFolderStops(t *testing.T) {
 	tests := map[string]func(*testing.T, config.Wrapper){
 		"paused": func(t *testing.T, wrapper config.Wrapper) {
@@ -287,6 +517,34 @@ type blockTransferRequestResult struct {
 	err      error
 }
 
+type namedBlockTransferRequestResult struct {
+	folder   string
+	device   protocol.DeviceID
+	response protocol.RequestResponse
+	err      error
+}
+
+func awaitNamedBlockTransferRequest(t *testing.T, results <-chan namedBlockTransferRequestResult) namedBlockTransferRequestResult {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for named Block Transfer request")
+		return namedBlockTransferRequestResult{}
+	}
+}
+
+func queueNamedBlockTransferRequest(t *testing.T, m *model, conn protocol.Connection, device protocol.DeviceID, folder, name string, payload []byte, enqueued <-chan blockTransferDescriptor, results chan<- namedBlockTransferRequestResult) {
+	t.Helper()
+	hash := sha256.Sum256(payload)
+	go func() {
+		response, err := m.Request(conn, &protocol.Request{Folder: folder, Name: name, Size: len(payload), Hash: hash[:]})
+		results <- namedBlockTransferRequestResult{folder: folder, device: device, response: response, err: err}
+	}()
+	awaitEnqueuedBlockTransfer(t, enqueued, folder)
+}
+
 type blockTransferWireResult struct {
 	data []byte
 	err  error
@@ -359,14 +617,23 @@ func awaitClusterConfiguration(t *testing.T, model *blockTransferWireModel) {
 }
 
 func newBlockTransferRequestConfig(t *testing.T, priorities map[string]int) (config.Wrapper, map[string]*blockTransferFilesystemControl) {
+	return newBlockTransferRequestConfigWithLimits(t, priorities, 0, 1, device1)
+}
+
+func newBlockTransferRequestConfigWithLimits(t *testing.T, priorities map[string]int, globalLimitKiB, deviceLimitKiB int, devices ...protocol.DeviceID) (config.Wrapper, map[string]*blockTransferFilesystemControl) {
 	t.Helper()
 	cfg := config.New(myID)
 	cfg.Options.MinHomeDiskFree.Value = 0
 	cfg.Options.FeatureFlags = []string{config.FeatureFlagNetworkPriority}
-	device := cfg.Defaults.Device.Copy()
-	device.DeviceID = device1
-	device.MaxRequestKiB = 1
-	cfg.SetDevice(device)
+	cfg.Options.RawMaxCIRequestKiB = globalLimitKiB
+	folderDevices := make([]config.FolderDeviceConfiguration, 0, len(devices))
+	for _, deviceID := range devices {
+		device := cfg.Defaults.Device.Copy()
+		device.DeviceID = deviceID
+		device.MaxRequestKiB = deviceLimitKiB
+		cfg.SetDevice(device)
+		folderDevices = append(folderDevices, config.FolderDeviceConfiguration{DeviceID: deviceID})
+	}
 
 	controls := make(map[string]*blockTransferFilesystemControl, len(priorities))
 	for folderID, priority := range priorities {
@@ -384,7 +651,7 @@ func newBlockTransferRequestConfig(t *testing.T, priorities map[string]int) (con
 		folder.Label = folderID
 		folder.Path = root
 		folder.FilesystemType = config.FilesystemType(observingBlockTransferFilesystemType)
-		folder.Devices = []config.FolderDeviceConfiguration{{DeviceID: device1}}
+		folder.Devices = folderDevices
 		folder.NetworkPriority = priority
 		folder.FSWatcherEnabled = false
 		folder.RescanIntervalS = 0

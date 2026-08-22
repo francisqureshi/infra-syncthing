@@ -1,0 +1,84 @@
+# Operating Network Priority scheduling
+
+Network Priority is a device-local integer from -100 through 100, defaulting
+to zero. While the temporary `networkPriority` feature flag is active, higher
+values strictly precede lower values for the next runnable Block Transfer.
+Active transfers and active protocol frames finish without preemption.
+
+Strict priority intentionally permits starvation. Continuously runnable work
+at a higher priority can keep lower-priority work queued indefinitely. Use the
+current Scheduling Wait status and metrics below to detect that condition, then
+change the local priorities if the policy is too aggressive.
+
+## Configure each participating device
+
+The setting is neither synchronized nor sent to peers. A controller that needs
+coordinated end-to-end behavior must update every relevant Syncthing device
+independently through its REST API. A peer using a different local value is
+valid because each device controls its own resources.
+
+`networkPriority` is part of the existing folder configuration returned by
+`GET /rest/config/folders/:id` and accepted by `PUT` or `PATCH` on that path:
+
+```json
+{
+  "networkPriority": 50
+}
+```
+
+The inclusive bounds are -100 and 100. Invalid values reject the configuration
+update without changing the current value. During burn-in, add `networkPriority`
+to the options `featureFlags` list to activate scheduling. When the flag is
+absent, configured priorities remain persisted and visible while transfers use
+legacy admission behavior.
+
+## In-Flight Limits are not rate limits
+
+`maxConcurrentIncomingRequestKiB` is the node-wide upload In-Flight Limit for
+active response bytes serving incoming block requests.
+`maxConcurrentOutgoingRequestKiB` is the independent node-wide download
+In-Flight Limit for active outgoing block requests. For both settings, zero
+selects the 256 MiB default, a negative value disables the cap, and a small
+positive value is raised to the safe protocol minimum.
+
+An In-Flight Limit caps concurrent active bytes; it does not cap bytes per
+second. `maxSendKbps`, `maxRecvKbps`, and per-device rate limits remain
+authoritative. Network Priority does not bypass those limiters, reserve their
+tokens, or guarantee bandwidth.
+
+## Observe current scheduler state
+
+`GET /rest/db/status?folder=:id` reports whether scheduling is active and the
+current state for each direction:
+
+```json
+{
+  "networkPrioritySchedulingActive": true,
+  "networkPriorityScheduling": {
+    "upload": {
+      "queuedBytes": 1048576,
+      "activeBytes": 4194304,
+      "oldestSchedulingWaitSeconds": 12.5
+    },
+    "download": {
+      "queuedBytes": 0,
+      "activeBytes": 0,
+      "oldestSchedulingWaitSeconds": 0
+    }
+  }
+}
+```
+
+`queuedBytes` and `activeBytes` are current totals. Scheduling Wait is the age
+of the oldest work that is currently queued, not historical admission latency.
+It keeps increasing while work starves and returns to zero when the queue is
+empty. The REST response exposes stable behavior only; it does not expose
+internal queue records.
+
+Prometheus exposes equivalent gauges with only the bounded `folder` and
+`direction` labels:
+
+- `syncthing_model_network_priority_scheduler_active`
+- `syncthing_model_network_priority_queued_bytes`
+- `syncthing_model_network_priority_active_bytes`
+- `syncthing_model_network_priority_oldest_scheduling_wait_seconds`
