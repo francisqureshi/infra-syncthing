@@ -678,6 +678,119 @@ func TestRequestZeroSize(t *testing.T) {
 	}
 }
 
+func TestRequestResponsesPreserveAdmissionOrder(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	firstMayReturn := make(chan struct{})
+	firstStarted := make(chan struct{})
+	first := newOrderedFakeRequestResponse(ready)
+	second := newOrderedFakeRequestResponse(first.closed)
+
+	m := newTestModel()
+	m.requestFn = func(req *Request) (RequestResponse, error) {
+		switch req.ID {
+		case 1:
+			close(firstStarted)
+			<-firstMayReturn
+			return first, nil
+		case 2:
+			return second, nil
+		default:
+			return nil, errors.New("unexpected request")
+		}
+	}
+	c := getRawConnection(NewConnection(c0ID, &testutil.NoopRW{}, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+
+	go c.handleRequest(&Request{ID: 1})
+	<-firstStarted
+	go c.handleRequest(&Request{ID: 2})
+
+	select {
+	case message := <-c.outbox:
+		response := message.msg.(*bep.Response)
+		t.Fatalf("response %d overtook the admitted response", response.Id)
+	case <-second.waitStarted:
+	}
+
+	close(firstMayReturn)
+	firstMessage := <-c.outbox
+	if response := firstMessage.msg.(*bep.Response); response.Id != 1 {
+		t.Fatalf("first response ID is %d, expected 1", response.Id)
+	}
+	close(firstMessage.done)
+
+	secondMessage := <-c.outbox
+	if response := secondMessage.msg.(*bep.Response); response.Id != 2 {
+		t.Fatalf("second response ID is %d, expected 2", response.Id)
+	}
+	close(secondMessage.done)
+}
+
+func TestEncryptedResponsePreservesAdmissionLifecycle(t *testing.T) {
+	ready := make(chan struct{})
+	underlying := newOrderedFakeRequestResponse(ready)
+	response := rawResponse{data: []byte("encrypted"), response: underlying}
+
+	waiting := make(chan struct{})
+	go func() {
+		response.WaitForResponse()
+		close(waiting)
+	}()
+	<-underlying.waitStarted
+	select {
+	case <-waiting:
+		t.Fatal("encrypted response bypassed the underlying admission order")
+	default:
+	}
+
+	close(ready)
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("encrypted response did not follow the underlying admission order")
+	}
+	response.Close()
+	select {
+	case <-underlying.closed:
+	default:
+		t.Fatal("encrypted response did not complete the underlying admission")
+	}
+}
+
+type orderedFakeRequestResponse struct {
+	data        []byte
+	previous    <-chan struct{}
+	closed      chan struct{}
+	waitStarted chan struct{}
+	waitOnce    sync.Once
+	closeOnce   sync.Once
+}
+
+func newOrderedFakeRequestResponse(previous <-chan struct{}) *orderedFakeRequestResponse {
+	return &orderedFakeRequestResponse{
+		previous:    previous,
+		closed:      make(chan struct{}),
+		waitStarted: make(chan struct{}),
+	}
+}
+
+func (r *orderedFakeRequestResponse) Data() []byte {
+	return r.data
+}
+
+func (r *orderedFakeRequestResponse) Close() {
+	r.closeOnce.Do(func() { close(r.closed) })
+}
+
+func (r *orderedFakeRequestResponse) Wait() {
+	<-r.closed
+}
+
+func (r *orderedFakeRequestResponse) WaitForResponse() {
+	r.waitOnce.Do(func() { close(r.waitStarted) })
+	<-r.previous
+}
+
 func TestRequestInvalidFilename(t *testing.T) {
 	m := newTestModel()
 	rw := testutil.NewBlockingRW()

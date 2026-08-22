@@ -1940,9 +1940,10 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		featureFlags []string
+		wantActive   bool
 	}{
 		{name: "feature flag absent"},
-		{name: "feature flag reserved", featureFlags: []string{config.FeatureFlagNetworkPriority}},
+		{name: "feature flag active", featureFlags: []string{config.FeatureFlagNetworkPriority}, wantActive: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1981,8 +1982,8 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 			if status.NetworkPrioritySchedulingActive == nil {
 				t.Fatal("REST status does not explicitly report Network Priority scheduler state")
 			}
-			if *status.NetworkPrioritySchedulingActive {
-				t.Fatal("Network Priority scheduler is reported active before it is implemented")
+			if *status.NetworkPrioritySchedulingActive != tc.wantActive {
+				t.Fatalf("Network Priority scheduler active is %v, expected %v", *status.NetworkPrioritySchedulingActive, tc.wantActive)
 			}
 		})
 	}

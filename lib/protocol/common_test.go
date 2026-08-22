@@ -20,6 +20,7 @@ type TestModel struct {
 	fromTemporary bool
 	indexFn       func(string, []FileInfo)
 	ccFn          func(*ClusterConfig)
+	requestFn     func(*Request) (RequestResponse, error)
 	closedCh      chan struct{}
 	closedErr     error
 }
@@ -42,6 +43,9 @@ func (*TestModel) IndexUpdate(Connection, *IndexUpdate) error {
 }
 
 func (t *TestModel) Request(_ Connection, req *Request) (RequestResponse, error) {
+	if t.requestFn != nil {
+		return t.requestFn(req)
+	}
 	t.folder = req.Folder
 	t.name = req.Name
 	t.offset = req.Offset

@@ -113,6 +113,12 @@ type RequestResponse interface {
 	Wait()  // Blocks until Close is called
 }
 
+type orderedRequestResponse interface {
+	// WaitForResponse blocks until this admitted response may be queued for
+	// transmission. The active response frame remains non-preemptive.
+	WaitForResponse()
+}
+
 type Connection interface {
 	// Send an Index message to the peer device. The message in the
 	// parameter may be altered by the connection and should not be used
@@ -694,6 +700,9 @@ func (c *rawConnection) handleRequest(req *Request) {
 		}
 		c.send(context.Background(), resp.toWire(), nil)
 		return
+	}
+	if ordered, ok := res.(orderedRequestResponse); ok {
+		ordered.WaitForResponse()
 	}
 	done := make(chan struct{})
 	resp := &Response{
