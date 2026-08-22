@@ -36,7 +36,6 @@ func TestBlockTransferSchedulerStrictPriorityAccumulatesCapacity(t *testing.T) {
 
 	awaitBlockTransferAdmission(t, low).close()
 	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  6,
 		deviceLimits: make(map[protocol.DeviceID]int),
 		folders: map[string]blockTransferFolder{
@@ -186,7 +185,6 @@ func TestBlockTransferSchedulerDoesNotCarryFairnessDebtAcrossIdlePeriods(t *test
 func TestBlockTransferSchedulerReprioritizesAndCancelsQueuedFolders(t *testing.T) {
 	scheduler := newBlockTransferScheduler()
 	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  4,
 		deviceLimits: make(map[protocol.DeviceID]int),
 		folders: map[string]blockTransferFolder{
@@ -201,7 +199,6 @@ func TestBlockTransferSchedulerReprioritizesAndCancelsQueuedFolders(t *testing.T
 	second := scheduler.enqueue(blockTransferDescriptorForDevice("second", device1, 4))
 
 	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  4,
 		deviceLimits: make(map[protocol.DeviceID]int),
 		folders: map[string]blockTransferFolder{
@@ -215,7 +212,6 @@ func TestBlockTransferSchedulerReprioritizesAndCancelsQueuedFolders(t *testing.T
 	assertBlockTransferWaiting(t, second)
 
 	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  4,
 		deviceLimits: make(map[protocol.DeviceID]int),
 		folders: map[string]blockTransferFolder{
@@ -253,7 +249,6 @@ func TestBlockTransferSchedulerReprioritizationJoinsCurrentFairnessRound(t *test
 	movingB := scheduler.enqueue(blockTransferDescriptorForDevice("moving-b", device1, 4))
 
 	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  8,
 		deviceLimits: make(map[protocol.DeviceID]int),
 		folders: map[string]blockTransferFolder{
@@ -313,7 +308,7 @@ func TestBlockTransferSchedulerSelectsLeastLoadedCompatibleConnectionDeterminist
 	deterministicTie.close()
 }
 
-func TestConfigureBlockTransferSchedulerKeepsLegacyPathBehindFeatureFlag(t *testing.T) {
+func TestConfigureBlockTransferSchedulerIsUniversal(t *testing.T) {
 	scheduler := newBlockTransferScheduler()
 	cfg := config.Configuration{
 		Folders: []config.FolderConfiguration{{ID: "folder"}},
@@ -321,21 +316,7 @@ func TestConfigureBlockTransferSchedulerKeepsLegacyPathBehindFeatureFlag(t *test
 	}
 	configureUploadBlockTransferScheduler(scheduler, cfg)
 
-	legacyResult := <-scheduler.enqueue(blockTransferDescriptorForDevice("folder", device1, 1024)).result
-	if legacyResult.err != nil || legacyResult.admission != nil {
-		t.Fatalf("inactive feature flag did not use legacy upload path: %#v", legacyResult)
-	}
-
-	cfg.Options.FeatureFlags = []string{config.FeatureFlagNetworkPriority}
-	configureUploadBlockTransferScheduler(scheduler, cfg)
 	awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptorForDevice("folder", device1, 1024))).close()
-
-	cfg.Options.FeatureFlags = nil
-	configureUploadBlockTransferScheduler(scheduler, cfg)
-	disabledResult := <-scheduler.enqueue(blockTransferDescriptorForDevice("folder", device1, 1024)).result
-	if disabledResult.err != nil || disabledResult.admission != nil {
-		t.Fatalf("disabled scheduler did not return to legacy upload path: %#v", disabledResult)
-	}
 }
 
 func configuredBlockTransferScheduler(globalLimit int, deviceLimits map[protocol.DeviceID]int, priorities map[string]int) *blockTransferScheduler {
@@ -348,7 +329,6 @@ func configuredBlockTransferScheduler(globalLimit int, deviceLimits map[protocol
 	}
 	scheduler := newBlockTransferScheduler()
 	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  globalLimit,
 		deviceLimits: deviceLimits,
 		folders:      folders,

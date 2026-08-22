@@ -291,32 +291,6 @@ func TestPullRetryBackoffYieldsToRunnableWork(t *testing.T) {
 	close(low.release)
 }
 
-func TestPullScheduleBypassesRetryBackoffWithoutNetworkPriority(t *testing.T) {
-	m := newFolderNetworkPriorityModelWithoutFeatureFlag(t, map[string]int{"folder": 0})
-	conn := addFolderNetworkPriorityConnection(t, m, device1, "folder")
-	var attempts atomic.Int32
-	conn.RequestCalls(func(context.Context, *protocol.Request) ([]byte, error) {
-		attempts.Add(1)
-		return nil, errors.New("test pull failure")
-	})
-	runner, ok := m.folderRunners.Get("folder")
-	if !ok {
-		t.Fatal("folder is not running")
-	}
-	folder, ok := runner.(*sendReceiveFolder)
-	if !ok {
-		t.Fatalf("folder runner has type %T, want *sendReceiveFolder", runner)
-	}
-	folder.pullPause = time.Hour
-
-	sendFolderNetworkPriorityFile(t, m, conn, "folder")
-	awaitAtomicValue(t, &attempts, 1)
-	awaitFolderState(t, m, "folder", FolderIdle)
-
-	runner.SchedulePull()
-	awaitAtomicValue(t, &attempts, 2)
-}
-
 func TestFilePriorityRemainsFolderLocalAfterNetworkPriorityAdmission(t *testing.T) {
 	m := newFolderNetworkPriorityModelWithOrders(t, map[string]int{
 		"active": 0,
@@ -399,15 +373,6 @@ func newFolderNetworkPriorityModel(t *testing.T, priorities map[string]int) *tes
 	return newFolderNetworkPriorityModelWithOrders(t, priorities, nil)
 }
 
-func newFolderNetworkPriorityModelWithoutFeatureFlag(t *testing.T, priorities map[string]int) *testModel {
-	t.Helper()
-	devices := make(map[string]protocol.DeviceID, len(priorities))
-	for folder := range priorities {
-		devices[folder] = device1
-	}
-	return newFolderNetworkPriorityModelWithFeatureFlag(t, priorities, devices, nil, false)
-}
-
 func newFolderNetworkPriorityModelWithOrders(t *testing.T, priorities map[string]int, orders map[string]config.PullOrder) *testModel {
 	t.Helper()
 	devices := make(map[string]protocol.DeviceID, len(priorities))
@@ -423,17 +388,10 @@ func newFolderNetworkPriorityModelForDevices(t *testing.T, priorities map[string
 }
 
 func newFolderNetworkPriorityModelWithConfiguration(t *testing.T, priorities map[string]int, devices map[string]protocol.DeviceID, orders map[string]config.PullOrder) *testModel {
-	return newFolderNetworkPriorityModelWithFeatureFlag(t, priorities, devices, orders, true)
-}
-
-func newFolderNetworkPriorityModelWithFeatureFlag(t *testing.T, priorities map[string]int, devices map[string]protocol.DeviceID, orders map[string]config.PullOrder, enabled bool) *testModel {
 	t.Helper()
 	cfg := config.New(myID)
 	cfg.Options.MinHomeDiskFree.Value = 0
 	cfg.Options.RawMaxFolderConcurrency = 1
-	if enabled {
-		cfg.Options.FeatureFlags = []string{config.FeatureFlagNetworkPriority}
-	}
 	configuredDevices := make(map[protocol.DeviceID]struct{})
 	for _, deviceID := range devices {
 		if _, ok := configuredDevices[deviceID]; ok {

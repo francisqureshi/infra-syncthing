@@ -407,17 +407,10 @@ func (f *folder) getHealthErrorWithoutIgnores() error {
 }
 
 func (f *folder) pull(ctx context.Context) (success bool, err error) {
-	networkPriorityEnabled := f.model.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority)
-	if networkPriorityEnabled {
-		// New schedule notifications do not bypass retry backoff after a failed
-		// pull. The timer invocation proceeds once the deadline has elapsed.
-		if f.pullRetryKind == pullRetryFailure && time.Now().Before(f.pullRetryAt) {
-			return false, nil
-		}
-	} else {
-		// Preserve the legacy behavior where every pull notification cancels
-		// the retry timer and attempts the pull immediately.
-		f.clearPullRetry()
+	// New schedule notifications do not bypass retry backoff after a failed
+	// pull. The timer invocation proceeds once the deadline has elapsed.
+	if f.pullRetryKind == pullRetryFailure && time.Now().Before(f.pullRetryAt) {
+		return false, nil
 	}
 
 	select {
@@ -515,11 +508,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	// Pulling failed, try again later.
 	delay := f.pullPause + time.Since(startTime)
 	f.sl.InfoContext(ctx, "Folder failed to sync, will be retried", slog.String("wait", stringutil.NiceDurationString(delay)))
-	if networkPriorityEnabled {
-		f.schedulePullRetry(pullRetryFailure, delay)
-	} else {
-		f.pullFailTimer.Reset(delay)
-	}
+	f.schedulePullRetry(pullRetryFailure, delay)
 
 	return false, err
 }
@@ -543,9 +532,6 @@ func (f *folder) clearPullRetry() {
 }
 
 func (f *folder) networkPriorityPullRunnable() (bool, error) {
-	if !f.model.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority) {
-		return true, nil
-	}
 	puller, ok := f.puller.(runnablePuller)
 	if !ok {
 		return true, nil

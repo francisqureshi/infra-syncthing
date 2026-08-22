@@ -802,12 +802,19 @@ func TestRequestResponseFrameIsNonPreemptiveOnWire(t *testing.T) {
 }
 
 func TestConnectionCriticalTrafficLeadsQueuedFolderWork(t *testing.T) {
-	model := &networkPriorityTestModel{
-		TestModel: newTestModel(),
-		priorities: map[string]int{
-			"folder": 100,
-		},
-	}
+	t.Run("configured priority", func(t *testing.T) {
+		testConnectionCriticalTrafficLeadsQueuedFolderWork(t, &networkPriorityTestModel{
+			TestModel:  newTestModel(),
+			priorities: map[string]int{"folder": 100},
+		})
+	})
+	t.Run("default priority", func(t *testing.T) {
+		testConnectionCriticalTrafficLeadsQueuedFolderWork(t, newTestModel())
+	})
+}
+
+func testConnectionCriticalTrafficLeadsQueuedFolderWork(t *testing.T, model Model) {
+	t.Helper()
 	c, writer, initialWrite := newControlledProtocolConnection(t, c0ID, model)
 
 	indexReturned := make(chan error, 1)
@@ -832,6 +839,7 @@ func TestConnectionCriticalTrafficLeadsQueuedFolderWork(t *testing.T) {
 	close(initialWrite.complete)
 	criticalWrite := awaitControlledWireWrite(t, writer)
 	if got := messageTypeFromWire(t, criticalWrite.data); got != bep.MessageType_MESSAGE_TYPE_CLUSTER_CONFIG {
+		close(criticalWrite.complete)
 		t.Fatalf("first queued frame is %v, expected Connection-Critical Traffic", got)
 	}
 	close(criticalWrite.complete)
@@ -839,6 +847,7 @@ func TestConnectionCriticalTrafficLeadsQueuedFolderWork(t *testing.T) {
 
 	metadataWrite := awaitControlledWireWrite(t, writer)
 	if got := messageTypeFromWire(t, metadataWrite.data); got != bep.MessageType_MESSAGE_TYPE_INDEX {
+		close(metadataWrite.complete)
 		t.Fatalf("second queued frame is %v, expected Folder-Scoped Metadata", got)
 	}
 	close(metadataWrite.complete)
@@ -1278,11 +1287,7 @@ type networkPriorityTestModel struct {
 }
 
 func (m *networkPriorityTestModel) NetworkPriority(folder string) NetworkPriorityPolicy {
-	if folder == "" {
-		return NetworkPriorityPolicy{Enabled: true}
-	}
-	priority, ok := m.priorities[folder]
-	return NetworkPriorityPolicy{Priority: priority, Enabled: ok}
+	return NetworkPriorityPolicy{Priority: m.priorities[folder]}
 }
 
 func newOrderedFakeRequestResponse(previous <-chan struct{}) *orderedFakeRequestResponse {

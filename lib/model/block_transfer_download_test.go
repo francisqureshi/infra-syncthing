@@ -64,7 +64,7 @@ func TestModelRequestGlobalPrioritizesQueuedDownloadBlockTransfers(t *testing.T)
 	awaitOutgoingBlockTransferResult(t, lowResult)
 }
 
-func TestNetworkPriorityPrototypeLiveReprioritizationThroughModelRequestGlobal(t *testing.T) {
+func TestNetworkPriorityLiveReprioritizationThroughModelRequestGlobal(t *testing.T) {
 	const activeSize = protocol.MaxRequestSize
 	wrapper, _ := newBlockTransferRequestConfigWithLimits(t, map[string]int{
 		"active": 0,
@@ -149,7 +149,7 @@ func TestNetworkPriorityPrototypeLiveReprioritizationThroughModelRequestGlobal(t
 	awaitOutgoingBlockTransferResult(t, bulkResult)
 }
 
-func TestNetworkPriorityPrototypeRateLimitIndependenceThroughModelRequestGlobal(t *testing.T) {
+func TestNetworkPriorityRateLimitIndependenceThroughModelRequestGlobal(t *testing.T) {
 	m := newDownloadBlockTransferModel(t, map[string]int{
 		"high": 100,
 		"low":  0,
@@ -351,7 +351,6 @@ func TestModelUploadAndDownloadBlockTransfersUseIndependentInFlightLimits(t *tes
 	m := setupModel(t, wrapper)
 	defer cleanupModel(m)
 	m.uploadScheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  1,
 		deviceLimits: map[protocol.DeviceID]int{device1: 1},
 		folders:      map[string]blockTransferFolder{"folder": {priority: 0, runnable: true}},
@@ -551,25 +550,20 @@ func TestModelRequestGlobalUsesRemainingCompatibleConnectionAfterConnectionClose
 	awaitOutgoingBlockTransferResult(t, queuedResult)
 }
 
-func TestModelRequestGlobalKeepsLegacyDownloadConcurrencyWhenFeatureFlagInactive(t *testing.T) {
+func TestDefaultNetworkPriorityLimitsConcurrentDownloads(t *testing.T) {
 	m := newDownloadBlockTransferModel(t, map[string]int{"folder": 0})
-	m.downloadScheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      false,
-		globalLimit:  1,
-		deviceLimits: make(map[protocol.DeviceID]int),
-		folders:      map[string]blockTransferFolder{"folder": {priority: 0, runnable: true}},
-	})
 	started := make(chan outgoingBlockTransferStart, 2)
 	addOutgoingBlockTransferConnection(m.model, device1, "connection", started)
 
-	firstResult := requestOutgoingBlockTransfer(t, m.model, device1, "folder", 1)
+	firstResult := requestOutgoingBlockTransfer(t, m.model, device1, "folder", protocol.MaxRequestSize)
 	first := awaitOutgoingBlockTransferStart(t, started)
-	secondResult := requestOutgoingBlockTransfer(t, m.model, device1, "folder", 1)
-	second := awaitOutgoingBlockTransferStart(t, started)
+	secondResult := requestOutgoingBlockTransfer(t, m.model, device1, "folder", protocol.MaxRequestSize)
+	assertNoOutgoingBlockTransferStarted(t, started)
 
 	close(first.release)
-	close(second.release)
 	awaitOutgoingBlockTransferResult(t, firstResult)
+	second := awaitOutgoingBlockTransferStart(t, started)
+	close(second.release)
 	awaitOutgoingBlockTransferResult(t, secondResult)
 }
 
@@ -728,7 +722,6 @@ type outgoingBlockTransferResult struct {
 func newDownloadBlockTransferModel(t *testing.T, priorities map[string]int) *testModel {
 	t.Helper()
 	cfg := config.New(myID)
-	cfg.Options.FeatureFlags = []string{config.FeatureFlagNetworkPriority}
 	device := cfg.Defaults.Device.Copy()
 	device.DeviceID = device1
 	cfg.SetDevice(device)
@@ -754,7 +747,6 @@ func configureDownloadBlockTransferSchedulerForTest(m *model, globalLimit int, p
 		folders[folder] = blockTransferFolder{priority: priority, runnable: true}
 	}
 	m.downloadScheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      true,
 		globalLimit:  globalLimit,
 		deviceLimits: make(map[protocol.DeviceID]int),
 		folders:      folders,

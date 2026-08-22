@@ -66,7 +66,6 @@ type copyBlocksState struct {
 const retainBits = fs.ModeSetgid | fs.ModeSetuid | fs.ModeSticky
 
 var (
-	activity                  = newDeviceActivity()
 	errNoDevice               = errors.New("peers who had this file went away, or the file has changed while syncing. will retry later")
 	errDirPrefix              = "directory has been deleted on a remote device but "
 	errDirHasToBeScanned      = errors.New(errDirPrefix + "contains changed files, scheduling scan")

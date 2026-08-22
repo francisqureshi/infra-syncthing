@@ -12,7 +12,7 @@ import (
 )
 
 func TestFolderWorkSchedulerKeepsMaintenanceInArrivalOrder(t *testing.T) {
-	scheduler := configuredFolderWorkScheduler(true, map[string]int{
+	scheduler := configuredFolderWorkScheduler(map[string]int{
 		"low":  -100,
 		"high": 100,
 	})
@@ -38,8 +38,8 @@ func TestFolderWorkSchedulerKeepsMaintenanceInArrivalOrder(t *testing.T) {
 	close(highRelease)
 }
 
-func TestFolderWorkSchedulerUsesArrivalOrderWithoutFeatureFlag(t *testing.T) {
-	scheduler := configuredFolderWorkScheduler(false, map[string]int{
+func TestFolderWorkSchedulerUsesNetworkPriorityUniversally(t *testing.T) {
+	scheduler := configuredFolderWorkScheduler(map[string]int{
 		"low":  -100,
 		"high": 100,
 	})
@@ -54,18 +54,18 @@ func TestFolderWorkSchedulerUsesArrivalOrderWithoutFeatureFlag(t *testing.T) {
 	awaitFolderWorkQueued(t, scheduler, 2)
 
 	scheduler.give()
-	if folder := awaitFolderWorkStart(t, started); folder != "low" {
-		t.Fatalf("first legacy folder work is for folder %q, want low", folder)
-	}
-	close(lowRelease)
 	if folder := awaitFolderWorkStart(t, started); folder != "high" {
-		t.Fatalf("second legacy folder work is for folder %q, want high", folder)
+		t.Fatalf("first folder work is for folder %q, want high", folder)
 	}
 	close(highRelease)
+	if folder := awaitFolderWorkStart(t, started); folder != "low" {
+		t.Fatalf("second folder work is for folder %q, want low", folder)
+	}
+	close(lowRelease)
 }
 
 func TestFolderWorkSchedulerReprioritizesQueuedWork(t *testing.T) {
-	scheduler := configuredFolderWorkScheduler(true, map[string]int{
+	scheduler := configuredFolderWorkScheduler(map[string]int{
 		"first":  0,
 		"second": 0,
 	})
@@ -78,7 +78,7 @@ func TestFolderWorkSchedulerReprioritizesQueuedWork(t *testing.T) {
 	awaitFolderWorkQueued(t, scheduler, 1)
 	secondRelease := enqueueFolderWork(t, scheduler, started, "second", folderWorkNetwork)
 	awaitFolderWorkQueued(t, scheduler, 2)
-	scheduler.configure(true, 1, map[string]int{
+	scheduler.configure(1, map[string]int{
 		"first":  -100,
 		"second": 100,
 	})
@@ -95,7 +95,7 @@ func TestFolderWorkSchedulerReprioritizesQueuedWork(t *testing.T) {
 }
 
 func TestFolderWorkSchedulerMaintenanceDoesNotInvertNetworkPriority(t *testing.T) {
-	scheduler := configuredFolderWorkScheduler(true, map[string]int{
+	scheduler := configuredFolderWorkScheduler(map[string]int{
 		"low":  -100,
 		"high": 100,
 	})
@@ -126,9 +126,9 @@ func TestFolderWorkSchedulerMaintenanceDoesNotInvertNetworkPriority(t *testing.T
 	close(maintenanceRelease)
 }
 
-func configuredFolderWorkScheduler(enabled bool, priorities map[string]int) *folderWorkScheduler {
+func configuredFolderWorkScheduler(priorities map[string]int) *folderWorkScheduler {
 	scheduler := newFolderWorkScheduler()
-	scheduler.configure(enabled, 1, priorities)
+	scheduler.configure(1, priorities)
 	return scheduler
 }
 

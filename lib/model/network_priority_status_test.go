@@ -18,7 +18,6 @@ func TestNetworkPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 	upload := newBlockTransferScheduler()
 	upload.now = func() time.Time { return now }
 	upload.configure(blockTransferSchedulerConfiguration{
-		enabled:     true,
 		globalLimit: 10,
 		folders: map[string]blockTransferFolder{
 			"alpha": {priority: 50, runnable: true},
@@ -27,7 +26,6 @@ func TestNetworkPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 	download := newBlockTransferScheduler()
 	download.now = upload.now
 	download.configure(blockTransferSchedulerConfiguration{
-		enabled: true,
 		folders: map[string]blockTransferFolder{
 			"alpha": {priority: 50, runnable: true},
 		},

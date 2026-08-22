@@ -97,17 +97,16 @@ type Model interface {
 }
 
 // NetworkPriorityProvider supplies device-local scheduling policy to a
-// connection. It is kept separate from Model so protocol users that do not
-// enable the scheduler retain the legacy output order.
+// connection. Protocol users without a provider use the universal scheduler
+// with the default priority of zero.
 type NetworkPriorityProvider interface {
 	NetworkPriority(folder string) NetworkPriorityPolicy
 }
 
 // NetworkPriorityPolicy describes the current output scheduling policy for a
-// folder. Enabled reports whether Network Priority scheduling is active.
+// folder.
 type NetworkPriorityPolicy struct {
 	Priority int
-	Enabled  bool
 }
 
 // rawModel is the Model interface, but without the initial Connection
@@ -240,7 +239,7 @@ type asyncMessage struct {
 type outputClass uint8
 
 const (
-	outputLegacy outputClass = iota
+	outputOther outputClass = iota
 	outputConnectionCritical
 	outputFolderMetadata
 	outputBlock
@@ -253,13 +252,12 @@ type outputTurn struct {
 type queuedOutput struct {
 	asyncMessage
 
-	class              outputClass
-	folder             string
-	priority           int
-	priorityScheduling bool
-	sequence           uint64
-	selected           chan struct{}
-	queued             bool
+	class    outputClass
+	folder   string
+	priority int
+	sequence uint64
+	selected chan struct{}
+	queued   bool
 }
 
 const (
@@ -792,7 +790,7 @@ func (c *rawConnection) handleResponse(resp *Response) {
 }
 
 func (c *rawConnection) send(ctx context.Context, msg proto.Message) bool {
-	class := outputLegacy
+	class := outputOther
 	switch msg.(type) {
 	case *bep.ClusterConfig, *bep.Ping:
 		class = outputConnectionCritical
@@ -810,13 +808,12 @@ func (c *rawConnection) queueOutput(msg proto.Message, done chan struct{}, folde
 		policy = c.networkPriority(folder)
 	}
 	output := &queuedOutput{
-		asyncMessage:       asyncMessage{msg: msg, done: done},
-		class:              class,
-		folder:             folder,
-		priority:           policy.Priority,
-		priorityScheduling: policy.Enabled,
-		selected:           make(chan struct{}),
-		queued:             true,
+		asyncMessage: asyncMessage{msg: msg, done: done},
+		class:        class,
+		folder:       folder,
+		priority:     policy.Priority,
+		selected:     make(chan struct{}),
+		queued:       true,
 	}
 
 	c.outputMut.Lock()
@@ -920,7 +917,7 @@ func (c *rawConnection) selectOutputLocked(initialClusterConfigOnly bool) int {
 
 	selected := -1
 	for index, output := range c.outputQueue {
-		if output.priorityScheduling && output.class == outputConnectionCritical && (selected < 0 || output.sequence < c.outputQueue[selected].sequence) {
+		if output.class == outputConnectionCritical && (selected < 0 || output.sequence < c.outputQueue[selected].sequence) {
 			selected = index
 		}
 	}
@@ -941,7 +938,7 @@ func (c *rawConnection) selectOutputLocked(initialClusterConfigOnly bool) int {
 	if foundPriority {
 		metadata, block := -1, -1
 		for index, output := range c.outputQueue {
-			if !output.priorityScheduling || output.priority != priority {
+			if output.priority != priority {
 				continue
 			}
 			switch output.class {
@@ -986,7 +983,6 @@ func (c *rawConnection) refreshOutputPoliciesLocked() {
 		}
 		policy := c.networkPriority(output.folder)
 		output.priority = policy.Priority
-		output.priorityScheduling = policy.Enabled
 		if output.participatesInMetadataTurns() {
 			affectedPriorities[output.priority] = struct{}{}
 		}
@@ -997,7 +993,7 @@ func (c *rawConnection) refreshOutputPoliciesLocked() {
 }
 
 func (o *queuedOutput) participatesInMetadataTurns() bool {
-	return o.priorityScheduling && (o.class == outputFolderMetadata || o.class == outputBlock)
+	return o.class == outputFolderMetadata || o.class == outputBlock
 }
 
 func (c *rawConnection) writeCloseOutput(message asyncMessage) {
