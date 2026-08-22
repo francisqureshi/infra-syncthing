@@ -14,7 +14,6 @@ import (
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/versioner"
 )
 
@@ -26,9 +25,9 @@ type sendOnlyFolder struct {
 	*folder
 }
 
-func newSendOnlyFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, _ versioner.Versioner, evLogger events.Logger, ioLimiter *semaphore.Semaphore) service {
+func newSendOnlyFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, _ versioner.Versioner, evLogger events.Logger) service {
 	f := &sendOnlyFolder{
-		folder: newFolder(model, ignores, cfg, evLogger, ioLimiter, nil),
+		folder: newFolder(model, ignores, cfg, evLogger, nil),
 	}
 	f.puller = f
 	return f

@@ -29,7 +29,6 @@ import (
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
-	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/stats"
 	"github.com/syncthing/syncthing/lib/stringutil"
 	"github.com/syncthing/syncthing/lib/svcutil"
@@ -45,7 +44,7 @@ type folder struct {
 	config.FolderConfiguration
 	*stats.FolderStatisticsReference
 
-	ioLimiter *semaphore.Semaphore
+	ioLimiter *folderWorkScheduler
 
 	localFlags protocol.FlagLocal
 
@@ -69,6 +68,8 @@ type folder struct {
 	pullScheduled chan struct{}
 	pullPause     time.Duration
 	pullFailTimer *time.Timer
+	pullRetryAt   time.Time
+	pullRetryKind pullRetryKind
 
 	scanErrors []FileError
 	pullErrors []FileError
@@ -101,12 +102,25 @@ type puller interface {
 	pull(ctx context.Context) (bool, error) // true when successful and should not be retried
 }
 
-func newFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger, ioLimiter *semaphore.Semaphore, ver versioner.Versioner) *folder {
+type runnablePuller interface {
+	puller
+	pullRunnable() (bool, error)
+}
+
+type pullRetryKind uint8
+
+const (
+	pullRetryNone pullRetryKind = iota
+	pullRetryUnavailable
+	pullRetryFailure
+)
+
+func newFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger, ver versioner.Versioner) *folder {
 	f := folder{
 		stateTracker:              newStateTracker(cfg.ID, evLogger),
 		FolderConfiguration:       cfg,
 		FolderStatisticsReference: stats.NewFolderStatisticsReference(db.NewTyped(model.sdb, "folderstats/"+cfg.ID)),
-		ioLimiter:                 ioLimiter,
+		ioLimiter:                 model.folderIOLimiter,
 
 		model:         model,
 		shortID:       model.shortID,
@@ -251,7 +265,7 @@ func (f *folder) Serve(ctx context.Context) error {
 
 		case fsEvents := <-f.watchChan:
 			f.sl.DebugContext(ctx, "Scan due to watcher")
-			err = f.scanSubdirs(ctx, fsEvents)
+			err = f.scanSubdirsForNetwork(ctx, fsEvents)
 
 		case <-f.restartWatchChan:
 			f.sl.DebugContext(ctx, "Restart watcher")
@@ -393,10 +407,17 @@ func (f *folder) getHealthErrorWithoutIgnores() error {
 }
 
 func (f *folder) pull(ctx context.Context) (success bool, err error) {
-	f.pullFailTimer.Stop()
-	select {
-	case <-f.pullFailTimer.C:
-	default:
+	networkPriorityEnabled := f.model.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority)
+	if networkPriorityEnabled {
+		// New schedule notifications do not bypass retry backoff after a failed
+		// pull. The timer invocation proceeds once the deadline has elapsed.
+		if f.pullRetryKind == pullRetryFailure && time.Now().Before(f.pullRetryAt) {
+			return false, nil
+		}
+	} else {
+		// Preserve the legacy behavior where every pull notification cancels
+		// the retry timer and attempts the pull immediately.
+		f.clearPullRetry()
 	}
 
 	select {
@@ -410,6 +431,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 		if success {
 			// We're good, reset the pause interval.
 			f.pullPause = f.pullBasePause()
+			f.clearPullRetry()
 		}
 	}()
 
@@ -440,10 +462,32 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	if f.Type != config.FolderTypeSendOnly {
 		f.setState(FolderSyncWaiting)
 
-		if err := f.ioLimiter.TakeWithContext(ctx, 1); err != nil {
+		if runnable, err := f.networkPriorityPullRunnable(); err != nil {
+			return false, err
+		} else if !runnable {
+			if f.pullRetryKind != pullRetryUnavailable || !time.Now().Before(f.pullRetryAt) {
+				f.schedulePullRetry(pullRetryUnavailable, f.pullPause)
+			}
+			return false, nil
+		}
+
+		f.clearPullRetry()
+		if err := f.ioLimiter.takeWithContext(ctx, f.ID, folderWorkNetwork); err != nil {
 			return true, err
 		}
-		defer f.ioLimiter.Give(1)
+		defer f.ioLimiter.give()
+
+		// Availability may change while the folder is waiting for constrained
+		// I/O. Recheck after admission so a high-priority folder that stopped
+		// being runnable yields the slot immediately.
+		if runnable, err := f.networkPriorityPullRunnable(); err != nil {
+			return false, err
+		} else if !runnable {
+			f.schedulePullRetry(pullRetryUnavailable, f.pullPause)
+			return false, nil
+		}
+	} else {
+		f.clearPullRetry()
 	}
 
 	startTime := time.Now()
@@ -471,12 +515,53 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	// Pulling failed, try again later.
 	delay := f.pullPause + time.Since(startTime)
 	f.sl.InfoContext(ctx, "Folder failed to sync, will be retried", slog.String("wait", stringutil.NiceDurationString(delay)))
-	f.pullFailTimer.Reset(delay)
+	if networkPriorityEnabled {
+		f.schedulePullRetry(pullRetryFailure, delay)
+	} else {
+		f.pullFailTimer.Reset(delay)
+	}
 
 	return false, err
 }
 
+func (f *folder) schedulePullRetry(kind pullRetryKind, delay time.Duration) {
+	f.clearPullRetry()
+	f.pullRetryKind = kind
+	f.pullRetryAt = time.Now().Add(delay)
+	f.pullFailTimer.Reset(delay)
+}
+
+func (f *folder) clearPullRetry() {
+	f.pullRetryKind = pullRetryNone
+	f.pullRetryAt = time.Time{}
+	if !f.pullFailTimer.Stop() {
+		select {
+		case <-f.pullFailTimer.C:
+		default:
+		}
+	}
+}
+
+func (f *folder) networkPriorityPullRunnable() (bool, error) {
+	if !f.model.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority) {
+		return true, nil
+	}
+	puller, ok := f.puller.(runnablePuller)
+	if !ok {
+		return true, nil
+	}
+	return puller.pullRunnable()
+}
+
 func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
+	return f.scanSubdirsWithClass(ctx, subDirs, folderWorkMaintenance)
+}
+
+func (f *folder) scanSubdirsForNetwork(ctx context.Context, subDirs []string) error {
+	return f.scanSubdirsWithClass(ctx, subDirs, folderWorkNetwork)
+}
+
+func (f *folder) scanSubdirsWithClass(ctx context.Context, subDirs []string, class folderWorkClass) error {
 	f.sl.DebugContext(ctx, "Scanning")
 
 	oldHash := f.ignores.Hash()
@@ -500,10 +585,10 @@ func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
 
 	f.setState(FolderScanWaiting)
 
-	if err := f.ioLimiter.TakeWithContext(ctx, 1); err != nil {
+	if err := f.ioLimiter.takeWithContext(ctx, f.ID, class); err != nil {
 		return err
 	}
-	defer f.ioLimiter.Give(1)
+	defer f.ioLimiter.give()
 
 	metricFolderScans.WithLabelValues(f.ID).Inc()
 	scanCtx, cancel := context.WithCancel(ctx)
@@ -1012,7 +1097,7 @@ loop:
 }
 
 func (f *folder) scanTimerFired(ctx context.Context) error {
-	err := f.scanSubdirs(ctx, nil)
+	err := f.scanSubdirsForNetwork(ctx, nil)
 
 	select {
 	case <-f.initialScanFinished:
@@ -1036,10 +1121,10 @@ func (f *folder) scanTimerFired(ctx context.Context) error {
 func (f *folder) versionCleanupTimerFired(ctx context.Context) {
 	f.setState(FolderCleanWaiting)
 
-	if err := f.ioLimiter.TakeWithContext(ctx, 1); err != nil {
+	if err := f.ioLimiter.takeWithContext(ctx, f.ID, folderWorkMaintenance); err != nil {
 		return
 	}
-	defer f.ioLimiter.Give(1)
+	defer f.ioLimiter.give()
 
 	f.setState(FolderCleaning)
 
@@ -1081,7 +1166,7 @@ func (f *folder) scheduleWatchRestart() {
 func (f *folder) restartWatch(ctx context.Context) error {
 	f.stopWatch()
 	f.startWatch(ctx)
-	return f.scanSubdirs(ctx, nil)
+	return f.scanSubdirsForNetwork(ctx, nil)
 }
 
 // startWatch should only ever be called synchronously. If you want to use
@@ -1439,7 +1524,7 @@ func (f *folder) handleForcedRescans(ctx context.Context) error {
 		return err
 	}
 
-	return f.scanSubdirs(ctx, paths)
+	return f.scanSubdirsForNetwork(ctx, paths)
 }
 
 // The exists function is expected to return true for all known paths
