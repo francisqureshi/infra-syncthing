@@ -10,14 +10,15 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
 type blockTransferDescriptor struct {
-	folder         string
-	name           string
-	sources        []blockTransferSource
+	folder  string
+	name    string
+	sources []blockTransferSource
 	// refreshSources runs with the scheduler mutex held so source changes
 	// serialize with enqueue and admission. It must not call back into the
 	// scheduler or wait on code that does.
@@ -46,9 +47,11 @@ type blockTransferScheduler struct {
 	activeDevices   map[blockTransferDeviceAccount]int
 	connectionBytes map[string]int
 	connectionTails map[string]chan struct{}
+	activeBytes     map[string]int64
 	readyResponse   chan struct{}
 	queued          []*blockTransferWaiter
 	nextSequence    uint64
+	now             func() time.Time
 }
 
 type blockTransferFolder struct {
@@ -77,6 +80,7 @@ type blockTransferDeviceAccount struct {
 type blockTransferWaiter struct {
 	descriptor blockTransferDescriptor
 	sequence   uint64
+	enqueuedAt time.Time
 	result     chan blockTransferResult
 }
 
@@ -102,6 +106,8 @@ type blockTransferAdmission struct {
 	responseDone     chan struct{}
 	folderAccount    blockTransferFolderAccount
 	deviceAccount    blockTransferDeviceAccount
+	folder           string
+	transferBytes    int64
 	once             sync.Once
 }
 
@@ -118,7 +124,9 @@ func newBlockTransferScheduler() *blockTransferScheduler {
 		activeDevices:   make(map[blockTransferDeviceAccount]int),
 		connectionBytes: make(map[string]int),
 		connectionTails: make(map[string]chan struct{}),
+		activeBytes:     make(map[string]int64),
 		readyResponse:   readyResponse,
+		now:             time.Now,
 	}
 }
 
@@ -172,6 +180,7 @@ func (s *blockTransferScheduler) enqueue(descriptor blockTransferDescriptor) *bl
 	waiter := &blockTransferWaiter{
 		descriptor: descriptor,
 		sequence:   s.nextSequence,
+		enqueuedAt: s.now(),
 		result:     make(chan blockTransferResult, 1),
 	}
 	s.nextSequence++
@@ -406,22 +415,22 @@ func (s *blockTransferScheduler) scheduleLocked() {
 		priorities := s.queuedPrioritiesLocked()
 		reservedGlobal := 0
 		reservedDevices := make(map[protocol.DeviceID]int)
+		protectedNext := false
 		selected := blockTransferSelection{index: -1}
 		for _, priority := range priorities {
 			selected = s.firstFittingLocked(priority, reservedGlobal, reservedDevices)
 			if selected.index >= 0 {
 				break
 			}
-			for _, waiter := range s.queued {
-				folder, ok := s.folders[waiter.descriptor.folder]
-				if !ok || !folder.runnable || folder.priority != priority {
-					continue
-				}
-				reservedGlobal = max(reservedGlobal, s.globalCharge(waiter.descriptor.bytes))
-				for _, source := range waiter.descriptor.sources {
-					deviceCharge := s.deviceCharge(source.device, waiter.descriptor.bytes)
-					reservedDevices[source.device] = max(reservedDevices[source.device], deviceCharge)
-				}
+			if protectedNext {
+				continue
+			}
+			next := s.nextLocked(priority)
+			if next.index >= 0 {
+				waiter := s.queued[next.index]
+				reservedGlobal = s.globalCharge(waiter.descriptor.bytes)
+				reservedDevices[next.source.device] = s.deviceCharge(next.source.device, waiter.descriptor.bytes)
+				protectedNext = true
 			}
 		}
 		if selected.index < 0 {
@@ -450,6 +459,8 @@ func (s *blockTransferScheduler) scheduleLocked() {
 		}
 		responseDone := make(chan struct{})
 		s.connectionTails[connection] = responseDone
+		transferBytes := int64(connectionBytes)
+		s.activeBytes[waiter.descriptor.folder] += transferBytes
 		waiter.result <- blockTransferResult{admission: &blockTransferAdmission{
 			scheduler:        s,
 			device:           selected.source.device,
@@ -462,6 +473,8 @@ func (s *blockTransferScheduler) scheduleLocked() {
 			responseDone:     responseDone,
 			folderAccount:    folderAccount,
 			deviceAccount:    deviceAccount,
+			folder:           waiter.descriptor.folder,
+			transferBytes:    transferBytes,
 		}}
 	}
 }
@@ -476,6 +489,51 @@ func (s *blockTransferScheduler) leastLoadedConnectionLocked(connections []strin
 		if s.connectionBytes[connection] < s.connectionBytes[selected] ||
 			(s.connectionBytes[connection] == s.connectionBytes[selected] && connection < selected) {
 			selected = connection
+		}
+	}
+	return selected
+}
+
+func (s *blockTransferScheduler) nextLocked(priority int) blockTransferSelection {
+	return s.selectFairLocked(priority, func(waiter *blockTransferWaiter) (blockTransferSource, bool) {
+		return s.leastServedSourceLocked(waiter, priority, nil)
+	})
+}
+
+func (s *blockTransferScheduler) selectFairLocked(priority int, selectSource func(*blockTransferWaiter) (blockTransferSource, bool)) blockTransferSelection {
+	selectedFolder := ""
+	var selectedFolderBytes int64
+	var selectedFolderSequence uint64
+	for _, waiter := range s.queued {
+		folder, ok := s.folders[waiter.descriptor.folder]
+		if !ok || !folder.runnable || folder.priority != priority {
+			continue
+		}
+		if _, ok := selectSource(waiter); !ok {
+			continue
+		}
+		folderBytes := s.folderBytes[blockTransferFolderAccount{priority: priority, folder: waiter.descriptor.folder}]
+		if selectedFolder == "" || folderBytes < selectedFolderBytes || (folderBytes == selectedFolderBytes && waiter.sequence < selectedFolderSequence) {
+			selectedFolder = waiter.descriptor.folder
+			selectedFolderBytes = folderBytes
+			selectedFolderSequence = waiter.sequence
+		}
+	}
+
+	selected := blockTransferSelection{index: -1}
+	var selectedDeviceBytes int64
+	for i, waiter := range s.queued {
+		if waiter.descriptor.folder != selectedFolder {
+			continue
+		}
+		source, ok := selectSource(waiter)
+		if !ok {
+			continue
+		}
+		deviceBytes := s.deviceBytes[blockTransferDeviceAccount{priority: priority, folder: selectedFolder, device: source.device}]
+		if selected.index < 0 || deviceBytes < selectedDeviceBytes || (deviceBytes == selectedDeviceBytes && waiter.sequence < s.queued[selected.index].sequence) {
+			selected = blockTransferSelection{index: i, source: source}
+			selectedDeviceBytes = deviceBytes
 		}
 	}
 	return selected
@@ -498,42 +556,9 @@ func (s *blockTransferScheduler) queuedPrioritiesLocked() []int {
 }
 
 func (s *blockTransferScheduler) firstFittingLocked(priority, reservedGlobal int, reservedDevices map[protocol.DeviceID]int) blockTransferSelection {
-	selectedFolder := ""
-	var selectedFolderBytes int64
-	var selectedFolderSequence uint64
-	for _, waiter := range s.queued {
-		folder, ok := s.folders[waiter.descriptor.folder]
-		if !ok || !folder.runnable || folder.priority != priority {
-			continue
-		}
-		if _, ok := s.firstFittingSourceLocked(waiter, priority, reservedGlobal, reservedDevices); !ok {
-			continue
-		}
-		folderBytes := s.folderBytes[blockTransferFolderAccount{priority: priority, folder: waiter.descriptor.folder}]
-		if selectedFolder == "" || folderBytes < selectedFolderBytes || (folderBytes == selectedFolderBytes && waiter.sequence < selectedFolderSequence) {
-			selectedFolder = waiter.descriptor.folder
-			selectedFolderBytes = folderBytes
-			selectedFolderSequence = waiter.sequence
-		}
-	}
-
-	selected := blockTransferSelection{index: -1}
-	var selectedDeviceBytes int64
-	for i, waiter := range s.queued {
-		if waiter.descriptor.folder != selectedFolder {
-			continue
-		}
-		source, ok := s.firstFittingSourceLocked(waiter, priority, reservedGlobal, reservedDevices)
-		if !ok {
-			continue
-		}
-		deviceBytes := s.deviceBytes[blockTransferDeviceAccount{priority: priority, folder: selectedFolder, device: source.device}]
-		if selected.index < 0 || deviceBytes < selectedDeviceBytes || (deviceBytes == selectedDeviceBytes && waiter.sequence < s.queued[selected.index].sequence) {
-			selected = blockTransferSelection{index: i, source: source}
-			selectedDeviceBytes = deviceBytes
-		}
-	}
-	return selected
+	return s.selectFairLocked(priority, func(waiter *blockTransferWaiter) (blockTransferSource, bool) {
+		return s.firstFittingSourceLocked(waiter, priority, reservedGlobal, reservedDevices)
+	})
 }
 
 func (s *blockTransferScheduler) firstFittingSourceLocked(waiter *blockTransferWaiter, priority, reservedGlobal int, reservedDevices map[protocol.DeviceID]int) (blockTransferSource, bool) {
@@ -542,12 +567,18 @@ func (s *blockTransferScheduler) firstFittingSourceLocked(waiter *blockTransferW
 		return blockTransferSource{}, false
 	}
 
+	return s.leastServedSourceLocked(waiter, priority, func(source blockTransferSource) bool {
+		deviceAvailable := s.available(s.deviceLimits[source.device], s.deviceInFlight[source.device]) - reservedDevices[source.device]
+		return s.deviceCharge(source.device, waiter.descriptor.bytes) <= deviceAvailable
+	})
+}
+
+func (s *blockTransferScheduler) leastServedSourceLocked(waiter *blockTransferWaiter, priority int, eligible func(blockTransferSource) bool) (blockTransferSource, bool) {
 	var selected blockTransferSource
 	var selectedDeviceBytes int64
 	found := false
 	for _, source := range waiter.descriptor.sources {
-		deviceAvailable := s.available(s.deviceLimits[source.device], s.deviceInFlight[source.device]) - reservedDevices[source.device]
-		if s.deviceCharge(source.device, waiter.descriptor.bytes) > deviceAvailable {
+		if eligible != nil && !eligible(source) {
 			continue
 		}
 		deviceBytes := s.deviceBytes[blockTransferDeviceAccount{priority: priority, folder: waiter.descriptor.folder, device: source.device}]
@@ -607,6 +638,10 @@ func (s *blockTransferScheduler) release(admission *blockTransferAdmission) {
 	s.activeDevices[admission.deviceAccount]--
 	if s.activeDevices[admission.deviceAccount] == 0 {
 		delete(s.activeDevices, admission.deviceAccount)
+	}
+	s.activeBytes[admission.folder] -= admission.transferBytes
+	if s.activeBytes[admission.folder] == 0 {
+		delete(s.activeBytes, admission.folder)
 	}
 	s.scheduleLocked()
 	s.mut.Unlock()

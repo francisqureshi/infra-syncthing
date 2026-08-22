@@ -1018,6 +1018,14 @@ func startHTTP(t *testing.T, cfg config.Wrapper) string {
 }
 
 func startHTTPWithShutdownTimeout(t *testing.T, cfg config.Wrapper, shutdownTimeout time.Duration) string {
+	return startHTTPWithSummaryAndShutdownTimeout(t, cfg, nil, shutdownTimeout)
+}
+
+func startHTTPWithSummary(t *testing.T, cfg config.Wrapper, summary model.FolderSummaryService) string {
+	return startHTTPWithSummaryAndShutdownTimeout(t, cfg, summary, 0)
+}
+
+func startHTTPWithSummaryAndShutdownTimeout(t *testing.T, cfg config.Wrapper, summary model.FolderSummaryService, shutdownTimeout time.Duration) string {
 	m := new(modelmocks.Model)
 	assetDir := "../../gui"
 	eventSub := new(eventmocks.BufferedSubscription)
@@ -1027,8 +1035,11 @@ func startHTTPWithShutdownTimeout(t *testing.T, cfg config.Wrapper, shutdownTime
 	errorLog := slogutil.NewRecorder(0)
 	systemLog := slogutil.NewRecorder(0)
 	addrChan := make(chan string)
-	mockedSummary := &modelmocks.FolderSummaryService{}
-	mockedSummary.SummaryReturns(new(model.FolderSummary), nil)
+	if summary == nil {
+		mockedSummary := &modelmocks.FolderSummaryService{}
+		mockedSummary.SummaryReturns(new(model.FolderSummary), nil)
+		summary = mockedSummary
+	}
 
 	// Instantiate the API service
 	urService := ur.New(cfg, m, connections, false)
@@ -1040,7 +1051,7 @@ func startHTTPWithShutdownTimeout(t *testing.T, cfg config.Wrapper, shutdownTime
 		mdb.Close()
 	})
 	kdb := db.NewMiscDB(mdb)
-	svc := New(protocol.LocalDeviceID, cfg, assetDir, "syncthing", m, eventSub, diskEventSub, events.NoopLogger, discoverer, connections, urService, mockedSummary, errorLog, systemLog, false, kdb).(*service)
+	svc := New(protocol.LocalDeviceID, cfg, assetDir, "syncthing", m, eventSub, diskEventSub, events.NoopLogger, discoverer, connections, urService, summary, errorLog, systemLog, false, kdb).(*service)
 	svc.started = addrChan
 
 	if shutdownTimeout > 0 {
@@ -1822,8 +1833,15 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.xml")
 	wrapper := config.Wrap(configPath, cfg, protocol.LocalDeviceID, events.NoopLogger)
 	cfgCtx, cfgCancel := context.WithCancel(context.Background())
-	go wrapper.Serve(cfgCtx)
-	t.Cleanup(cfgCancel)
+	cfgDone := make(chan struct{})
+	go func() {
+		_ = wrapper.Serve(cfgCtx)
+		close(cfgDone)
+	}()
+	t.Cleanup(func() {
+		cfgCancel()
+		<-cfgDone
+	})
 	baseURL := startHTTP(t, wrapper)
 
 	client := &http.Client{Timeout: time.Minute}
@@ -1938,12 +1956,29 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 
 func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		featureFlags []string
-		wantActive   bool
+		name           string
+		featureFlags   []string
+		wantActive     bool
+		wantScheduling model.NetworkPrioritySchedulerState
 	}{
 		{name: "feature flag absent"},
-		{name: "feature flag active", featureFlags: []string{config.FeatureFlagNetworkPriority}, wantActive: true},
+		{
+			name:         "feature flag active",
+			featureFlags: []string{config.FeatureFlagNetworkPriority},
+			wantActive:   true,
+			wantScheduling: model.NetworkPrioritySchedulerState{
+				Upload: model.NetworkPrioritySchedulerDirectionState{
+					QueuedBytes:                 11,
+					ActiveBytes:                 12,
+					OldestSchedulingWaitSeconds: 13,
+				},
+				Download: model.NetworkPrioritySchedulerDirectionState{
+					QueuedBytes:                 21,
+					ActiveBytes:                 22,
+					OldestSchedulingWaitSeconds: 23,
+				},
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1957,7 +1992,9 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 				Options: config.OptionsConfiguration{FeatureFlags: tc.featureFlags},
 			}
 			wrapper := config.Wrap(filepath.Join(t.TempDir(), "config.xml"), cfg, protocol.LocalDeviceID, events.NoopLogger)
-			baseURL := startHTTP(t, wrapper)
+			summary := &modelmocks.FolderSummaryService{}
+			summary.SummaryReturns(&model.FolderSummary{NetworkPriorityScheduling: tc.wantScheduling}, nil)
+			baseURL := startHTTPWithSummary(t, wrapper, summary)
 
 			req, err := http.NewRequest(http.MethodGet, baseURL+"/rest/db/status?folder=priority", nil)
 			if err != nil {
@@ -1974,7 +2011,8 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 			}
 
 			var status struct {
-				NetworkPrioritySchedulingActive *bool `json:"networkPrioritySchedulingActive"`
+				NetworkPrioritySchedulingActive *bool                                `json:"networkPrioritySchedulingActive"`
+				NetworkPriorityScheduling       *model.NetworkPrioritySchedulerState `json:"networkPriorityScheduling"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 				t.Fatal(err)
@@ -1984,6 +2022,12 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 			}
 			if *status.NetworkPrioritySchedulingActive != tc.wantActive {
 				t.Fatalf("Network Priority scheduler active is %v, expected %v", *status.NetworkPrioritySchedulingActive, tc.wantActive)
+			}
+			if status.NetworkPriorityScheduling == nil {
+				t.Fatal("REST status does not expose per-direction Network Priority scheduler state")
+			}
+			if *status.NetworkPriorityScheduling != tc.wantScheduling {
+				t.Fatalf("REST Network Priority scheduling = %#v, want %#v", *status.NetworkPriorityScheduling, tc.wantScheduling)
 			}
 		})
 	}

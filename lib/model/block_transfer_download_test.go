@@ -10,9 +10,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -59,6 +62,148 @@ func TestModelRequestGlobalPrioritizesQueuedDownloadBlockTransfers(t *testing.T)
 	}
 	close(low.release)
 	awaitOutgoingBlockTransferResult(t, lowResult)
+}
+
+func TestNetworkPriorityPrototypeLiveReprioritizationThroughModelRequestGlobal(t *testing.T) {
+	const activeSize = protocol.MaxRequestSize
+	wrapper, _ := newBlockTransferRequestConfigWithLimits(t, map[string]int{
+		"active": 0,
+		"bulk":   0,
+		"focus":  -100,
+	}, 0, -1, device1)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.RawMaxConcurrentOutgoingRequestKiB = activeSize / 1024
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+	started := make(chan outgoingBlockTransferStart, 3)
+	connection := addOutgoingBlockTransferConnection(m.model, device1, "connection", started)
+	requestCtx, cancelRequests := context.WithCancel(t.Context())
+	defer func() {
+		cancelRequests()
+		m.Closed(connection, protocol.ErrClosed)
+	}()
+	enqueued := observeEnqueuedBlockTransfers(m.model)
+
+	activeResult := requestOutgoingBlockTransferContext(requestCtx, m.model, device1, "active", activeSize)
+	awaitEnqueuedBlockTransfer(t, enqueued, "active")
+	active := awaitOutgoingBlockTransferStart(t, started)
+	bulkResult := requestOutgoingBlockTransferContext(requestCtx, m.model, device1, "bulk", activeSize)
+	awaitEnqueuedBlockTransfer(t, enqueued, "bulk")
+	focusResult := requestOutgoingBlockTransferContext(requestCtx, m.model, device1, "focus", activeSize)
+	awaitEnqueuedBlockTransfer(t, enqueued, "focus")
+
+	found := false
+	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
+		folder, index, ok := cfg.Folder("focus")
+		if !ok {
+			return
+		}
+		found = true
+		folder.NetworkPriority = 100
+		cfg.Folders[index] = folder
+	})
+	if err != nil {
+		close(active.release)
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	if !found {
+		close(active.release)
+		t.Fatal("focus folder disappeared before reprioritization")
+	}
+	m.downloadScheduler.mut.Lock()
+	focusPriority := m.downloadScheduler.folders["focus"].priority
+	globalLimit := m.downloadScheduler.globalLimit
+	globalInFlight := m.downloadScheduler.globalInFlight
+	m.downloadScheduler.mut.Unlock()
+	if focusPriority != 100 {
+		close(active.release)
+		t.Fatalf("download scheduler retained focus priority %d, want 100", focusPriority)
+	}
+	if globalLimit != activeSize || globalInFlight != activeSize {
+		close(active.release)
+		t.Fatalf("download capacity after reprioritization is %d/%d, want %d/%d", globalInFlight, globalLimit, activeSize, activeSize)
+	}
+	assertNoOutgoingBlockTransferStarted(t, started)
+
+	close(active.release)
+	awaitOutgoingBlockTransferResult(t, activeResult)
+	focus := awaitOutgoingBlockTransferStart(t, started)
+	if focus.folder != "focus" {
+		close(focus.release)
+		t.Fatalf("first download after reprioritization is %q, want focus", focus.folder)
+	}
+	close(focus.release)
+	awaitOutgoingBlockTransferResult(t, focusResult)
+	bulk := awaitOutgoingBlockTransferStart(t, started)
+	if bulk.folder != "bulk" {
+		close(bulk.release)
+		t.Fatalf("second download after reprioritization is %q, want bulk", bulk.folder)
+	}
+	close(bulk.release)
+	awaitOutgoingBlockTransferResult(t, bulkResult)
+}
+
+func TestNetworkPriorityPrototypeRateLimitIndependenceThroughModelRequestGlobal(t *testing.T) {
+	m := newDownloadBlockTransferModel(t, map[string]int{
+		"high": 100,
+		"low":  0,
+	})
+	configureDownloadBlockTransferSchedulerForTest(m.model, 2, map[string]int{"high": 100, "low": 0})
+	started := make(chan outgoingBlockTransferStart, 4)
+	sharedRate := newObservedSharedRateLimiter(64*1024, 8)
+	addOutgoingBlockTransferConnectionWithCompletion(m.model, device1, "connection", started, func(ctx context.Context, req *protocol.Request) error {
+		return sharedRate.take(ctx, req.Folder, req.Size)
+	})
+
+	activeLowResult1 := requestOutgoingBlockTransfer(t, m.model, device1, "low", 1)
+	activeLow1 := awaitOutgoingBlockTransferStart(t, started)
+	activeLowResult2 := requestOutgoingBlockTransfer(t, m.model, device1, "low", 1)
+	activeLow2 := awaitOutgoingBlockTransferStart(t, started)
+	enqueued := observeEnqueuedBlockTransfers(m.model)
+	highResult := requestOutgoingBlockTransfer(t, m.model, device1, "high", 1)
+	awaitEnqueuedBlockTransfer(t, enqueued, "high")
+	queuedLowResult := requestOutgoingBlockTransfer(t, m.model, device1, "low", 1)
+	awaitEnqueuedBlockTransfer(t, enqueued, "low")
+	assertNoOutgoingBlockTransferStarted(t, started)
+
+	limitBefore := sharedRate.limiter.Limit()
+	close(activeLow1.release)
+	awaitOutgoingBlockTransferResult(t, activeLowResult1)
+	high := awaitOutgoingBlockTransferStart(t, started)
+	if high.folder != "high" {
+		close(high.release)
+		t.Fatalf("first admission after a low-priority transfer completed is %q, want high", high.folder)
+	}
+	assertNoOutgoingBlockTransferStarted(t, started)
+
+	close(activeLow2.release)
+	awaitOutgoingBlockTransferResult(t, activeLowResult2)
+	queuedLow := awaitOutgoingBlockTransferStart(t, started)
+	if queuedLow.folder != "low" {
+		close(high.release)
+		close(queuedLow.release)
+		t.Fatalf("admission sharing the limiter with active high-priority work is %q, want low", queuedLow.folder)
+	}
+	close(high.release)
+	close(queuedLow.release)
+	awaitOutgoingBlockTransferResult(t, highResult)
+	awaitOutgoingBlockTransferResult(t, queuedLowResult)
+
+	if got := sharedRate.limiter.Limit(); got != limitBefore {
+		t.Fatalf("shared raw rate limit changed from %v to %v", limitBefore, got)
+	}
+	if got := sharedRate.bytesFor("high"); got != 1 {
+		t.Fatalf("high-priority bytes through shared rate limiter = %d, want 1", got)
+	}
+	if got := sharedRate.bytesFor("low"); got != 3 {
+		t.Fatalf("low-priority bytes through shared rate limiter = %d, want 3", got)
+	}
 }
 
 func TestModelRequestGlobalSelectsAvailableSourceAcrossDevices(t *testing.T) {
@@ -617,6 +762,10 @@ func configureDownloadBlockTransferSchedulerForTest(m *model, globalLimit int, p
 }
 
 func addOutgoingBlockTransferConnection(m *model, device protocol.DeviceID, connectionID string, started chan<- outgoingBlockTransferStart) *protocolmocks.Connection {
+	return addOutgoingBlockTransferConnectionWithCompletion(m, device, connectionID, started, nil)
+}
+
+func addOutgoingBlockTransferConnectionWithCompletion(m *model, device protocol.DeviceID, connectionID string, started chan<- outgoingBlockTransferStart, complete func(context.Context, *protocol.Request) error) *protocolmocks.Connection {
 	conn := new(protocolmocks.Connection)
 	conn.DeviceIDReturns(device)
 	conn.ConnectionIDReturns(connectionID)
@@ -629,6 +778,11 @@ func addOutgoingBlockTransferConnection(m *model, device protocol.DeviceID, conn
 		}
 		select {
 		case <-start.release:
+			if complete != nil {
+				if err := complete(ctx, req); err != nil {
+					return nil, err
+				}
+			}
 			return make([]byte, req.Size), nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -640,6 +794,39 @@ func addOutgoingBlockTransferConnection(m *model, device protocol.DeviceID, conn
 	m.closed[connectionID] = make(chan struct{})
 	m.mut.Unlock()
 	return conn
+}
+
+type observedSharedRateLimiter struct {
+	limiter *rate.Limiter
+	mut     sync.Mutex
+	bytes   map[string]int
+}
+
+func newObservedSharedRateLimiter(limit rate.Limit, burst int) *observedSharedRateLimiter {
+	return &observedSharedRateLimiter{
+		limiter: rate.NewLimiter(limit, burst),
+		bytes:   make(map[string]int),
+	}
+}
+
+func (l *observedSharedRateLimiter) take(ctx context.Context, folder string, bytes int) error {
+	for remaining := bytes; remaining > 0; {
+		chunk := min(remaining, l.limiter.Burst())
+		if err := l.limiter.WaitN(ctx, chunk); err != nil {
+			return err
+		}
+		remaining -= chunk
+	}
+	l.mut.Lock()
+	l.bytes[folder] += bytes
+	l.mut.Unlock()
+	return nil
+}
+
+func (l *observedSharedRateLimiter) bytesFor(folder string) int {
+	l.mut.Lock()
+	defer l.mut.Unlock()
+	return l.bytes[folder]
 }
 
 func requestOutgoingBlockTransfer(t *testing.T, m *model, device protocol.DeviceID, folder string, size int) <-chan outgoingBlockTransferResult {

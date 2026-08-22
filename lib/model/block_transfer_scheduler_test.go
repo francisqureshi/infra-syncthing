@@ -74,6 +74,28 @@ func TestBlockTransferSchedulerAllowsOnlyGenuineLeftoverCapacity(t *testing.T) {
 	highAdmission.close()
 }
 
+func TestBlockTransferSchedulerProtectsOnlyNextHighPriorityBlock(t *testing.T) {
+	scheduler := configuredBlockTransferScheduler(10, map[protocol.DeviceID]int{device1: 4}, map[string]int{
+		"active": 0,
+		"high":   100,
+		"low":    -100,
+	})
+
+	active := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptorForDevice("active", device1, 4)))
+	nextHigh := scheduler.enqueue(blockTransferDescriptorForDevice("high", device1, 4))
+	laterHigh := scheduler.enqueue(blockTransferDescriptorForDevice("high", device2, 10))
+	leftover := scheduler.enqueue(blockTransferDescriptorForDevice("low", device2, 2))
+
+	assertBlockTransferWaiting(t, nextHigh)
+	assertBlockTransferWaiting(t, laterHigh)
+	leftoverAdmission := awaitBlockTransferAdmission(t, leftover)
+	leftoverAdmission.close()
+
+	active.close()
+	awaitBlockTransferAdmission(t, nextHigh).close()
+	awaitBlockTransferAdmission(t, laterHigh).close()
+}
+
 func TestBlockTransferSchedulerSharesEqualPriorityBytesBetweenFolders(t *testing.T) {
 	scheduler := configuredBlockTransferScheduler(4, nil, map[string]int{
 		"gate":     100,

@@ -117,7 +117,8 @@ type FolderSummary struct {
 	IgnorePatterns bool   `json:"ignorePatterns"`
 	WatchError     string `json:"watchError"`
 
-	NetworkPrioritySchedulingActive bool `json:"networkPrioritySchedulingActive"`
+	NetworkPrioritySchedulingActive bool                          `json:"networkPrioritySchedulingActive"`
+	NetworkPriorityScheduling       NetworkPrioritySchedulerState `json:"networkPriorityScheduling"`
 }
 
 func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
@@ -199,6 +200,11 @@ func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {
 	err = c.model.WatchError(folder)
 	if err != nil {
 		res.WatchError = err.Error()
+	}
+
+	if provider, ok := c.model.(NetworkPrioritySchedulerStateProvider); ok {
+		res.NetworkPriorityScheduling = provider.NetworkPrioritySchedulerState(folder)
+		res.NetworkPrioritySchedulingActive = res.NetworkPriorityScheduling.Active
 	}
 
 	return res, nil

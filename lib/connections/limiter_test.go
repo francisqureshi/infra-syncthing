@@ -151,6 +151,62 @@ func TestNetworkPriorityFeatureFlagDoesNotChangeDownloadRateLimits(t *testing.T)
 	}
 }
 
+func TestNetworkPriorityControlledLoadPreservesRateLimitedByteTotals(t *testing.T) {
+	wrapper, wrapperCancel := initConfig()
+	defer wrapperCancel()
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.MaxSendKbps = 64 * 1024
+		cfg.Options.MaxRecvKbps = 64 * 1024
+		_, index, _ := cfg.Device(device2)
+		cfg.Devices[index].MaxSendKbps = 64 * 1024
+		cfg.Devices[index].MaxRecvKbps = 64 * 1024
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	lim := newLimiter(device1, wrapper)
+	payload := make([]byte, 2*limiterBurstSize+123)
+
+	transfer := func() (int64, int64) {
+		lim.mu.Lock()
+		reader := lim.newLimitedReaderLocked(device2, bytes.NewReader(payload), false)
+		var destination bytes.Buffer
+		writer := lim.newLimitedWriterLocked(device2, &destination, false)
+		lim.mu.Unlock()
+
+		written, err := io.Copy(writer, bytes.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		read, err := io.Copy(io.Discard, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(destination.Bytes(), payload) {
+			t.Fatal("rate-limited writer changed the transferred payload")
+		}
+		return read, written
+	}
+
+	beforeRead, beforeWritten := transfer()
+	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.FeatureFlags = append(cfg.Options.FeatureFlags, config.FeatureFlagNetworkPriority)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	afterRead, afterWritten := transfer()
+	wantTotal := int64(2 * len(payload))
+	if got := beforeRead + afterRead; got != wantTotal {
+		t.Fatalf("rate-limited download total = %d, want %d", got, wantTotal)
+	}
+	if got := beforeWritten + afterWritten; got != wantTotal {
+		t.Fatalf("rate-limited upload total = %d, want %d", got, wantTotal)
+	}
+}
+
 func TestSetDeviceLimits(t *testing.T) {
 	wrapper, wrapperCancel := initConfig()
 	defer wrapperCancel()
