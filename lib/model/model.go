@@ -151,6 +151,10 @@ type model struct {
 	// uploadScheduler orders incoming Block Transfers before buffers or file
 	// data are acquired when Network Priority scheduling is active.
 	uploadScheduler *blockTransferScheduler
+	// downloadScheduler orders outgoing Block Transfers before a connection
+	// is selected and a request is sent when Network Priority scheduling is
+	// active.
+	downloadScheduler *blockTransferScheduler
 	// folderIOLimiter limits the number of concurrent I/O heavy operations,
 	// such as scans and pulls.
 	folderIOLimiter *semaphore.Semaphore
@@ -219,7 +223,9 @@ var (
 func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFiles []string, evLogger events.Logger, keyGen *protocol.KeyGenerator) Model {
 	spec := svcutil.SpecWithDebugLogger()
 	uploadScheduler := newBlockTransferScheduler()
-	configureBlockTransferScheduler(uploadScheduler, cfg.RawCopy())
+	configureUploadBlockTransferScheduler(uploadScheduler, cfg.RawCopy())
+	downloadScheduler := newBlockTransferScheduler()
+	configureDownloadBlockTransferScheduler(downloadScheduler, cfg.RawCopy())
 	m := &model{
 		Supervisor: suture.New("model", spec),
 
@@ -235,6 +241,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		shortID:              id.Short(),
 		globalRequestLimiter: semaphore.New(1024 * cfg.Options().MaxConcurrentIncomingRequestKiB()),
 		uploadScheduler:      uploadScheduler,
+		downloadScheduler:    downloadScheduler,
 		folderIOLimiter:      semaphore.New(cfg.Options().MaxFolderConcurrency()),
 		fatalChan:            make(chan error),
 		started:              make(chan struct{}),
@@ -1196,7 +1203,21 @@ func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protoc
 		return fmt.Errorf("%s: %w", folder, ErrFolderNotRunning)
 	}
 
-	return indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence)
+	err := indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence)
+	if err == nil {
+		changedFiles := make(map[string]struct{}, len(fs))
+		for _, file := range fs {
+			changedFiles[file.Name] = struct{}{}
+		}
+		m.downloadScheduler.refreshRunnableTransfers(func(descriptor blockTransferDescriptor) bool {
+			if descriptor.folder != folder || !descriptor.hasDevice(deviceID) {
+				return false
+			}
+			_, changed := changedFiles[descriptor.name]
+			return !update || changed
+		})
+	}
+	return err
 }
 
 type clusterConfigDeviceInfo struct {
@@ -1304,6 +1325,9 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 	m.mut.Lock()
 	m.remoteFolderStates[deviceID] = states
 	m.mut.Unlock()
+	m.downloadScheduler.refreshRunnableTransfers(func(descriptor blockTransferDescriptor) bool {
+		return descriptor.hasDevice(deviceID)
+	})
 
 	m.evLogger.Log(events.ClusterConfigReceived, ClusterConfigReceivedEventData{
 		Device: deviceID,
@@ -1881,6 +1905,7 @@ func (m *model) Closed(conn protocol.Connection, err error) {
 	connID := conn.ConnectionID()
 	deviceID := conn.DeviceID()
 	m.uploadScheduler.cancelConnection(connID)
+	m.downloadScheduler.cancelConnection(connID)
 
 	m.mut.Lock()
 	conn, ok := m.connections[connID]
@@ -2054,10 +2079,12 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 	}
 
 	descriptor := blockTransferDescriptor{
-		folder:     req.Folder,
-		device:     deviceID,
-		connection: conn.ConnectionID(),
-		bytes:      req.Size,
+		folder: req.Folder,
+		sources: []blockTransferSource{{
+			device:      deviceID,
+			connections: []string{conn.ConnectionID()},
+		}},
+		bytes: req.Size,
 	}
 	waiter := m.uploadScheduler.enqueue(descriptor)
 	if m.blockTransferEnqueued != nil {
@@ -2487,6 +2514,14 @@ func (m *model) DownloadProgress(conn protocol.Connection, p *protocol.DownloadP
 	downloads := m.deviceDownloads[deviceID]
 	m.mut.RUnlock()
 	downloads.Update(p.Folder, p.Updates)
+	changedFiles := make(map[string]struct{}, len(p.Updates))
+	for _, update := range p.Updates {
+		changedFiles[update.Name] = struct{}{}
+	}
+	m.downloadScheduler.refreshRunnableTransfers(func(descriptor blockTransferDescriptor) bool {
+		_, changed := changedFiles[descriptor.name]
+		return descriptor.folder == p.Folder && changed && descriptor.hasDevice(deviceID)
+	})
 	state := downloads.GetBlockCounts(p.Folder)
 
 	m.evLogger.Log(events.RemoteDownloadProgress, map[string]any{
@@ -2515,13 +2550,137 @@ func (m *model) deviceDidCloseRLocked(deviceID protocol.DeviceID, duration time.
 }
 
 func (m *model) RequestGlobal(ctx context.Context, deviceID protocol.DeviceID, folder, name string, blockNo int, offset int64, size int, hash []byte, fromTemporary bool) ([]byte, error) {
-	conn, connOK := m.requestConnectionForDevice(deviceID)
-	if !connOK {
-		return nil, fmt.Errorf("requestGlobal: no connection to device: %s", deviceID.Short())
+	req := &protocol.Request{Folder: folder, Name: name, BlockNo: blockNo, Offset: offset, Size: size, Hash: hash}
+	data, _, err := m.requestGlobalFromAny(ctx, []Availability{{ID: deviceID, FromTemporary: fromTemporary}}, req)
+	return data, err
+}
+
+// requestGlobalFromAny admits a Block Transfer using the sources that the
+// caller currently considers runnable.
+func (m *model) requestGlobalFromAny(ctx context.Context, candidates []Availability, req *protocol.Request) ([]byte, Availability, error) {
+	return m.requestGlobalWithAvailability(ctx, func() []Availability { return candidates }, req)
+}
+
+// requestGlobalWithAvailability revalidates queued source data before
+// admission. The provider must return only sources that are currently runnable
+// for this request; it may be called while the request is in Scheduling Wait.
+func (m *model) requestGlobalWithAvailability(ctx context.Context, availability func() []Availability, req *protocol.Request) ([]byte, Availability, error) {
+	candidates := availability()
+	sources := make([]blockTransferSource, 0, len(candidates))
+	for _, candidate := range candidates {
+		connections := m.requestConnectionsForDevice(candidate.ID)
+		if len(connections) == 0 {
+			continue
+		}
+		sources = append(sources, blockTransferSource{
+			device:        candidate.ID,
+			connections:   connections,
+			fromTemporary: candidate.FromTemporary,
+		})
+	}
+	if len(sources) == 0 {
+		var selected Availability
+		if len(candidates) > 0 {
+			selected = candidates[0]
+		}
+		return nil, selected, fmt.Errorf("requestGlobal: no connection to an available device")
 	}
 
-	l.Debugf("%v REQ(out): %s (%s): %q / %q b=%d o=%d s=%d h=%x ft=%t", m, deviceID.Short(), conn, folder, name, blockNo, offset, size, hash, fromTemporary)
-	return conn.Request(ctx, &protocol.Request{Folder: folder, Name: name, BlockNo: blockNo, Offset: offset, Size: size, Hash: hash, FromTemporary: fromTemporary})
+	descriptor := blockTransferDescriptor{
+		folder:         req.Folder,
+		name:           req.Name,
+		sources:        sources,
+		refreshSources: m.refreshBlockTransferSources(availability),
+		bytes:          req.Size,
+	}
+	waiter := m.downloadScheduler.enqueue(descriptor)
+	if m.blockTransferEnqueued != nil {
+		m.blockTransferEnqueued(descriptor)
+	}
+	admission, err := waiter.waitContext(ctx, m.downloadScheduler)
+	if err != nil {
+		return nil, candidates[0], err
+	}
+	if admission != nil {
+		defer admission.close()
+	}
+
+	var selected Availability
+	var conn protocol.Connection
+	var connOK bool
+	if admission == nil {
+		legacyCandidates := make([]Availability, len(sources))
+		for i, source := range sources {
+			legacyCandidates[i] = Availability{ID: source.device, FromTemporary: source.fromTemporary}
+		}
+		selected = legacyCandidates[activity.leastBusy(legacyCandidates)]
+		conn, connOK = m.requestConnectionForDevice(selected.ID)
+	} else {
+		selected = Availability{ID: admission.device, FromTemporary: admission.fromTemporary}
+		m.mut.RLock()
+		conn, connOK = m.connections[admission.connection]
+		m.mut.RUnlock()
+	}
+	if !connOK {
+		return nil, selected, fmt.Errorf("requestGlobal: no connection to device: %s", selected.ID.Short())
+	}
+
+	activity.using(selected)
+	defer activity.done(selected)
+	req.FromTemporary = selected.FromTemporary
+	l.Debugf("%v REQ(out): %s (%s): %q / %q b=%d o=%d s=%d h=%x ft=%t", m, selected.ID.Short(), conn, req.Folder, req.Name, req.BlockNo, req.Offset, req.Size, req.Hash, req.FromTemporary)
+	data, err := conn.Request(ctx, req)
+	return data, selected, err
+}
+
+func (m *model) refreshBlockTransferSources(availability func() []Availability) func([]blockTransferSource) []blockTransferSource {
+	return func(sources []blockTransferSource) []blockTransferSource {
+		availableSources := make(map[Availability]struct{})
+		for _, candidate := range availability() {
+			availableSources[candidate] = struct{}{}
+		}
+
+		remainingSources := sources[:0]
+		for _, source := range sources {
+			candidate := Availability{ID: source.device, FromTemporary: source.fromTemporary}
+			if _, ok := availableSources[candidate]; !ok {
+				continue
+			}
+			availableConnections := m.requestConnectionsForDevice(source.device)
+			remainingConnections := source.connections[:0]
+			for _, connection := range source.connections {
+				if slices.Contains(availableConnections, connection) {
+					remainingConnections = append(remainingConnections, connection)
+				}
+			}
+			if len(remainingConnections) == 0 {
+				continue
+			}
+			source.connections = remainingConnections
+			remainingSources = append(remainingSources, source)
+		}
+		return remainingSources
+	}
+}
+
+func (m *model) requestConnectionsForDevice(deviceID protocol.DeviceID) []string {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
+
+	connIDs, ok := m.deviceConnIDs[deviceID]
+	if !ok {
+		return nil
+	}
+	if len(connIDs) > 1 {
+		connIDs = connIDs[1:]
+	}
+	connections := make([]string, 0, len(connIDs))
+	for _, connID := range connIDs {
+		if _, ok := m.connections[connID]; ok {
+			connections = append(connections, connID)
+		}
+	}
+	return connections
 }
 
 // requestConnectionForDevice returns a connection to the given device, to
@@ -2930,6 +3089,32 @@ func (m *model) blockAvailabilityRLocked(cfg config.FolderConfiguration, file pr
 	return candidates
 }
 
+func (m *model) blockSourceAvailable(cfg config.FolderConfiguration, file protocol.FileInfo, block protocol.BlockInfo, candidate Availability) bool {
+	m.mut.RLock()
+	state := m.remoteFolderStates[candidate.ID][cfg.ID]
+	downloads := m.deviceDownloads[candidate.ID]
+	m.mut.RUnlock()
+	if state != remoteFolderValid {
+		return false
+	}
+
+	if candidate.FromTemporary {
+		blockNo := int(block.Offset / int64(file.BlockSize()))
+		return downloads.Has(cfg.ID, file.Name, file.Version, blockNo)
+	}
+
+	remoteFile, ok, err := m.sdb.GetDeviceFile(cfg.ID, candidate.ID, file.Name)
+	if err != nil || !ok || remoteFile.IsDeleted() || remoteFile.IsInvalid() || remoteFile.Type != protocol.FileInfoTypeFile {
+		return false
+	}
+	for _, remoteBlock := range remoteFile.Blocks {
+		if remoteBlock.Offset == block.Offset && remoteBlock.Size == block.Size && bytes.Equal(remoteBlock.Hash, block.Hash) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *model) fileAvailability(cfg config.FolderConfiguration, file protocol.FileInfo) []Availability {
 	m.mut.RLock()
 	defer m.mut.RUnlock()
@@ -3019,7 +3204,8 @@ func (m *model) CommitConfiguration(from, to config.Configuration) bool {
 
 	// Delay processing config changes until after the initial setup
 	<-m.started
-	configureBlockTransferScheduler(m.uploadScheduler, to)
+	configureUploadBlockTransferScheduler(m.uploadScheduler, to)
+	configureDownloadBlockTransferScheduler(m.downloadScheduler, to)
 
 	// Go through the folder configs and figure out if we need to restart or not.
 
@@ -3192,7 +3378,7 @@ func (m *model) setConnRequestLimitersLocked(cfg config.DeviceConfiguration) {
 	}
 }
 
-func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration) {
+func configureUploadBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration) {
 	deviceLimits := make(map[protocol.DeviceID]int, len(cfg.Devices))
 	for _, device := range cfg.Devices {
 		switch {
@@ -3204,6 +3390,23 @@ func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg conf
 			deviceLimits[device.DeviceID] = 0
 		}
 	}
+	configureBlockTransferScheduler(scheduler, cfg, 1024*cfg.Options.MaxConcurrentIncomingRequestKiB(), deviceLimits)
+}
+
+func configureDownloadBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration) {
+	configureBlockTransferScheduler(scheduler, cfg, 1024*cfg.Options.MaxConcurrentOutgoingRequestKiB(), make(map[protocol.DeviceID]int))
+}
+
+func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration, globalLimit int, deviceLimits map[protocol.DeviceID]int) {
+	scheduler.configure(blockTransferSchedulerConfiguration{
+		enabled:      cfg.Options.FeatureFlag(config.FeatureFlagNetworkPriority),
+		globalLimit:  globalLimit,
+		deviceLimits: deviceLimits,
+		folders:      configuredBlockTransferFolders(cfg),
+	})
+}
+
+func configuredBlockTransferFolders(cfg config.Configuration) map[string]blockTransferFolder {
 	folders := make(map[string]blockTransferFolder, len(cfg.Folders))
 	for _, folder := range cfg.Folders {
 		folders[folder.ID] = blockTransferFolder{
@@ -3211,12 +3414,7 @@ func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg conf
 			runnable: !folder.Paused,
 		}
 	}
-	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      cfg.Options.FeatureFlag(config.FeatureFlagNetworkPriority),
-		globalLimit:  1024 * cfg.Options.MaxConcurrentIncomingRequestKiB(),
-		deviceLimits: deviceLimits,
-		folders:      folders,
-	})
+	return folders
 }
 
 func (m *model) cleanPending(existingDevices map[protocol.DeviceID]config.DeviceConfiguration, existingFolders map[string]config.FolderConfiguration, ignoredDevices deviceIDSet, removedFolders map[string]struct{}) {

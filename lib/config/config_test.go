@@ -656,6 +656,53 @@ func TestNetworkPriorityConfiguration(t *testing.T) {
 	}
 }
 
+func TestMaxConcurrentOutgoingRequestKiB(t *testing.T) {
+	const defaultLimitKiB = 256 * 1024
+	const minimumLimitKiB = 2 * protocol.MaxBlockSize / 1024
+
+	tests := []struct {
+		name string
+		raw  int
+		want int
+	}{
+		{name: "default", raw: 0, want: defaultLimitKiB},
+		{name: "disabled", raw: -1, want: 0},
+		{name: "minimum clamped", raw: 1, want: minimumLimitKiB},
+		{name: "explicit", raw: minimumLimitKiB + 1, want: minimumLimitKiB + 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := OptionsConfiguration{RawMaxConcurrentOutgoingRequestKiB: tc.raw}
+			if got := opts.MaxConcurrentOutgoingRequestKiB(); got != tc.want {
+				t.Fatalf("MaxConcurrentOutgoingRequestKiB() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMaxConcurrentOutgoingRequestKiBPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.xml")
+	cfg := New(device1)
+	cfg.Options.RawMaxConcurrentOutgoingRequestKiB = 64 * 1024
+
+	wrapper := wrap(path, cfg, device1)
+	if err := wrapper.Save(); err != nil {
+		wrapper.stop()
+		t.Fatal(err)
+	}
+	wrapper.stop()
+
+	loaded, err := load(path, device1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loaded.stop()
+	if got := loaded.Options().RawMaxConcurrentOutgoingRequestKiB; got != cfg.Options.RawMaxConcurrentOutgoingRequestKiB {
+		t.Fatalf("persisted maxConcurrentOutgoingRequestKiB = %d, want %d", got, cfg.Options.RawMaxConcurrentOutgoingRequestKiB)
+	}
+}
+
 func TestNetworkPriorityPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.xml")
 	cfg := New(device1)

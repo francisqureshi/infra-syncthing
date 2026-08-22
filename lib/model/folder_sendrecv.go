@@ -1608,11 +1608,9 @@ loop:
 		default:
 		}
 
-		// Select the least busy device to pull the block from. If we found no
-		// feasible device at all, fail the block (and in the long run, the
-		// file).
-		found := activity.leastBusy(candidates)
-		if found == -1 {
+		// If we found no feasible device at all, fail the block (and in the
+		// long run, the file).
+		if len(candidates) == 0 {
 			if lastError != nil {
 				state.fail(fmt.Errorf("pull: %w", lastError))
 			} else {
@@ -1621,17 +1619,22 @@ loop:
 			break
 		}
 
-		selected := candidates[found]
+		var buf []byte
+		var selected Availability
+		blockNo := int(state.block.Offset / int64(state.file.BlockSize()))
+		req := &protocol.Request{Folder: f.folderID, Name: state.file.Name, BlockNo: blockNo, Offset: state.block.Offset, Size: state.block.Size, Hash: state.block.Hash}
+		buf, selected, lastError = f.model.requestGlobalWithAvailability(ctx, func() []Availability {
+			return slices.DeleteFunc(slices.Clone(candidates), func(candidate Availability) bool {
+				return !f.model.blockSourceAvailable(f.FolderConfiguration, state.file, state.block, candidate)
+			})
+		}, req)
+		found := slices.Index(candidates, selected)
+		if found < 0 {
+			state.fail(fmt.Errorf("pull: selected unavailable source: %w", lastError))
+			break loop
+		}
 		candidates[found] = candidates[len(candidates)-1]
 		candidates = candidates[:len(candidates)-1]
-
-		// Fetch the block, while marking the selected device as in use so that
-		// leastBusy can select another device when someone else asks.
-		activity.using(selected)
-		var buf []byte
-		blockNo := int(state.block.Offset / int64(state.file.BlockSize()))
-		buf, lastError = f.model.RequestGlobal(ctx, selected.ID, f.folderID, state.file.Name, blockNo, state.block.Offset, state.block.Size, state.block.Hash, selected.FromTemporary)
-		activity.done(selected)
 		if lastError != nil {
 			f.sl.DebugContext(ctx, "Block request returned error", slogutil.FilePath(state.file.Name), "offset", state.block.Offset, "size", state.block.Size, "device", selected.ID.Short(), slogutil.Error(lastError))
 			continue
