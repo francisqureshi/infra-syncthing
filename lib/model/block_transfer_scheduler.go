@@ -29,10 +29,10 @@ type blockTransferScheduler struct {
 	deviceLimits    map[protocol.DeviceID]int
 	deviceInFlight  map[protocol.DeviceID]int
 	folders         map[string]blockTransferFolder
-	folderBytes     map[blockTransferFolderShare]int64
-	deviceBytes     map[blockTransferDeviceShare]int64
-	activeFolders   map[blockTransferFolderShare]int
-	activeDevices   map[blockTransferDeviceShare]int
+	folderBytes     map[blockTransferFolderAccount]int64
+	deviceBytes     map[blockTransferDeviceAccount]int64
+	activeFolders   map[blockTransferFolderAccount]int
+	activeDevices   map[blockTransferDeviceAccount]int
 	connectionTails map[string]chan struct{}
 	readyResponse   chan struct{}
 	queued          []*blockTransferWaiter
@@ -51,12 +51,12 @@ type blockTransferSchedulerConfiguration struct {
 	folders      map[string]blockTransferFolder
 }
 
-type blockTransferFolderShare struct {
+type blockTransferFolderAccount struct {
 	priority int
 	folder   string
 }
 
-type blockTransferDeviceShare struct {
+type blockTransferDeviceAccount struct {
 	priority int
 	folder   string
 	device   protocol.DeviceID
@@ -81,8 +81,8 @@ type blockTransferAdmission struct {
 	connection       string
 	previousResponse <-chan struct{}
 	responseDone     chan struct{}
-	folderShare      blockTransferFolderShare
-	deviceShare      blockTransferDeviceShare
+	folderAccount    blockTransferFolderAccount
+	deviceAccount    blockTransferDeviceAccount
 	once             sync.Once
 }
 
@@ -93,27 +93,18 @@ func newBlockTransferScheduler() *blockTransferScheduler {
 		deviceLimits:    make(map[protocol.DeviceID]int),
 		deviceInFlight:  make(map[protocol.DeviceID]int),
 		folders:         make(map[string]blockTransferFolder),
-		folderBytes:     make(map[blockTransferFolderShare]int64),
-		deviceBytes:     make(map[blockTransferDeviceShare]int64),
-		activeFolders:   make(map[blockTransferFolderShare]int),
-		activeDevices:   make(map[blockTransferDeviceShare]int),
+		folderBytes:     make(map[blockTransferFolderAccount]int64),
+		deviceBytes:     make(map[blockTransferDeviceAccount]int64),
+		activeFolders:   make(map[blockTransferFolderAccount]int),
+		activeDevices:   make(map[blockTransferDeviceAccount]int),
 		connectionTails: make(map[string]chan struct{}),
 		readyResponse:   readyResponse,
 	}
 }
 
-func (s *blockTransferScheduler) setEnabled(enabled bool) {
-	s.mut.Lock()
-	s.enabled = enabled
-	if !enabled {
-		s.finishQueuedLocked(func(*blockTransferWaiter) bool { return true }, blockTransferResult{})
-	}
-	s.scheduleLocked()
-	s.mut.Unlock()
-}
-
 func (s *blockTransferScheduler) configure(cfg blockTransferSchedulerConfiguration) {
 	s.mut.Lock()
+	previousFolders := s.folders
 	if !cfg.enabled {
 		s.finishQueuedLocked(func(*blockTransferWaiter) bool { return true }, blockTransferResult{})
 	} else {
@@ -126,31 +117,8 @@ func (s *blockTransferScheduler) configure(cfg blockTransferSchedulerConfigurati
 	s.globalLimit = max(cfg.globalLimit, 0)
 	s.deviceLimits = cfg.deviceLimits
 	s.folders = cfg.folders
-	s.scheduleLocked()
-	s.mut.Unlock()
-}
-
-func (s *blockTransferScheduler) setGlobalLimit(bytes int) {
-	s.mut.Lock()
-	s.globalLimit = max(bytes, 0)
-	s.scheduleLocked()
-	s.mut.Unlock()
-}
-
-func (s *blockTransferScheduler) setDeviceLimit(device protocol.DeviceID, bytes int) {
-	s.mut.Lock()
-	s.deviceLimits[device] = max(bytes, 0)
-	s.scheduleLocked()
-	s.mut.Unlock()
-}
-
-func (s *blockTransferScheduler) setFolder(folder string, priority int, runnable bool) {
-	s.mut.Lock()
-	s.folders[folder] = blockTransferFolder{priority: priority, runnable: runnable}
-	if !runnable {
-		s.finishQueuedLocked(func(waiter *blockTransferWaiter) bool {
-			return waiter.descriptor.folder == folder
-		}, blockTransferResult{err: protocol.ErrGeneric})
+	if cfg.enabled {
+		s.initializeReprioritizedFairnessAccountsLocked(previousFolders)
 	}
 	s.scheduleLocked()
 	s.mut.Unlock()
@@ -183,91 +151,124 @@ func (s *blockTransferScheduler) enqueue(descriptor blockTransferDescriptor) *bl
 		s.mut.Unlock()
 		return waiter
 	}
-	s.initializeSharesLocked(descriptor)
+	s.initializeFairnessAccountsLocked(descriptor)
 	s.queued = append(s.queued, waiter)
 	s.scheduleLocked()
 	s.mut.Unlock()
 	return waiter
 }
 
-func (s *blockTransferScheduler) initializeSharesLocked(descriptor blockTransferDescriptor) {
+func (s *blockTransferScheduler) initializeFairnessAccountsLocked(descriptor blockTransferDescriptor) {
 	priority := s.folders[descriptor.folder].priority
-	folderShare := blockTransferFolderShare{priority: priority, folder: descriptor.folder}
-	if !s.folderParticipatingLocked(folderShare) {
-		s.folderBytes[folderShare] = s.minimumFolderBytesLocked(priority)
+	folderAccount := blockTransferFolderAccount{priority: priority, folder: descriptor.folder}
+	if !s.folderParticipatingLocked(folderAccount) {
+		s.folderBytes[folderAccount] = s.minimumFolderBytesLocked(priority, nil)
 	}
-	deviceShare := blockTransferDeviceShare{priority: priority, folder: descriptor.folder, device: descriptor.device}
-	if !s.deviceParticipatingLocked(deviceShare) {
-		s.deviceBytes[deviceShare] = s.minimumDeviceBytesLocked(priority, descriptor.folder)
+	deviceAccount := blockTransferDeviceAccount{priority: priority, folder: descriptor.folder, device: descriptor.device}
+	if !s.deviceParticipatingLocked(deviceAccount) {
+		s.deviceBytes[deviceAccount] = s.minimumDeviceBytesLocked(priority, descriptor.folder, true)
 	}
 }
 
-func (s *blockTransferScheduler) folderParticipatingLocked(share blockTransferFolderShare) bool {
-	if s.activeFolders[share] > 0 {
+func (s *blockTransferScheduler) initializeReprioritizedFairnessAccountsLocked(previousFolders map[string]blockTransferFolder) {
+	reprioritizedFolders := make(map[int]map[string]struct{})
+	reprioritizedDevices := make(map[blockTransferDeviceAccount]struct{})
+	for _, waiter := range s.queued {
+		folder := s.folders[waiter.descriptor.folder]
+		previous, existed := previousFolders[waiter.descriptor.folder]
+		if existed && previous.priority == folder.priority {
+			continue
+		}
+		if reprioritizedFolders[folder.priority] == nil {
+			reprioritizedFolders[folder.priority] = make(map[string]struct{})
+		}
+		reprioritizedFolders[folder.priority][waiter.descriptor.folder] = struct{}{}
+		deviceAccount := blockTransferDeviceAccount{priority: folder.priority, folder: waiter.descriptor.folder, device: waiter.descriptor.device}
+		reprioritizedDevices[deviceAccount] = struct{}{}
+	}
+
+	for priority, folders := range reprioritizedFolders {
+		minimum := s.minimumFolderBytesLocked(priority, folders)
+		for folder := range folders {
+			s.folderBytes[blockTransferFolderAccount{priority: priority, folder: folder}] = minimum
+		}
+	}
+	for account := range reprioritizedDevices {
+		s.deviceBytes[account] = s.minimumDeviceBytesLocked(account.priority, account.folder, false)
+	}
+}
+
+func (s *blockTransferScheduler) folderParticipatingLocked(account blockTransferFolderAccount) bool {
+	if s.activeFolders[account] > 0 {
 		return true
 	}
 	for _, waiter := range s.queued {
 		folder, ok := s.folders[waiter.descriptor.folder]
-		if ok && folder.priority == share.priority && waiter.descriptor.folder == share.folder {
+		if ok && folder.priority == account.priority && waiter.descriptor.folder == account.folder {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *blockTransferScheduler) deviceParticipatingLocked(share blockTransferDeviceShare) bool {
-	if s.activeDevices[share] > 0 {
+func (s *blockTransferScheduler) deviceParticipatingLocked(account blockTransferDeviceAccount) bool {
+	if s.activeDevices[account] > 0 {
 		return true
 	}
 	for _, waiter := range s.queued {
 		folder, ok := s.folders[waiter.descriptor.folder]
-		if ok && folder.priority == share.priority && waiter.descriptor.folder == share.folder && waiter.descriptor.device == share.device {
+		if ok && folder.priority == account.priority && waiter.descriptor.folder == account.folder && waiter.descriptor.device == account.device {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *blockTransferScheduler) minimumFolderBytesLocked(priority int) int64 {
+func (s *blockTransferScheduler) minimumFolderBytesLocked(priority int, excludedFolders map[string]struct{}) int64 {
 	var minimum int64
 	found := false
-	for share, count := range s.activeFolders {
-		if count > 0 && share.priority == priority && (!found || s.folderBytes[share] < minimum) {
-			minimum = s.folderBytes[share]
+	for account, count := range s.activeFolders {
+		_, excluded := excludedFolders[account.folder]
+		if count > 0 && account.priority == priority && !excluded && (!found || s.folderBytes[account] < minimum) {
+			minimum = s.folderBytes[account]
 			found = true
 		}
 	}
 	for _, waiter := range s.queued {
 		folder, ok := s.folders[waiter.descriptor.folder]
-		if !ok || folder.priority != priority {
+		_, excluded := excludedFolders[waiter.descriptor.folder]
+		if !ok || folder.priority != priority || excluded {
 			continue
 		}
-		share := blockTransferFolderShare{priority: priority, folder: waiter.descriptor.folder}
-		if !found || s.folderBytes[share] < minimum {
-			minimum = s.folderBytes[share]
+		account := blockTransferFolderAccount{priority: priority, folder: waiter.descriptor.folder}
+		if !found || s.folderBytes[account] < minimum {
+			minimum = s.folderBytes[account]
 			found = true
 		}
 	}
 	return minimum
 }
 
-func (s *blockTransferScheduler) minimumDeviceBytesLocked(priority int, folderID string) int64 {
+func (s *blockTransferScheduler) minimumDeviceBytesLocked(priority int, folderID string, includeQueued bool) int64 {
 	var minimum int64
 	found := false
-	for share, count := range s.activeDevices {
-		if count > 0 && share.priority == priority && share.folder == folderID && (!found || s.deviceBytes[share] < minimum) {
-			minimum = s.deviceBytes[share]
+	for account, count := range s.activeDevices {
+		if count > 0 && account.priority == priority && account.folder == folderID && (!found || s.deviceBytes[account] < minimum) {
+			minimum = s.deviceBytes[account]
 			found = true
 		}
+	}
+	if !includeQueued {
+		return minimum
 	}
 	for _, waiter := range s.queued {
 		folder, ok := s.folders[waiter.descriptor.folder]
 		if !ok || folder.priority != priority || waiter.descriptor.folder != folderID {
 			continue
 		}
-		share := blockTransferDeviceShare{priority: priority, folder: folderID, device: waiter.descriptor.device}
-		if !found || s.deviceBytes[share] < minimum {
-			minimum = s.deviceBytes[share]
+		account := blockTransferDeviceAccount{priority: priority, folder: folderID, device: waiter.descriptor.device}
+		if !found || s.deviceBytes[account] < minimum {
+			minimum = s.deviceBytes[account]
 			found = true
 		}
 	}
@@ -326,12 +327,12 @@ func (s *blockTransferScheduler) scheduleLocked() {
 		s.globalInFlight += globalCharge
 		s.deviceInFlight[waiter.descriptor.device] += deviceCharge
 		folder := s.folders[waiter.descriptor.folder]
-		folderShare := blockTransferFolderShare{priority: folder.priority, folder: waiter.descriptor.folder}
-		deviceShare := blockTransferDeviceShare{priority: folder.priority, folder: waiter.descriptor.folder, device: waiter.descriptor.device}
-		s.folderBytes[folderShare] += int64(waiter.descriptor.bytes)
-		s.deviceBytes[deviceShare] += int64(waiter.descriptor.bytes)
-		s.activeFolders[folderShare]++
-		s.activeDevices[deviceShare]++
+		folderAccount := blockTransferFolderAccount{priority: folder.priority, folder: waiter.descriptor.folder}
+		deviceAccount := blockTransferDeviceAccount{priority: folder.priority, folder: waiter.descriptor.folder, device: waiter.descriptor.device}
+		s.folderBytes[folderAccount] += int64(waiter.descriptor.bytes)
+		s.deviceBytes[deviceAccount] += int64(waiter.descriptor.bytes)
+		s.activeFolders[folderAccount]++
+		s.activeDevices[deviceAccount]++
 		previousResponse := (<-chan struct{})(s.connectionTails[waiter.descriptor.connection])
 		if previousResponse == nil {
 			previousResponse = s.readyResponse
@@ -346,8 +347,8 @@ func (s *blockTransferScheduler) scheduleLocked() {
 			connection:       waiter.descriptor.connection,
 			previousResponse: previousResponse,
 			responseDone:     responseDone,
-			folderShare:      folderShare,
-			deviceShare:      deviceShare,
+			folderAccount:    folderAccount,
+			deviceAccount:    deviceAccount,
 		}}
 	}
 }
@@ -380,7 +381,7 @@ func (s *blockTransferScheduler) firstFittingLocked(priority, reservedGlobal int
 		if !s.fitsLocked(waiter, reservedGlobal, reservedDevices) {
 			continue
 		}
-		folderBytes := s.folderBytes[blockTransferFolderShare{priority: priority, folder: waiter.descriptor.folder}]
+		folderBytes := s.folderBytes[blockTransferFolderAccount{priority: priority, folder: waiter.descriptor.folder}]
 		if selectedFolder == "" || folderBytes < selectedFolderBytes || (folderBytes == selectedFolderBytes && waiter.sequence < selectedFolderSequence) {
 			selectedFolder = waiter.descriptor.folder
 			selectedFolderBytes = folderBytes
@@ -394,7 +395,7 @@ func (s *blockTransferScheduler) firstFittingLocked(priority, reservedGlobal int
 		if waiter.descriptor.folder != selectedFolder || !s.fitsLocked(waiter, reservedGlobal, reservedDevices) {
 			continue
 		}
-		deviceBytes := s.deviceBytes[blockTransferDeviceShare{priority: priority, folder: selectedFolder, device: waiter.descriptor.device}]
+		deviceBytes := s.deviceBytes[blockTransferDeviceAccount{priority: priority, folder: selectedFolder, device: waiter.descriptor.device}]
 		if selected < 0 || deviceBytes < selectedDeviceBytes || (deviceBytes == selectedDeviceBytes && waiter.sequence < s.queued[selected].sequence) {
 			selected = i
 			selectedDeviceBytes = deviceBytes
@@ -437,24 +438,28 @@ func (s *blockTransferScheduler) deviceCharge(device protocol.DeviceID, bytes in
 
 func (a *blockTransferAdmission) close() {
 	a.once.Do(func() {
-		a.scheduler.mut.Lock()
-		close(a.responseDone)
-		if a.scheduler.connectionTails[a.connection] == a.responseDone {
-			delete(a.scheduler.connectionTails, a.connection)
-		}
-		a.scheduler.globalInFlight -= a.globalBytes
-		a.scheduler.deviceInFlight[a.device] -= a.deviceBytes
-		a.scheduler.activeFolders[a.folderShare]--
-		if a.scheduler.activeFolders[a.folderShare] == 0 {
-			delete(a.scheduler.activeFolders, a.folderShare)
-		}
-		a.scheduler.activeDevices[a.deviceShare]--
-		if a.scheduler.activeDevices[a.deviceShare] == 0 {
-			delete(a.scheduler.activeDevices, a.deviceShare)
-		}
-		a.scheduler.scheduleLocked()
-		a.scheduler.mut.Unlock()
+		a.scheduler.release(a)
 	})
+}
+
+func (s *blockTransferScheduler) release(admission *blockTransferAdmission) {
+	s.mut.Lock()
+	close(admission.responseDone)
+	if s.connectionTails[admission.connection] == admission.responseDone {
+		delete(s.connectionTails, admission.connection)
+	}
+	s.globalInFlight -= admission.globalBytes
+	s.deviceInFlight[admission.device] -= admission.deviceBytes
+	s.activeFolders[admission.folderAccount]--
+	if s.activeFolders[admission.folderAccount] == 0 {
+		delete(s.activeFolders, admission.folderAccount)
+	}
+	s.activeDevices[admission.deviceAccount]--
+	if s.activeDevices[admission.deviceAccount] == 0 {
+		delete(s.activeDevices, admission.deviceAccount)
+	}
+	s.scheduleLocked()
+	s.mut.Unlock()
 }
 
 func (a *blockTransferAdmission) waitForResponse() {

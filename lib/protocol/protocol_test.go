@@ -9,6 +9,7 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -726,10 +727,122 @@ func TestRequestResponsesPreserveAdmissionOrder(t *testing.T) {
 	close(secondMessage.done)
 }
 
+func TestRequestResponseFrameIsNonPreemptiveOnWire(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	first := newOrderedFakeRequestResponse(ready)
+	second := newOrderedFakeRequestResponse(first.closed)
+
+	m := newTestModel()
+	m.requestFn = func(req *Request) (RequestResponse, error) {
+		switch req.ID {
+		case 1:
+			return first, nil
+		case 2:
+			return second, nil
+		default:
+			return nil, errors.New("unexpected request")
+		}
+	}
+	writer := &controlledWireWriter{writes: make(chan controlledWireWrite)}
+	c := getRawConnection(NewConnection(c0ID, &testutil.NoopRW{}, writer, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	writerStopped := make(chan struct{})
+	go func() {
+		c.writerLoop()
+		close(writerStopped)
+	}()
+	c.clusterConfigBox <- &ClusterConfig{}
+	initialWrite := awaitControlledWireWrite(t, writer)
+	close(initialWrite.complete)
+	t.Cleanup(func() {
+		close(c.closed)
+		<-writerStopped
+	})
+
+	go c.handleRequest(&Request{ID: 1})
+	firstWrite := awaitControlledWireWrite(t, writer)
+	if id := responseIDFromWire(t, firstWrite.data); id != 1 {
+		t.Fatalf("first wire response ID is %d, expected 1", id)
+	}
+
+	go c.handleRequest(&Request{ID: 2})
+	<-second.waitStarted
+	select {
+	case write := <-writer.writes:
+		close(write.complete)
+		t.Fatal("second response began writing before the active frame completed")
+	default:
+	}
+
+	close(firstWrite.complete)
+	secondWrite := awaitControlledWireWrite(t, writer)
+	if id := responseIDFromWire(t, secondWrite.data); id != 2 {
+		t.Fatalf("second wire response ID is %d, expected 2", id)
+	}
+	close(secondWrite.complete)
+	select {
+	case <-second.closed:
+	case <-time.After(time.Second):
+		t.Fatal("second response lifecycle did not complete after its wire frame")
+	}
+}
+
+func TestRequestErrorsPreserveAdmissionOrder(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	firstMayReturn := make(chan struct{})
+	firstStarted := make(chan struct{})
+	first := newOrderedFakeRequestError(ready)
+	second := newOrderedFakeRequestResponse(first.closed)
+
+	m := newTestModel()
+	m.requestFn = func(req *Request) (RequestResponse, error) {
+		switch req.ID {
+		case 1:
+			close(firstStarted)
+			<-firstMayReturn
+			return nil, first
+		case 2:
+			return second, nil
+		default:
+			return nil, errors.New("unexpected request")
+		}
+	}
+	c := getRawConnection(NewConnection(c0ID, &testutil.NoopRW{}, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+
+	go c.handleRequest(&Request{ID: 1})
+	<-firstStarted
+	go c.handleRequest(&Request{ID: 2})
+
+	select {
+	case message := <-c.outbox:
+		response := message.msg.(*bep.Response)
+		t.Fatalf("response %d overtook the admitted error response", response.Id)
+	case <-second.waitStarted:
+	}
+
+	close(firstMayReturn)
+	<-first.waitStarted
+	firstMessage := <-c.outbox
+	if response := firstMessage.msg.(*bep.Response); response.Id != 1 {
+		t.Fatalf("first response ID is %d, expected 1", response.Id)
+	}
+	if firstMessage.done == nil {
+		t.Fatal("ordered error response was not tied to wire completion")
+	}
+	close(firstMessage.done)
+
+	secondMessage := <-c.outbox
+	if response := secondMessage.msg.(*bep.Response); response.Id != 2 {
+		t.Fatalf("second response ID is %d, expected 2", response.Id)
+	}
+	close(secondMessage.done)
+}
+
 func TestEncryptedResponsePreservesAdmissionLifecycle(t *testing.T) {
 	ready := make(chan struct{})
 	underlying := newOrderedFakeRequestResponse(ready)
-	response := rawResponse{data: []byte("encrypted"), response: underlying}
+	response := newRawResponse([]byte("encrypted"), underlying)
 
 	waiting := make(chan struct{})
 	go func() {
@@ -757,20 +870,39 @@ func TestEncryptedResponsePreservesAdmissionLifecycle(t *testing.T) {
 	}
 }
 
+func TestEncryptedResponseUsesLegacyLifecycleWithoutAdmission(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	underlying := newOrderedFakeRequestResponse(ready)
+	underlying.retainForTransmission = false
+
+	response := newRawResponse([]byte("encrypted"), underlying)
+	select {
+	case <-underlying.closed:
+	default:
+		t.Fatal("legacy encrypted response retained the unencrypted response")
+	}
+	if response.response != nil {
+		t.Fatal("legacy encrypted response kept the unencrypted response after encryption")
+	}
+}
+
 type orderedFakeRequestResponse struct {
-	data        []byte
-	previous    <-chan struct{}
-	closed      chan struct{}
-	waitStarted chan struct{}
-	waitOnce    sync.Once
-	closeOnce   sync.Once
+	data                  []byte
+	previous              <-chan struct{}
+	closed                chan struct{}
+	waitStarted           chan struct{}
+	retainForTransmission bool
+	waitOnce              sync.Once
+	closeOnce             sync.Once
 }
 
 func newOrderedFakeRequestResponse(previous <-chan struct{}) *orderedFakeRequestResponse {
 	return &orderedFakeRequestResponse{
-		previous:    previous,
-		closed:      make(chan struct{}),
-		waitStarted: make(chan struct{}),
+		previous:              previous,
+		closed:                make(chan struct{}),
+		waitStarted:           make(chan struct{}),
+		retainForTransmission: true,
 	}
 }
 
@@ -789,6 +921,80 @@ func (r *orderedFakeRequestResponse) Wait() {
 func (r *orderedFakeRequestResponse) WaitForResponse() {
 	r.waitOnce.Do(func() { close(r.waitStarted) })
 	<-r.previous
+}
+
+func (r *orderedFakeRequestResponse) RetainForTransmission() bool {
+	return r.retainForTransmission
+}
+
+type orderedFakeRequestError struct {
+	previous    <-chan struct{}
+	closed      chan struct{}
+	waitStarted chan struct{}
+	waitOnce    sync.Once
+	closeOnce   sync.Once
+}
+
+func newOrderedFakeRequestError(previous <-chan struct{}) *orderedFakeRequestError {
+	return &orderedFakeRequestError{
+		previous:    previous,
+		closed:      make(chan struct{}),
+		waitStarted: make(chan struct{}),
+	}
+}
+
+func (*orderedFakeRequestError) Error() string {
+	return "request failed after admission"
+}
+
+func (e *orderedFakeRequestError) Close() {
+	e.closeOnce.Do(func() { close(e.closed) })
+}
+
+func (e *orderedFakeRequestError) WaitForResponse() {
+	e.waitOnce.Do(func() { close(e.waitStarted) })
+	<-e.previous
+}
+
+type controlledWireWriter struct {
+	writes chan controlledWireWrite
+}
+
+type controlledWireWrite struct {
+	data     []byte
+	complete chan struct{}
+}
+
+func (w *controlledWireWriter) Write(data []byte) (int, error) {
+	write := controlledWireWrite{
+		data:     append([]byte(nil), data...),
+		complete: make(chan struct{}),
+	}
+	w.writes <- write
+	<-write.complete
+	return len(data), nil
+}
+
+func awaitControlledWireWrite(t *testing.T, writer *controlledWireWriter) controlledWireWrite {
+	t.Helper()
+	select {
+	case write := <-writer.writes:
+		return write
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for wire write")
+		return controlledWireWrite{}
+	}
+}
+
+func responseIDFromWire(t *testing.T, data []byte) int {
+	t.Helper()
+	headerSize := int(binary.BigEndian.Uint16(data))
+	messageOffset := 2 + headerSize + 4
+	var response bep.Response
+	if err := proto.Unmarshal(data[messageOffset:], &response); err != nil {
+		t.Fatal(err)
+	}
+	return int(response.Id)
 }
 
 func TestRequestInvalidFilename(t *testing.T) {

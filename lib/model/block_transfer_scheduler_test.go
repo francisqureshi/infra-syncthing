@@ -16,12 +16,11 @@ import (
 )
 
 func TestBlockTransferSchedulerStrictPriorityAccumulatesCapacity(t *testing.T) {
-	scheduler := newBlockTransferScheduler()
-	scheduler.setEnabled(true)
-	scheduler.setGlobalLimit(6)
-	scheduler.setFolder("active", 0, true)
-	scheduler.setFolder("high", 100, true)
-	scheduler.setFolder("low", -100, true)
+	scheduler := configuredBlockTransferScheduler(6, nil, map[string]int{
+		"active": 0,
+		"high":   100,
+		"low":    -100,
+	})
 
 	active := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{
 		folder: "active",
@@ -48,7 +47,16 @@ func TestBlockTransferSchedulerStrictPriorityAccumulatesCapacity(t *testing.T) {
 	highAdmission.close()
 
 	awaitBlockTransferAdmission(t, low).close()
-	scheduler.setFolder("low", -100, false)
+	scheduler.configure(blockTransferSchedulerConfiguration{
+		enabled:      true,
+		globalLimit:  6,
+		deviceLimits: make(map[protocol.DeviceID]int),
+		folders: map[string]blockTransferFolder{
+			"active": {priority: 0, runnable: true},
+			"high":   {priority: 100, runnable: true},
+			"low":    {priority: -100, runnable: false},
+		},
+	})
 	result := <-scheduler.enqueue(blockTransferDescriptor{folder: "low", device: device1, bytes: 2}).result
 	if !errors.Is(result.err, protocol.ErrGeneric) {
 		t.Fatalf("new request for non-runnable folder returned %v, expected protocol error", result.err)
@@ -56,13 +64,11 @@ func TestBlockTransferSchedulerStrictPriorityAccumulatesCapacity(t *testing.T) {
 }
 
 func TestBlockTransferSchedulerAllowsOnlyGenuineLeftoverCapacity(t *testing.T) {
-	scheduler := newBlockTransferScheduler()
-	scheduler.setEnabled(true)
-	scheduler.setGlobalLimit(10)
-	scheduler.setDeviceLimit(device1, 4)
-	scheduler.setFolder("active", 0, true)
-	scheduler.setFolder("high", 100, true)
-	scheduler.setFolder("low", -100, true)
+	scheduler := configuredBlockTransferScheduler(10, map[protocol.DeviceID]int{device1: 4}, map[string]int{
+		"active": 0,
+		"high":   100,
+		"low":    -100,
+	})
 
 	active := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{
 		folder: "active",
@@ -97,12 +103,11 @@ func TestBlockTransferSchedulerAllowsOnlyGenuineLeftoverCapacity(t *testing.T) {
 }
 
 func TestBlockTransferSchedulerSharesEqualPriorityBytesBetweenFolders(t *testing.T) {
-	scheduler := newBlockTransferScheduler()
-	scheduler.setEnabled(true)
-	scheduler.setGlobalLimit(4)
-	scheduler.setFolder("gate", 100, true)
-	scheduler.setFolder("folder-a", 0, true)
-	scheduler.setFolder("folder-b", 0, true)
+	scheduler := configuredBlockTransferScheduler(4, nil, map[string]int{
+		"gate":     100,
+		"folder-a": 0,
+		"folder-b": 0,
+	})
 
 	gate := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{
 		folder: "gate",
@@ -122,11 +127,10 @@ func TestBlockTransferSchedulerSharesEqualPriorityBytesBetweenFolders(t *testing
 }
 
 func TestBlockTransferSchedulerSharesFolderBytesBetweenDevices(t *testing.T) {
-	scheduler := newBlockTransferScheduler()
-	scheduler.setEnabled(true)
-	scheduler.setGlobalLimit(4)
-	scheduler.setFolder("gate", 100, true)
-	scheduler.setFolder("shared", 0, true)
+	scheduler := configuredBlockTransferScheduler(4, nil, map[string]int{
+		"gate":   100,
+		"shared": 0,
+	})
 
 	gate := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{
 		folder: "gate",
@@ -146,12 +150,11 @@ func TestBlockTransferSchedulerSharesFolderBytesBetweenDevices(t *testing.T) {
 }
 
 func TestBlockTransferSchedulerDoesNotCarryFairnessDebtAcrossIdlePeriods(t *testing.T) {
-	scheduler := newBlockTransferScheduler()
-	scheduler.setEnabled(true)
-	scheduler.setGlobalLimit(4)
-	scheduler.setFolder("gate", 100, true)
-	scheduler.setFolder("folder-a", 0, true)
-	scheduler.setFolder("folder-b", 0, true)
+	scheduler := configuredBlockTransferScheduler(4, nil, map[string]int{
+		"gate":     100,
+		"folder-a": 0,
+		"folder-b": 0,
+	})
 
 	awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{folder: "folder-a", device: device1, bytes: 4})).close()
 	awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{folder: "folder-a", device: device1, bytes: 4})).close()
@@ -224,11 +227,54 @@ func TestBlockTransferSchedulerReprioritizesAndCancelsQueuedFolders(t *testing.T
 	firstAdmission.close()
 }
 
+func TestBlockTransferSchedulerReprioritizationJoinsCurrentFairnessRound(t *testing.T) {
+	scheduler := configuredBlockTransferScheduler(8, nil, map[string]int{
+		"gate":      100,
+		"incumbent": 50,
+		"moving-a":  0,
+		"moving-b":  0,
+	})
+
+	incumbentActive := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{
+		folder: "incumbent",
+		device: device1,
+		bytes:  4,
+	}))
+	gate := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{
+		folder: "gate",
+		device: device1,
+		bytes:  4,
+	}))
+	incumbentNext := scheduler.enqueue(blockTransferDescriptor{folder: "incumbent", device: device1, bytes: 4})
+	movingA := scheduler.enqueue(blockTransferDescriptor{folder: "moving-a", device: device1, bytes: 4})
+	movingB := scheduler.enqueue(blockTransferDescriptor{folder: "moving-b", device: device1, bytes: 4})
+
+	scheduler.configure(blockTransferSchedulerConfiguration{
+		enabled:      true,
+		globalLimit:  8,
+		deviceLimits: make(map[protocol.DeviceID]int),
+		folders: map[string]blockTransferFolder{
+			"gate":      {priority: 100, runnable: true},
+			"incumbent": {priority: 50, runnable: true},
+			"moving-a":  {priority: 50, runnable: true},
+			"moving-b":  {priority: 50, runnable: true},
+		},
+	})
+	gate.close()
+
+	incumbentNextAdmission := awaitBlockTransferAdmission(t, incumbentNext)
+	assertBlockTransferWaiting(t, movingA)
+	assertBlockTransferWaiting(t, movingB)
+	incumbentNextAdmission.close()
+	movingAAdmission := awaitBlockTransferAdmission(t, movingA)
+	assertBlockTransferWaiting(t, movingB)
+	movingAAdmission.close()
+	awaitBlockTransferAdmission(t, movingB).close()
+	incumbentActive.close()
+}
+
 func TestBlockTransferAdmissionsPreservePerConnectionResponseOrder(t *testing.T) {
-	scheduler := newBlockTransferScheduler()
-	scheduler.setEnabled(true)
-	scheduler.setGlobalLimit(8)
-	scheduler.setFolder("folder", 0, true)
+	scheduler := configuredBlockTransferScheduler(8, nil, map[string]int{"folder": 0})
 
 	first := awaitBlockTransferAdmission(t, scheduler.enqueue(blockTransferDescriptor{
 		folder:     "folder",
@@ -280,11 +326,30 @@ func TestConfigureBlockTransferSchedulerKeepsLegacyPathBehindFeatureFlag(t *test
 		bytes:  1024,
 	})).close()
 
-	scheduler.setEnabled(false)
+	cfg.Options.FeatureFlags = nil
+	configureBlockTransferScheduler(scheduler, cfg)
 	disabledResult := <-scheduler.enqueue(blockTransferDescriptor{folder: "folder", device: device1, bytes: 1024}).result
 	if disabledResult.err != nil || disabledResult.admission != nil {
 		t.Fatalf("disabled scheduler did not return to legacy upload path: %#v", disabledResult)
 	}
+}
+
+func configuredBlockTransferScheduler(globalLimit int, deviceLimits map[protocol.DeviceID]int, priorities map[string]int) *blockTransferScheduler {
+	if deviceLimits == nil {
+		deviceLimits = make(map[protocol.DeviceID]int)
+	}
+	folders := make(map[string]blockTransferFolder, len(priorities))
+	for folder, priority := range priorities {
+		folders[folder] = blockTransferFolder{priority: priority, runnable: true}
+	}
+	scheduler := newBlockTransferScheduler()
+	scheduler.configure(blockTransferSchedulerConfiguration{
+		enabled:      true,
+		globalLimit:  globalLimit,
+		deviceLimits: deviceLimits,
+		folders:      folders,
+	})
+	return scheduler
 }
 
 func awaitBlockTransferAdmission(t *testing.T, waiter *blockTransferWaiter) *blockTransferAdmission {
