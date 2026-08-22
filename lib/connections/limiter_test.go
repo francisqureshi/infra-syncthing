@@ -119,6 +119,38 @@ func TestNetworkPriorityFeatureFlagDoesNotChangeUploadRateLimits(t *testing.T) {
 	}
 }
 
+func TestNetworkPriorityFeatureFlagDoesNotChangeDownloadRateLimits(t *testing.T) {
+	wrapper, wrapperCancel := initConfig()
+	defer wrapperCancel()
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.MaxRecvKbps = 64
+		_, index, _ := cfg.Device(device2)
+		cfg.Devices[index].MaxRecvKbps = 32
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	lim := newLimiter(device1, wrapper)
+
+	globalLimit := lim.read.Limit()
+	deviceLimit := lim.deviceReadLimiters[device2].Limit()
+	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.FeatureFlags = append(cfg.Options.FeatureFlags, config.FeatureFlagNetworkPriority)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	if got := lim.read.Limit(); got != globalLimit {
+		t.Fatalf("global raw download rate changed from %v to %v", globalLimit, got)
+	}
+	if got := lim.deviceReadLimiters[device2].Limit(); got != deviceLimit {
+		t.Fatalf("per-device raw download rate changed from %v to %v", deviceLimit, got)
+	}
+}
+
 func TestSetDeviceLimits(t *testing.T) {
 	wrapper, wrapperCancel := initConfig()
 	defer wrapperCancel()
