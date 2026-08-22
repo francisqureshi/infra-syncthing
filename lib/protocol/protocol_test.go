@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -196,26 +197,23 @@ func TestClusterConfigFirst(t *testing.T) {
 	c.Start()
 	defer closeAndWait(c, rw)
 
+	pingReturned := make(chan bool, 1)
+	go func() {
+		pingReturned <- c.send(context.Background(), &bep.Ping{})
+	}()
 	select {
-	case c.outbox <- asyncMessage{&bep.Ping{}, nil}:
+	case <-pingReturned:
 		t.Fatal("able to send ping before cluster config")
 	case <-time.After(100 * time.Millisecond):
 		// Allow some time for c.writerLoop to set up after c.Start
 	}
 
 	c.ClusterConfig(&ClusterConfig{}, nil)
-
-	done := make(chan struct{})
-	if ok := c.send(context.Background(), &bep.Ping{}, done); !ok {
+	if ok := <-pingReturned; !ok {
 		t.Fatal("send ping after cluster config returned false")
 	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("timed out before ping was sent")
-	}
 
-	done = make(chan struct{})
+	done := make(chan struct{})
 	go func() {
 		c.internalClose(errManual)
 		close(done)
@@ -605,9 +603,13 @@ func TestRequestMaxSize(t *testing.T) {
 		t.Run(fmt.Sprintf("invalid/%d", s), func(t *testing.T) {
 			m := newTestModel()
 			rw := testutil.NewBlockingRW()
-			c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
+			writer := &controlledWireWriter{writes: make(chan controlledWireWrite)}
+			c := getRawConnection(NewConnection(c0ID, rw, writer, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 			c.Start()
 			defer closeAndWait(c, rw)
+			go c.ClusterConfig(&ClusterConfig{}, nil)
+			initialWrite := awaitControlledWireWrite(t, writer)
+			close(initialWrite.complete)
 
 			c.inbox <- &bep.ClusterConfig{}
 
@@ -619,10 +621,11 @@ func TestRequestMaxSize(t *testing.T) {
 				Hash: []byte{42},
 			}
 
-			res := <-c.outbox
-			if msg, ok := res.msg.(*bep.Response); !ok || msg.Id != 1 {
-				t.Errorf("bad response %#v", msg)
+			responseWrite := awaitControlledWireWrite(t, writer)
+			if id := responseIDFromWire(t, responseWrite.data); id != 1 {
+				t.Errorf("bad response ID %d", id)
 			}
+			close(responseWrite.complete)
 
 			// A request with an invalid size should cause the dispatcher to
 			// return with a protocol error.
@@ -638,6 +641,8 @@ func TestRequestMaxSize(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("timed out before dispatcher loop terminated")
 			}
+			closeWrite := awaitControlledWireWrite(t, writer)
+			close(closeWrite.complete)
 
 			err := m.closedError()
 			if err == nil {
@@ -655,9 +660,13 @@ func TestRequestZeroSize(t *testing.T) {
 	// Syncthing send these. See https://github.com/syncthing/syncthing/issues/10709.
 	m := newTestModel()
 	rw := testutil.NewBlockingRW()
-	c := getRawConnection(NewConnection(c0ID, rw, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
+	writer := &controlledWireWriter{writes: make(chan controlledWireWrite)}
+	c := getRawConnection(NewConnection(c0ID, rw, writer, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionAlways, testKeyGen))
 	c.Start()
 	defer closeAndWait(c, rw)
+	go c.ClusterConfig(&ClusterConfig{}, nil)
+	initialWrite := awaitControlledWireWrite(t, writer)
+	close(initialWrite.complete)
 
 	c.inbox <- &bep.ClusterConfig{}
 	c.inbox <- &bep.Request{
@@ -667,16 +676,11 @@ func TestRequestZeroSize(t *testing.T) {
 		Hash: []byte{42},
 	}
 
-	select {
-	case res := <-c.outbox:
-		if msg, ok := res.msg.(*bep.Response); !ok || msg.Id != 1 {
-			t.Errorf("bad response %#v", msg)
-		}
-	case <-c.dispatcherLoopStopped:
-		t.Fatal("dispatcher loop terminated, expected zero-sized request to be accepted")
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for response")
+	responseWrite := awaitControlledWireWrite(t, writer)
+	if id := responseIDFromWire(t, responseWrite.data); id != 1 {
+		t.Errorf("bad response ID %d", id)
 	}
+	close(responseWrite.complete)
 }
 
 func TestRequestResponsesPreserveAdmissionOrder(t *testing.T) {
@@ -700,31 +704,41 @@ func TestRequestResponsesPreserveAdmissionOrder(t *testing.T) {
 			return nil, errors.New("unexpected request")
 		}
 	}
-	c := getRawConnection(NewConnection(c0ID, &testutil.NoopRW{}, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	writer := &controlledWireWriter{writes: make(chan controlledWireWrite)}
+	c := getRawConnection(NewConnection(c0ID, &testutil.NoopRW{}, writer, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	writerStopped := make(chan struct{})
+	go func() { c.writerLoop(); close(writerStopped) }()
+	go c.ClusterConfig(&ClusterConfig{}, nil)
+	initialWrite := awaitControlledWireWrite(t, writer)
+	close(initialWrite.complete)
+	t.Cleanup(func() {
+		close(c.closed)
+		<-writerStopped
+	})
 
 	go c.handleRequest(&Request{ID: 1})
 	<-firstStarted
 	go c.handleRequest(&Request{ID: 2})
 
 	select {
-	case message := <-c.outbox:
-		response := message.msg.(*bep.Response)
-		t.Fatalf("response %d overtook the admitted response", response.Id)
+	case write := <-writer.writes:
+		close(write.complete)
+		t.Fatalf("response %d overtook the admitted response", responseIDFromWire(t, write.data))
 	case <-second.waitStarted:
 	}
 
 	close(firstMayReturn)
-	firstMessage := <-c.outbox
-	if response := firstMessage.msg.(*bep.Response); response.Id != 1 {
-		t.Fatalf("first response ID is %d, expected 1", response.Id)
+	firstWrite := awaitControlledWireWrite(t, writer)
+	if id := responseIDFromWire(t, firstWrite.data); id != 1 {
+		t.Fatalf("first response ID is %d, expected 1", id)
 	}
-	close(firstMessage.done)
+	close(firstWrite.complete)
 
-	secondMessage := <-c.outbox
-	if response := secondMessage.msg.(*bep.Response); response.Id != 2 {
-		t.Fatalf("second response ID is %d, expected 2", response.Id)
+	secondWrite := awaitControlledWireWrite(t, writer)
+	if id := responseIDFromWire(t, secondWrite.data); id != 2 {
+		t.Fatalf("second response ID is %d, expected 2", id)
 	}
-	close(secondMessage.done)
+	close(secondWrite.complete)
 }
 
 func TestRequestResponseFrameIsNonPreemptiveOnWire(t *testing.T) {
@@ -751,7 +765,7 @@ func TestRequestResponseFrameIsNonPreemptiveOnWire(t *testing.T) {
 		c.writerLoop()
 		close(writerStopped)
 	}()
-	c.clusterConfigBox <- &ClusterConfig{}
+	go c.ClusterConfig(&ClusterConfig{}, nil)
 	initialWrite := awaitControlledWireWrite(t, writer)
 	close(initialWrite.complete)
 	t.Cleanup(func() {
@@ -787,6 +801,360 @@ func TestRequestResponseFrameIsNonPreemptiveOnWire(t *testing.T) {
 	}
 }
 
+func TestConnectionCriticalTrafficLeadsQueuedFolderWork(t *testing.T) {
+	model := &networkPriorityTestModel{
+		TestModel: newTestModel(),
+		priorities: map[string]int{
+			"folder": 100,
+		},
+	}
+	c, writer, initialWrite := newControlledProtocolConnection(t, c0ID, model)
+
+	indexReturned := make(chan error, 1)
+	go func() {
+		indexReturned <- c.Index(context.Background(), &Index{Folder: "folder"})
+	}()
+	awaitQueuedOutputs(t, c, 1)
+
+	clusterConfigReturned := make(chan struct{})
+	go func() {
+		c.ClusterConfig(&ClusterConfig{}, nil)
+		close(clusterConfigReturned)
+	}()
+	awaitQueuedOutputs(t, c, 2)
+	select {
+	case write := <-writer.writes:
+		close(write.complete)
+		t.Fatal("Connection-Critical Traffic interrupted an active protocol frame")
+	default:
+	}
+
+	close(initialWrite.complete)
+	criticalWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, criticalWrite.data); got != bep.MessageType_MESSAGE_TYPE_CLUSTER_CONFIG {
+		t.Fatalf("first queued frame is %v, expected Connection-Critical Traffic", got)
+	}
+	close(criticalWrite.complete)
+	<-clusterConfigReturned
+
+	metadataWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, metadataWrite.data); got != bep.MessageType_MESSAGE_TYPE_INDEX {
+		t.Fatalf("second queued frame is %v, expected Folder-Scoped Metadata", got)
+	}
+	close(metadataWrite.complete)
+	if err := <-indexReturned; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFolderScopedMetadataInheritsCurrentNetworkPriority(t *testing.T) {
+	model := &networkPriorityTestModel{
+		TestModel: newTestModel(),
+		priorities: map[string]int{
+			"low":  -100,
+			"high": 100,
+		},
+	}
+	c, writer, initialWrite := newControlledProtocolConnection(t, c0ID, model)
+
+	results := make(chan error, 2)
+	go func() { results <- c.Index(context.Background(), &Index{Folder: "low"}) }()
+	go func() { results <- c.Index(context.Background(), &Index{Folder: "high"}) }()
+	awaitQueuedOutputs(t, c, 2)
+	model.priorities["low"] = 200
+
+	close(initialWrite.complete)
+	lowWrite := awaitControlledWireWrite(t, writer)
+	if got := indexFolderFromWire(t, lowWrite.data); got != "low" {
+		t.Fatalf("first metadata folder is %q, expected reprioritized current Network Priority", got)
+	}
+	close(lowWrite.complete)
+	highWrite := awaitControlledWireWrite(t, writer)
+	if got := indexFolderFromWire(t, highWrite.data); got != "high" {
+		t.Fatalf("second metadata folder is %q, expected the remaining Network Priority", got)
+	}
+	close(highWrite.complete)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFolderScopedMetadataYieldsToSamePriorityBlock(t *testing.T) {
+	model := &networkPriorityTestModel{
+		TestModel:  newTestModel(),
+		priorities: map[string]int{"folder": 10},
+	}
+	c, writer, initialWrite := newControlledProtocolConnection(t, c0ID, model)
+	close(initialWrite.complete)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	t.Cleanup(cancelRequest)
+
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- c.Index(context.Background(), &Index{Folder: "folder", LastSequence: 1}) }()
+	firstMetadata := awaitControlledWireWrite(t, writer)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder", LastSequence: 2})
+	}()
+	requestResult := make(chan error, 1)
+	go func() {
+		_, err := c.Request(requestCtx, &Request{Folder: "folder", Name: "file", Size: 1})
+		requestResult <- err
+	}()
+	awaitQueuedOutputs(t, c, 2)
+
+	close(firstMetadata.complete)
+	blockWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, blockWrite.data); got != bep.MessageType_MESSAGE_TYPE_REQUEST {
+		t.Fatalf("frame after one metadata batch is %v, expected same-priority Block Transfer", got)
+	}
+	close(blockWrite.complete)
+	cancelRequest()
+	if err := <-requestResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Request returned %v, expected cancellation after observing its frame", err)
+	}
+
+	secondMetadata := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, secondMetadata.data); got != bep.MessageType_MESSAGE_TYPE_INDEX_UPDATE {
+		t.Fatalf("frame after block turn is %v, expected next Folder-Scoped Metadata batch", got)
+	}
+	close(secondMetadata.complete)
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConnectionCriticalTrafficDoesNotResetMetadataBatch(t *testing.T) {
+	model := &networkPriorityTestModel{
+		TestModel:  newTestModel(),
+		priorities: map[string]int{"folder": 10},
+	}
+	c, writer, initialWrite := newControlledProtocolConnection(t, c0ID, model)
+	close(initialWrite.complete)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	t.Cleanup(cancelRequest)
+
+	go c.Index(context.Background(), &Index{Folder: "folder", LastSequence: 1})
+	firstMetadata := awaitControlledWireWrite(t, writer)
+	go c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder", LastSequence: 2})
+	requestResult := make(chan error, 1)
+	go func() {
+		_, err := c.Request(requestCtx, &Request{Folder: "folder", Name: "file", Size: 1})
+		requestResult <- err
+	}()
+	criticalReturned := make(chan struct{})
+	go func() {
+		c.ClusterConfig(&ClusterConfig{}, nil)
+		close(criticalReturned)
+	}()
+	awaitQueuedOutputs(t, c, 3)
+
+	close(firstMetadata.complete)
+	criticalWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, criticalWrite.data); got != bep.MessageType_MESSAGE_TYPE_CLUSTER_CONFIG {
+		t.Fatalf("frame after metadata is %v, expected queued Connection-Critical Traffic", got)
+	}
+	close(criticalWrite.complete)
+	<-criticalReturned
+
+	blockWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, blockWrite.data); got != bep.MessageType_MESSAGE_TYPE_REQUEST {
+		t.Fatalf("frame after Connection-Critical Traffic is %v, expected pending block turn", got)
+	}
+	close(blockWrite.complete)
+	cancelRequest()
+	if err := <-requestResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Request returned %v, expected cancellation after observing its frame", err)
+	}
+
+	metadataWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, metadataWrite.data); got != bep.MessageType_MESSAGE_TYPE_INDEX_UPDATE {
+		t.Fatalf("frame after block turn is %v, expected next metadata batch", got)
+	}
+	close(metadataWrite.complete)
+}
+
+func TestMetadataBatchStateResetsWhenPriorityBucketEmpties(t *testing.T) {
+	model := &networkPriorityTestModel{
+		TestModel:  newTestModel(),
+		priorities: map[string]int{"folder": 10},
+	}
+	c, writer, initialWrite := newControlledProtocolConnection(t, c0ID, model)
+	close(initialWrite.complete)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	t.Cleanup(cancelRequest)
+
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- c.Index(context.Background(), &Index{Folder: "folder", LastSequence: 1}) }()
+	firstMetadata := awaitControlledWireWrite(t, writer)
+	close(firstMetadata.complete)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+
+	criticalReturned := make(chan struct{})
+	go func() {
+		c.ClusterConfig(&ClusterConfig{}, nil)
+		close(criticalReturned)
+	}()
+	criticalWrite := awaitControlledWireWrite(t, writer)
+	go c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder", LastSequence: 2})
+	requestResult := make(chan error, 1)
+	go func() {
+		_, err := c.Request(requestCtx, &Request{Folder: "folder", Name: "file", Size: 1})
+		requestResult <- err
+	}()
+	awaitQueuedOutputs(t, c, 2)
+
+	close(criticalWrite.complete)
+	<-criticalReturned
+	metadataWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, metadataWrite.data); got != bep.MessageType_MESSAGE_TYPE_INDEX_UPDATE {
+		t.Fatalf("first frame in refilled bucket is %v, expected a fresh metadata batch", got)
+	}
+	close(metadataWrite.complete)
+	blockWrite := awaitControlledWireWrite(t, writer)
+	if got := messageTypeFromWire(t, blockWrite.data); got != bep.MessageType_MESSAGE_TYPE_REQUEST {
+		t.Fatalf("frame after fresh metadata batch is %v, expected block turn", got)
+	}
+	close(blockWrite.complete)
+	cancelRequest()
+	if err := <-requestResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Request returned %v, expected cancellation after observing its frame", err)
+	}
+}
+
+func TestMetadataBatchStateIsScopedByConnection(t *testing.T) {
+	model := &networkPriorityTestModel{
+		TestModel:  newTestModel(),
+		priorities: map[string]int{"folder": 10},
+	}
+	connectionA, writerA, initialA := newControlledProtocolConnection(t, c0ID, model)
+	connectionB, writerB, initialB := newControlledProtocolConnection(t, c1ID, model)
+	close(initialA.complete)
+	requestCtxA, cancelRequestA := context.WithCancel(context.Background())
+	requestCtxB, cancelRequestB := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelRequestA()
+		cancelRequestB()
+	})
+
+	go connectionA.Index(context.Background(), &Index{Folder: "folder", LastSequence: 1})
+	firstA := awaitControlledWireWrite(t, writerA)
+	go connectionA.IndexUpdate(context.Background(), &IndexUpdate{Folder: "folder", LastSequence: 2})
+	requestResultA := make(chan error, 1)
+	go func() {
+		_, err := connectionA.Request(requestCtxA, &Request{Folder: "folder", Name: "a", Size: 1})
+		requestResultA <- err
+	}()
+	awaitQueuedOutputs(t, connectionA, 2)
+
+	go connectionB.Index(context.Background(), &Index{Folder: "folder", LastSequence: 1})
+	requestResultB := make(chan error, 1)
+	go func() {
+		_, err := connectionB.Request(requestCtxB, &Request{Folder: "folder", Name: "b", Size: 1})
+		requestResultB <- err
+	}()
+	awaitQueuedOutputs(t, connectionB, 2)
+
+	close(firstA.complete)
+	nextA := awaitControlledWireWrite(t, writerA)
+	if got := messageTypeFromWire(t, nextA.data); got != bep.MessageType_MESSAGE_TYPE_REQUEST {
+		t.Fatalf("connection A frame is %v, expected its pending block turn", got)
+	}
+	close(initialB.complete)
+	nextB := awaitControlledWireWrite(t, writerB)
+	if got := messageTypeFromWire(t, nextB.data); got != bep.MessageType_MESSAGE_TYPE_INDEX {
+		t.Fatalf("connection B frame is %v, expected its independent initial metadata batch", got)
+	}
+
+	close(nextA.complete)
+	cancelRequestA()
+	if err := <-requestResultA; !errors.Is(err, context.Canceled) {
+		t.Fatalf("connection A Request returned %v", err)
+	}
+	remainingA := awaitControlledWireWrite(t, writerA)
+	close(remainingA.complete)
+	close(nextB.complete)
+	nextBlockB := awaitControlledWireWrite(t, writerB)
+	close(nextBlockB.complete)
+	cancelRequestB()
+	if err := <-requestResultB; !errors.Is(err, context.Canceled) {
+		t.Fatalf("connection B Request returned %v", err)
+	}
+}
+
+func TestMetadataBatchStateIsScopedByNetworkPriority(t *testing.T) {
+	model := &networkPriorityTestModel{
+		TestModel: newTestModel(),
+		priorities: map[string]int{
+			"low":  10,
+			"high": 20,
+		},
+	}
+	c, writer, initialWrite := newControlledProtocolConnection(t, c0ID, model)
+	close(initialWrite.complete)
+	lowCtx, cancelLow := context.WithCancel(context.Background())
+	highCtx, cancelHigh := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelLow()
+		cancelHigh()
+	})
+
+	go c.Index(context.Background(), &Index{Folder: "low", LastSequence: 1})
+	firstLow := awaitControlledWireWrite(t, writer)
+	go c.IndexUpdate(context.Background(), &IndexUpdate{Folder: "low", LastSequence: 2})
+	lowResult := make(chan error, 1)
+	go func() {
+		_, err := c.Request(lowCtx, &Request{Folder: "low", Name: "low", Size: 1})
+		lowResult <- err
+	}()
+	go c.Index(context.Background(), &Index{Folder: "high", LastSequence: 1})
+	highResult := make(chan error, 1)
+	go func() {
+		_, err := c.Request(highCtx, &Request{Folder: "high", Name: "high", Size: 1})
+		highResult <- err
+	}()
+	awaitQueuedOutputs(t, c, 4)
+
+	close(firstLow.complete)
+	highMetadata := awaitControlledWireWrite(t, writer)
+	if got := outputFolderFromWire(t, highMetadata.data); got != "high" {
+		t.Fatalf("first competing folder is %q, expected fresh high-priority metadata batch", got)
+	}
+	close(highMetadata.complete)
+	highBlock := awaitControlledWireWrite(t, writer)
+	if got := outputFolderFromWire(t, highBlock.data); got != "high" {
+		t.Fatalf("second competing folder is %q, expected high-priority block turn", got)
+	}
+	close(highBlock.complete)
+	cancelHigh()
+	if err := <-highResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("high-priority Request returned %v", err)
+	}
+
+	lowBlock := awaitControlledWireWrite(t, writer)
+	if got := outputFolderFromWire(t, lowBlock.data); got != "low" || messageTypeFromWire(t, lowBlock.data) != bep.MessageType_MESSAGE_TYPE_REQUEST {
+		t.Fatalf("next frame is %q, expected preserved low-priority block turn", got)
+	}
+	close(lowBlock.complete)
+	cancelLow()
+	if err := <-lowResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("low-priority Request returned %v", err)
+	}
+	lowMetadata := awaitControlledWireWrite(t, writer)
+	if got := outputFolderFromWire(t, lowMetadata.data); got != "low" || messageTypeFromWire(t, lowMetadata.data) != bep.MessageType_MESSAGE_TYPE_INDEX_UPDATE {
+		t.Fatalf("last frame is %q, expected remaining low-priority metadata", got)
+	}
+	close(lowMetadata.complete)
+}
+
 func TestRequestErrorsPreserveAdmissionOrder(t *testing.T) {
 	ready := make(chan struct{})
 	close(ready)
@@ -808,35 +1176,42 @@ func TestRequestErrorsPreserveAdmissionOrder(t *testing.T) {
 			return nil, errors.New("unexpected request")
 		}
 	}
-	c := getRawConnection(NewConnection(c0ID, &testutil.NoopRW{}, &testutil.NoopRW{}, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	writer := &controlledWireWriter{writes: make(chan controlledWireWrite)}
+	c := getRawConnection(NewConnection(c0ID, &testutil.NoopRW{}, writer, testutil.NoopCloser{}, m, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	writerStopped := make(chan struct{})
+	go func() { c.writerLoop(); close(writerStopped) }()
+	go c.ClusterConfig(&ClusterConfig{}, nil)
+	initialWrite := awaitControlledWireWrite(t, writer)
+	close(initialWrite.complete)
+	t.Cleanup(func() {
+		close(c.closed)
+		<-writerStopped
+	})
 
 	go c.handleRequest(&Request{ID: 1})
 	<-firstStarted
 	go c.handleRequest(&Request{ID: 2})
 
 	select {
-	case message := <-c.outbox:
-		response := message.msg.(*bep.Response)
-		t.Fatalf("response %d overtook the admitted error response", response.Id)
+	case write := <-writer.writes:
+		close(write.complete)
+		t.Fatalf("response %d overtook the admitted error response", responseIDFromWire(t, write.data))
 	case <-second.waitStarted:
 	}
 
 	close(firstMayReturn)
 	<-first.waitStarted
-	firstMessage := <-c.outbox
-	if response := firstMessage.msg.(*bep.Response); response.Id != 1 {
-		t.Fatalf("first response ID is %d, expected 1", response.Id)
+	firstWrite := awaitControlledWireWrite(t, writer)
+	if id := responseIDFromWire(t, firstWrite.data); id != 1 {
+		t.Fatalf("first response ID is %d, expected 1", id)
 	}
-	if firstMessage.done == nil {
-		t.Fatal("ordered error response was not tied to wire completion")
-	}
-	close(firstMessage.done)
+	close(firstWrite.complete)
 
-	secondMessage := <-c.outbox
-	if response := secondMessage.msg.(*bep.Response); response.Id != 2 {
-		t.Fatalf("second response ID is %d, expected 2", response.Id)
+	secondWrite := awaitControlledWireWrite(t, writer)
+	if id := responseIDFromWire(t, secondWrite.data); id != 2 {
+		t.Fatalf("second response ID is %d, expected 2", id)
 	}
-	close(secondMessage.done)
+	close(secondWrite.complete)
 }
 
 func TestEncryptedResponsePreservesAdmissionLifecycle(t *testing.T) {
@@ -895,6 +1270,19 @@ type orderedFakeRequestResponse struct {
 	retainForTransmission bool
 	waitOnce              sync.Once
 	closeOnce             sync.Once
+}
+
+type networkPriorityTestModel struct {
+	*TestModel
+	priorities map[string]int
+}
+
+func (m *networkPriorityTestModel) NetworkPriority(folder string) NetworkPriorityPolicy {
+	if folder == "" {
+		return NetworkPriorityPolicy{Enabled: true}
+	}
+	priority, ok := m.priorities[folder]
+	return NetworkPriorityPolicy{Priority: priority, Enabled: ok}
 }
 
 func newOrderedFakeRequestResponse(previous <-chan struct{}) *orderedFakeRequestResponse {
@@ -958,6 +1346,7 @@ func (e *orderedFakeRequestError) WaitForResponse() {
 
 type controlledWireWriter struct {
 	writes chan controlledWireWrite
+	stop   chan struct{}
 }
 
 type controlledWireWrite struct {
@@ -971,8 +1360,37 @@ func (w *controlledWireWriter) Write(data []byte) (int, error) {
 		complete: make(chan struct{}),
 	}
 	w.writes <- write
-	<-write.complete
+	if w.stop == nil {
+		<-write.complete
+	} else {
+		select {
+		case <-write.complete:
+		case <-w.stop:
+		}
+	}
 	return len(data), nil
+}
+
+func newControlledProtocolConnection(t *testing.T, deviceID DeviceID, model Model) (*rawConnection, *controlledWireWriter, controlledWireWrite) {
+	t.Helper()
+	writer := &controlledWireWriter{
+		writes: make(chan controlledWireWrite),
+		stop:   make(chan struct{}),
+	}
+	connection := getRawConnection(NewConnection(deviceID, &testutil.NoopRW{}, writer, testutil.NoopCloser{}, model, new(mockedConnectionInfo), CompressionNever, testKeyGen))
+	writerStopped := make(chan struct{})
+	go func() {
+		connection.writerLoop()
+		close(writerStopped)
+	}()
+	go connection.ClusterConfig(&ClusterConfig{}, nil)
+	initialWrite := awaitControlledWireWrite(t, writer)
+	t.Cleanup(func() {
+		close(connection.closed)
+		close(writer.stop)
+		<-writerStopped
+	})
+	return connection, writer, initialWrite
 }
 
 func awaitControlledWireWrite(t *testing.T, writer *controlledWireWriter) controlledWireWrite {
@@ -986,15 +1404,79 @@ func awaitControlledWireWrite(t *testing.T, writer *controlledWireWriter) contro
 	}
 }
 
-func responseIDFromWire(t *testing.T, data []byte) int {
+func awaitQueuedOutputs(t *testing.T, c *rawConnection, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		c.outputMut.Lock()
+		queued := len(c.outputQueue)
+		c.outputMut.Unlock()
+		if queued >= count {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("timed out waiting for %d queued protocol outputs", count)
+}
+
+func messageTypeFromWire(t *testing.T, data []byte) bep.MessageType {
 	t.Helper()
 	headerSize := int(binary.BigEndian.Uint16(data))
-	messageOffset := 2 + headerSize + 4
+	var header bep.Header
+	if err := proto.Unmarshal(data[2:2+headerSize], &header); err != nil {
+		t.Fatal(err)
+	}
+	return header.Type
+}
+
+func indexFolderFromWire(t *testing.T, data []byte) string {
+	t.Helper()
+	var index bep.Index
+	if err := proto.Unmarshal(wireMessagePayload(data), &index); err != nil {
+		t.Fatal(err)
+	}
+	return index.Folder
+}
+
+func outputFolderFromWire(t *testing.T, data []byte) string {
+	t.Helper()
+	switch messageTypeFromWire(t, data) {
+	case bep.MessageType_MESSAGE_TYPE_INDEX:
+		var message bep.Index
+		if err := proto.Unmarshal(wireMessagePayload(data), &message); err != nil {
+			t.Fatal(err)
+		}
+		return message.Folder
+	case bep.MessageType_MESSAGE_TYPE_INDEX_UPDATE:
+		var message bep.IndexUpdate
+		if err := proto.Unmarshal(wireMessagePayload(data), &message); err != nil {
+			t.Fatal(err)
+		}
+		return message.Folder
+	case bep.MessageType_MESSAGE_TYPE_REQUEST:
+		var message bep.Request
+		if err := proto.Unmarshal(wireMessagePayload(data), &message); err != nil {
+			t.Fatal(err)
+		}
+		return message.Folder
+	default:
+		t.Fatalf("message %v has no folder", messageTypeFromWire(t, data))
+		return ""
+	}
+}
+
+func responseIDFromWire(t *testing.T, data []byte) int {
+	t.Helper()
 	var response bep.Response
-	if err := proto.Unmarshal(data[messageOffset:], &response); err != nil {
+	if err := proto.Unmarshal(wireMessagePayload(data), &response); err != nil {
 		t.Fatal(err)
 	}
 	return int(response.Id)
+}
+
+func wireMessagePayload(data []byte) []byte {
+	headerSize := int(binary.BigEndian.Uint16(data))
+	return data[2+headerSize+4:]
 }
 
 func TestRequestInvalidFilename(t *testing.T) {
