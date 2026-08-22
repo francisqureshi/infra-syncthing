@@ -1162,6 +1162,22 @@ func (p *pager) done() bool {
 	return p.get == 0
 }
 
+// NetworkPriority supplies the connection writer with the current device-local
+// priority for folder-owned output.
+func (m *model) NetworkPriority(folder string) protocol.NetworkPriorityPolicy {
+	if !m.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority) {
+		return protocol.NetworkPriorityPolicy{}
+	}
+	if folder == "" {
+		return protocol.NetworkPriorityPolicy{Enabled: true}
+	}
+	cfg, ok := m.cfg.Folder(folder)
+	if !ok {
+		return protocol.NetworkPriorityPolicy{}
+	}
+	return protocol.NetworkPriorityPolicy{Priority: cfg.NetworkPriority, Enabled: true}
+}
+
 // Index is called when a new device is connected and we receive their full index.
 // Implements the protocol.Model interface.
 func (m *model) Index(conn protocol.Connection, idx *protocol.Index) error {

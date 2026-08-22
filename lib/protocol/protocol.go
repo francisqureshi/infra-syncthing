@@ -96,6 +96,20 @@ type Model interface {
 	DownloadProgress(conn Connection, p *DownloadProgress) error
 }
 
+// NetworkPriorityProvider supplies device-local scheduling policy to a
+// connection. It is kept separate from Model so protocol users that do not
+// enable the scheduler retain the legacy output order.
+type NetworkPriorityProvider interface {
+	NetworkPriority(folder string) NetworkPriorityPolicy
+}
+
+// NetworkPriorityPolicy describes the current output scheduling policy for a
+// folder. Enabled reports whether Network Priority scheduling is active.
+type NetworkPriorityPolicy struct {
+	Priority int
+	Enabled  bool
+}
+
 // rawModel is the Model interface, but without the initial Connection
 // parameter. Internal use only.
 type rawModel interface {
@@ -194,9 +208,7 @@ type rawConnection struct {
 	idxMut sync.Mutex // ensures serialization of Index calls
 
 	inbox                 chan proto.Message
-	outbox                chan asyncMessage
 	closeBox              chan asyncMessage
-	clusterConfigBox      chan *ClusterConfig
 	dispatcherLoopStopped chan struct{}
 	closed                chan struct{}
 	closeOnce             sync.Once
@@ -205,6 +217,14 @@ type rawConnection struct {
 	startStopMut          sync.Mutex // start and stop must be serialized
 
 	loopWG sync.WaitGroup // Need to ensure no leftover routines in testing
+
+	networkPriority func(string) NetworkPriorityPolicy
+	outputMut       sync.Mutex
+	outputQueue     []*queuedOutput
+	outputWake      chan struct{}
+	outputSequence  uint64
+	outputTurns     map[int]outputTurn
+	outputActive    map[int]int
 }
 
 type asyncResult struct {
@@ -215,6 +235,31 @@ type asyncResult struct {
 type asyncMessage struct {
 	msg  proto.Message
 	done chan struct{} // done closes when we're done sending the message
+}
+
+type outputClass uint8
+
+const (
+	outputLegacy outputClass = iota
+	outputConnectionCritical
+	outputFolderMetadata
+	outputBlock
+)
+
+type outputTurn struct {
+	metadataSent bool
+}
+
+type queuedOutput struct {
+	asyncMessage
+
+	class              outputClass
+	folder             string
+	priority           int
+	priorityScheduling bool
+	sequence           uint64
+	selected           chan struct{}
+	queued             bool
 }
 
 const (
@@ -245,7 +290,11 @@ func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer
 
 	// We do the wire format conversion first (outermost) so that the
 	// metadata is in wire format when it reaches the encryption step.
-	rc := newRawConnection(deviceID, reader, writer, closer, em, connInfo, compress)
+	var networkPriority func(string) NetworkPriorityPolicy
+	if provider, ok := model.(NetworkPriorityProvider); ok {
+		networkPriority = provider.NetworkPriority
+	}
+	rc := newRawConnection(deviceID, reader, writer, closer, em, connInfo, compress, networkPriority)
 	ec := newEncryptedConnection(rc, rc, em.folderKeys, keyGen)
 	wc := wireFormatConnection{ec}
 
@@ -253,7 +302,7 @@ func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer
 	return wc
 }
 
-func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, receiver rawModel, connInfo ConnectionInfo, compress Compression) *rawConnection {
+func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, receiver rawModel, connInfo ConnectionInfo, compress Compression, networkPriority func(string) NetworkPriorityPolicy) *rawConnection {
 	idString := deviceID.String()
 	cr := &countingReader{Reader: reader, idString: idString}
 	cw := &countingWriter{Writer: writer, idString: idString}
@@ -270,13 +319,15 @@ func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, clo
 		closer:                closer,
 		awaiting:              make(map[int]chan asyncResult),
 		inbox:                 make(chan proto.Message),
-		outbox:                make(chan asyncMessage),
 		closeBox:              make(chan asyncMessage),
-		clusterConfigBox:      make(chan *ClusterConfig),
 		dispatcherLoopStopped: make(chan struct{}),
 		closed:                make(chan struct{}),
 		compression:           compress,
 		loopWG:                sync.WaitGroup{},
+		networkPriority:       networkPriority,
+		outputWake:            make(chan struct{}, 1),
+		outputTurns:           make(map[int]outputTurn),
+		outputActive:          make(map[int]int),
 	}
 }
 
@@ -338,8 +389,9 @@ func (c *rawConnection) Index(ctx context.Context, idx *Index) error {
 	default:
 	}
 	c.idxMut.Lock()
-	c.send(ctx, idx.toWire(), nil)
+	output := c.queueOutput(idx.toWire(), nil, idx.Folder, outputFolderMetadata)
 	c.idxMut.Unlock()
+	c.waitOutput(ctx, output)
 	return nil
 }
 
@@ -353,8 +405,9 @@ func (c *rawConnection) IndexUpdate(ctx context.Context, idxUp *IndexUpdate) err
 	default:
 	}
 	c.idxMut.Lock()
-	c.send(ctx, idxUp.toWire(), nil)
+	output := c.queueOutput(idxUp.toWire(), nil, idxUp.Folder, outputFolderMetadata)
 	c.idxMut.Unlock()
+	c.waitOutput(ctx, output)
 	return nil
 }
 
@@ -381,7 +434,7 @@ func (c *rawConnection) Request(ctx context.Context, req *Request) ([]byte, erro
 	c.awaitingMut.Unlock()
 
 	req.ID = id
-	ok := c.send(ctx, req.toWire(), nil)
+	ok := c.sendFolder(ctx, req.toWire(), nil, req.Folder, outputBlock)
 	if !ok {
 		return nil, ErrClosed
 	}
@@ -399,10 +452,7 @@ func (c *rawConnection) Request(ctx context.Context, req *Request) ([]byte, erro
 
 // ClusterConfig sends the cluster configuration message to the peer.
 func (c *rawConnection) ClusterConfig(config *ClusterConfig, _ map[string]string) {
-	select {
-	case c.clusterConfigBox <- config:
-	case <-c.closed:
-	}
+	c.send(context.Background(), config.toWire())
 }
 
 func (c *rawConnection) Closed() <-chan struct{} {
@@ -411,11 +461,11 @@ func (c *rawConnection) Closed() <-chan struct{} {
 
 // DownloadProgress sends the progress updates for the files that are currently being downloaded.
 func (c *rawConnection) DownloadProgress(ctx context.Context, dp *DownloadProgress) {
-	c.send(ctx, dp.toWire(), nil)
+	c.send(ctx, dp.toWire())
 }
 
 func (c *rawConnection) ping() bool {
-	return c.send(context.Background(), &bep.Ping{}, nil)
+	return c.send(context.Background(), &bep.Ping{})
 }
 
 func (c *rawConnection) readerLoop() {
@@ -714,7 +764,7 @@ func (c *rawConnection) handleRequest(req *Request) {
 			ID:   req.ID,
 			Code: errorToCode(err),
 		}
-		c.send(context.Background(), resp.toWire(), done)
+		c.sendFolder(context.Background(), resp.toWire(), done, req.Folder, outputBlock)
 		return
 	}
 	if ordered, ok := res.(orderedRequestResponse); ok {
@@ -726,7 +776,7 @@ func (c *rawConnection) handleRequest(req *Request) {
 		Data: res.Data(),
 		Code: errorToCode(nil),
 	}
-	c.send(context.Background(), resp.toWire(), done)
+	c.sendFolder(context.Background(), resp.toWire(), done, req.Folder, outputBlock)
 	<-done
 	res.Close()
 }
@@ -741,71 +791,273 @@ func (c *rawConnection) handleResponse(resp *Response) {
 	c.awaitingMut.Unlock()
 }
 
-func (c *rawConnection) send(ctx context.Context, msg proto.Message, done chan struct{}) bool {
+func (c *rawConnection) send(ctx context.Context, msg proto.Message) bool {
+	class := outputLegacy
+	switch msg.(type) {
+	case *bep.ClusterConfig, *bep.Ping:
+		class = outputConnectionCritical
+	}
+	return c.sendFolder(ctx, msg, nil, "", class)
+}
+
+func (c *rawConnection) sendFolder(ctx context.Context, msg proto.Message, done chan struct{}, folder string, class outputClass) bool {
+	return c.waitOutput(ctx, c.queueOutput(msg, done, folder, class))
+}
+
+func (c *rawConnection) queueOutput(msg proto.Message, done chan struct{}, folder string, class outputClass) *queuedOutput {
+	policy := NetworkPriorityPolicy{}
+	if c.networkPriority != nil {
+		policy = c.networkPriority(folder)
+	}
+	output := &queuedOutput{
+		asyncMessage:       asyncMessage{msg: msg, done: done},
+		class:              class,
+		folder:             folder,
+		priority:           policy.Priority,
+		priorityScheduling: policy.Enabled,
+		selected:           make(chan struct{}),
+		queued:             true,
+	}
+
+	c.outputMut.Lock()
+	output.sequence = c.outputSequence
+	c.outputSequence++
+	c.outputQueue = append(c.outputQueue, output)
+	c.outputMut.Unlock()
+	c.signalOutput()
+	return output
+}
+
+func (c *rawConnection) waitOutput(ctx context.Context, output *queuedOutput) bool {
 	select {
-	case c.outbox <- asyncMessage{msg, done}:
+	case <-output.selected:
 		return true
 	case <-c.closed:
 	case <-ctx.Done():
 	}
-	if done != nil {
-		close(done)
+	if c.cancelOutput(output) {
+		if output.done != nil {
+			close(output.done)
+		}
+		return false
+	}
+	<-output.selected
+	return true
+}
+
+func (c *rawConnection) writerLoop() {
+	output, stop := c.nextOutput(true)
+	if stop {
+		return
+	}
+	if err := c.writeOutput(output); err != nil {
+		c.internalClose(err)
+		return
+	}
+	for {
+		output, stop := c.nextOutput(false)
+		if stop {
+			return
+		}
+		if err := c.writeOutput(output); err != nil {
+			c.internalClose(err)
+			return
+		}
+	}
+}
+
+func (c *rawConnection) nextOutput(initialClusterConfigOnly bool) (*queuedOutput, bool) {
+	for {
+		// A close leads all queued work once the active frame has completed.
+		select {
+		case message := <-c.closeBox:
+			c.writeCloseOutput(message)
+			return nil, true
+		case <-c.closed:
+			return nil, true
+		default:
+		}
+
+		c.outputMut.Lock()
+		index := c.selectOutputLocked(initialClusterConfigOnly)
+		if index >= 0 {
+			output := c.outputQueue[index]
+			c.outputQueue = append(c.outputQueue[:index], c.outputQueue[index+1:]...)
+			output.queued = false
+			if output.participatesInMetadataTurns() {
+				turn := c.outputTurns[output.priority]
+				turn.metadataSent = output.class == outputFolderMetadata
+				c.outputTurns[output.priority] = turn
+				c.outputActive[output.priority]++
+			}
+			close(output.selected)
+			c.outputMut.Unlock()
+			return output, false
+		}
+		c.outputMut.Unlock()
+
+		select {
+		case message := <-c.closeBox:
+			c.writeCloseOutput(message)
+			return nil, true
+		case <-c.outputWake:
+		case <-c.closed:
+			return nil, true
+		}
+	}
+}
+
+func (c *rawConnection) selectOutputLocked(initialClusterConfigOnly bool) int {
+	c.refreshOutputPoliciesLocked()
+	if initialClusterConfigOnly {
+		for index, output := range c.outputQueue {
+			if _, ok := output.msg.(*bep.ClusterConfig); ok {
+				return index
+			}
+		}
+		return -1
+	}
+
+	selected := -1
+	for index, output := range c.outputQueue {
+		if output.priorityScheduling && output.class == outputConnectionCritical && (selected < 0 || output.sequence < c.outputQueue[selected].sequence) {
+			selected = index
+		}
+	}
+	if selected >= 0 {
+		return selected
+	}
+
+	priority, foundPriority := 0, false
+	for _, output := range c.outputQueue {
+		if !output.participatesInMetadataTurns() {
+			continue
+		}
+		if !foundPriority || output.priority > priority {
+			priority = output.priority
+			foundPriority = true
+		}
+	}
+	if foundPriority {
+		metadata, block := -1, -1
+		for index, output := range c.outputQueue {
+			if !output.priorityScheduling || output.priority != priority {
+				continue
+			}
+			switch output.class {
+			case outputFolderMetadata:
+				if metadata < 0 || output.sequence < c.outputQueue[metadata].sequence {
+					metadata = index
+				}
+			case outputBlock:
+				if block < 0 || output.sequence < c.outputQueue[block].sequence {
+					block = index
+				}
+			}
+		}
+		if metadata >= 0 && block >= 0 {
+			if c.outputTurns[priority].metadataSent {
+				return block
+			}
+			return metadata
+		}
+		if metadata >= 0 {
+			return metadata
+		}
+		return block
+	}
+
+	for index, output := range c.outputQueue {
+		if selected < 0 || output.sequence < c.outputQueue[selected].sequence {
+			selected = index
+		}
+	}
+	return selected
+}
+
+func (c *rawConnection) refreshOutputPoliciesLocked() {
+	if c.networkPriority == nil {
+		return
+	}
+	affectedPriorities := make(map[int]struct{})
+	for _, output := range c.outputQueue {
+		if output.participatesInMetadataTurns() {
+			affectedPriorities[output.priority] = struct{}{}
+		}
+		policy := c.networkPriority(output.folder)
+		output.priority = policy.Priority
+		output.priorityScheduling = policy.Enabled
+		if output.participatesInMetadataTurns() {
+			affectedPriorities[output.priority] = struct{}{}
+		}
+	}
+	for priority := range affectedPriorities {
+		c.resetOutputTurnLocked(priority)
+	}
+}
+
+func (o *queuedOutput) participatesInMetadataTurns() bool {
+	return o.priorityScheduling && (o.class == outputFolderMetadata || o.class == outputBlock)
+}
+
+func (c *rawConnection) writeCloseOutput(message asyncMessage) {
+	_ = c.writeMessage(message.msg)
+	close(message.done)
+}
+
+func (c *rawConnection) writeOutput(output *queuedOutput) error {
+	err := c.writeMessage(output.msg)
+	if output.done != nil {
+		close(output.done)
+	}
+	c.outputMut.Lock()
+	if output.participatesInMetadataTurns() {
+		c.outputActive[output.priority]--
+		if c.outputActive[output.priority] == 0 {
+			delete(c.outputActive, output.priority)
+		}
+		c.resetOutputTurnLocked(output.priority)
+	}
+	c.outputMut.Unlock()
+	return err
+}
+
+func (c *rawConnection) cancelOutput(output *queuedOutput) bool {
+	c.outputMut.Lock()
+	defer c.outputMut.Unlock()
+	if !output.queued {
+		return false
+	}
+	for index, queued := range c.outputQueue {
+		if queued != output {
+			continue
+		}
+		c.outputQueue = append(c.outputQueue[:index], c.outputQueue[index+1:]...)
+		output.queued = false
+		if output.participatesInMetadataTurns() {
+			c.resetOutputTurnLocked(output.priority)
+		}
+		return true
 	}
 	return false
 }
 
-func (c *rawConnection) writerLoop() {
-	select {
-	case cc := <-c.clusterConfigBox:
-		err := c.writeMessage(cc.toWire())
-		if err != nil {
-			c.internalClose(err)
-			return
-		}
-	case hm := <-c.closeBox:
-		_ = c.writeMessage(hm.msg)
-		close(hm.done)
-		return
-	case <-c.closed:
+func (c *rawConnection) resetOutputTurnLocked(priority int) {
+	if c.outputActive[priority] > 0 {
 		return
 	}
-	for {
-		// When the connection is closing or closed, that should happen
-		// immediately, not compete with the (potentially very busy) outbox.
-		select {
-		case hm := <-c.closeBox:
-			_ = c.writeMessage(hm.msg)
-			close(hm.done)
-			return
-		case <-c.closed:
-			return
-		default:
-		}
-		select {
-		case cc := <-c.clusterConfigBox:
-			err := c.writeMessage(cc.toWire())
-			if err != nil {
-				c.internalClose(err)
-				return
-			}
-		case hm := <-c.outbox:
-			err := c.writeMessage(hm.msg)
-			if hm.done != nil {
-				close(hm.done)
-			}
-			if err != nil {
-				c.internalClose(err)
-				return
-			}
-
-		case hm := <-c.closeBox:
-			_ = c.writeMessage(hm.msg)
-			close(hm.done)
-			return
-
-		case <-c.closed:
+	for _, output := range c.outputQueue {
+		if output.priority == priority && output.participatesInMetadataTurns() {
 			return
 		}
+	}
+	delete(c.outputTurns, priority)
+}
+
+func (c *rawConnection) signalOutput() {
+	select {
+	case c.outputWake <- struct{}{}:
+	default:
 	}
 }
 
