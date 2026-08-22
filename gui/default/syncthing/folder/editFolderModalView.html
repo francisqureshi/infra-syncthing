@@ -305,7 +305,7 @@
           <div class="row">
             <div class="col-md-6 form-group" ng-class="{'has-error': folderEditor.networkPriority.$invalid && folderEditor.networkPriority.$dirty}">
               <label for="networkPriority" translate>Network Priority</label>
-              <input name="networkPriority" id="networkPriority" class="form-control" type="number" ng-model="currentFolder.networkPriority" required="" aria-required="true" min="-100" max="100" step="1" />
+              <input name="networkPriority" id="networkPriority" class="form-control" type="number" ng-model="currentFolder.networkPriority" ng-pattern="/^-?\d+$/" required="" aria-required="true" min="-100" max="100" step="1" />
               <p class="help-block" ng-show="folderEditor.networkPriority.$invalid" translate>
                 Network Priority must be a whole number from -100 through 100.
               </p>
