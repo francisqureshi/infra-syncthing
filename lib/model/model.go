@@ -181,7 +181,8 @@ type model struct {
 	indexHandlers                  *serviceMap[protocol.DeviceID, *indexHandlerRegistry]
 
 	// for testing only
-	foldersRunning atomic.Int32
+	foldersRunning        atomic.Int32
+	blockTransferEnqueued func(blockTransferDescriptor)
 }
 
 var _ config.Verifier = &model{}
@@ -1976,6 +1977,31 @@ func (r *requestResponse) WaitForResponse() {
 	}
 }
 
+func (r *requestResponse) RetainForTransmission() bool {
+	return r.admission != nil
+}
+
+type requestResponseError struct {
+	cause    error
+	response *requestResponse
+}
+
+func (e *requestResponseError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *requestResponseError) Unwrap() error {
+	return e.cause
+}
+
+func (e *requestResponseError) WaitForResponse() {
+	e.response.WaitForResponse()
+}
+
+func (e *requestResponseError) Close() {
+	e.response.Close()
+}
+
 // Request returns the specified data segment by reading it from local disk.
 // Implements the protocol.Model interface.
 func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out protocol.RequestResponse, err error) {
@@ -2027,12 +2053,17 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 		return nil, protocol.ErrInvalid
 	}
 
-	admission, err := m.uploadScheduler.enqueue(blockTransferDescriptor{
+	descriptor := blockTransferDescriptor{
 		folder:     req.Folder,
 		device:     deviceID,
 		connection: conn.ConnectionID(),
 		bytes:      req.Size,
-	}).wait()
+	}
+	waiter := m.uploadScheduler.enqueue(descriptor)
+	if m.blockTransferEnqueued != nil {
+		m.blockTransferEnqueued(descriptor)
+	}
+	admission, err := waiter.wait()
 	if err != nil {
 		return nil, err
 	}
@@ -2051,7 +2082,11 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 	defer func() {
 		// Close it ourselves if it isn't returned due to an error
 		if err != nil {
-			res.Close()
+			if res.admission == nil {
+				res.Close()
+			} else {
+				err = &requestResponseError{cause: err, response: res}
+			}
 		}
 	}()
 

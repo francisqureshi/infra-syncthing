@@ -138,7 +138,7 @@ func (e encryptedModel) Request(req *Request) (RequestResponse, error) {
 		data = nd
 	}
 	enc := encryptBytes(data, fileKey)
-	return rawResponse{data: enc, response: resp}, nil
+	return newRawResponse(enc, resp), nil
 }
 
 func (e encryptedModel) DownloadProgress(p *DownloadProgress) error {
@@ -637,6 +637,18 @@ func deslashify(s string) (string, error) {
 type rawResponse struct {
 	data     []byte
 	response RequestResponse
+}
+
+type retainedRequestResponse interface {
+	RetainForTransmission() bool
+}
+
+func newRawResponse(data []byte, response RequestResponse) rawResponse {
+	if retained, ok := response.(retainedRequestResponse); ok && retained.RetainForTransmission() {
+		return rawResponse{data: data, response: response}
+	}
+	response.Close()
+	return rawResponse{data: data}
 }
 
 func (r rawResponse) Data() []byte {

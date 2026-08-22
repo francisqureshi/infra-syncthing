@@ -119,6 +119,12 @@ type orderedRequestResponse interface {
 	WaitForResponse()
 }
 
+type orderedRequestError interface {
+	error
+	WaitForResponse()
+	Close()
+}
+
 type Connection interface {
 	// Send an Index message to the peer device. The message in the
 	// parameter may be altered by the connection and should not be used
@@ -694,11 +700,21 @@ func checkFilename(name string) error {
 func (c *rawConnection) handleRequest(req *Request) {
 	res, err := c.model.Request(req)
 	if err != nil {
+		var done chan struct{}
+		var ordered orderedRequestError
+		if errors.As(err, &ordered) {
+			ordered.WaitForResponse()
+			done = make(chan struct{})
+			defer func() {
+				<-done
+				ordered.Close()
+			}()
+		}
 		resp := &Response{
 			ID:   req.ID,
 			Code: errorToCode(err),
 		}
-		c.send(context.Background(), resp.toWire(), nil)
+		c.send(context.Background(), resp.toWire(), done)
 		return
 	}
 	if ordered, ok := res.(orderedRequestResponse); ok {
