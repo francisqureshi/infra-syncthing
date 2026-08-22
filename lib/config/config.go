@@ -287,7 +287,9 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
 
 	cfg.prepareIgnoredDevices(existingDevices)
 
-	cfg.Defaults.prepare(myID, existingDevices)
+	if err := cfg.Defaults.prepare(myID, existingDevices); err != nil {
+		return err
+	}
 
 	cfg.removeDeprecatedProtocols()
 
@@ -370,7 +372,9 @@ func (cfg *Configuration) prepareFolders(myID protocol.DeviceID, existingDevices
 			return nil, fmt.Errorf("folder %q: %w", folder.ID, errFolderIDDuplicate)
 		}
 
-		folder.prepare(myID, existingDevices)
+		if err := folder.prepare(myID, existingDevices); err != nil {
+			return nil, fmt.Errorf("folder %q: %w", folder.ID, err)
+		}
 
 		existingFolders[folder.ID] = folder
 
@@ -657,11 +661,14 @@ func getFreePort(host string, ports ...int) (int, error) {
 	return addr.Port, nil
 }
 
-func (defaults *Defaults) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) {
+func (defaults *Defaults) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) error {
 	ensureZeroForNodefault(&FolderConfiguration{}, &defaults.Folder)
 	ensureZeroForNodefault(&DeviceConfiguration{}, &defaults.Device)
-	defaults.Folder.prepare(myID, existingDevices)
+	if err := defaults.Folder.prepare(myID, existingDevices); err != nil {
+		return fmt.Errorf("default folder: %w", err)
+	}
 	defaults.Device.prepare(nil)
+	return nil
 }
 
 func ensureZeroForNodefault(empty any, target any) {

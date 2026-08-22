@@ -613,6 +613,79 @@ func TestNewSaveLoad(t *testing.T) {
 	}
 }
 
+func TestNetworkPriorityConfiguration(t *testing.T) {
+	if priority := New(device1).Defaults.Folder.NetworkPriority; priority != 0 {
+		t.Fatalf("default Network Priority is %d, expected 0", priority)
+	}
+	folder := FolderConfiguration{NetworkPriority: 50}
+	if priority := folder.RequiresRestartOnly().NetworkPriority; priority != 0 {
+		t.Fatalf("Network Priority %d unexpectedly requires restart", priority)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		priority int
+		wantErr  bool
+	}{
+		{name: "minimum", priority: -100},
+		{name: "maximum", priority: 100},
+		{name: "below minimum", priority: -101, wantErr: true},
+		{name: "above maximum", priority: 101, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := New(device1)
+			folder := cfg.Defaults.Folder.Copy()
+			adjustFolderConfiguration(&folder, "default", "default", fs.FilesystemTypeBasic, "/tmp")
+			folder.NetworkPriority = tc.priority
+			cfg.Folders = append(cfg.Folders, folder)
+
+			err := cfg.prepare(device1)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected invalid Network Priority to be rejected")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	cfg := New(device1)
+	cfg.Defaults.Folder.NetworkPriority = 101
+	if err := cfg.prepare(device1); err == nil {
+		t.Fatal("expected invalid default folder Network Priority to be rejected")
+	}
+}
+
+func TestNetworkPriorityPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.xml")
+	cfg := New(device1)
+	folder := cfg.Defaults.Folder.Copy()
+	adjustFolderConfiguration(&folder, "default", "default", fs.FilesystemTypeBasic, "/tmp")
+	folder.NetworkPriority = 50
+	cfg.Folders = append(cfg.Folders, folder)
+
+	wrapper := wrap(path, cfg, device1)
+	if err := wrapper.Save(); err != nil {
+		wrapper.stop()
+		t.Fatal(err)
+	}
+	wrapper.stop()
+
+	loaded, err := load(path, device1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loaded.stop()
+
+	loadedFolder, ok := loaded.Folder("default")
+	if !ok {
+		t.Fatal("persisted folder is missing")
+	}
+	if loadedFolder.NetworkPriority != 50 {
+		t.Fatalf("persisted Network Priority is %d, expected 50", loadedFolder.NetworkPriority)
+	}
+}
+
 func TestWindowsLineEndings(t *testing.T) {
 	if !build.IsWindows {
 		t.Skip("Windows specific")

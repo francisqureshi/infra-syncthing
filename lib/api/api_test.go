@@ -26,6 +26,7 @@ import (
 
 	"github.com/d4l3k/messagediff"
 	"github.com/thejerf/suture/v4"
+	"golang.org/x/net/html"
 
 	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/internal/db/sqlite"
@@ -1805,6 +1806,279 @@ func TestConfigChanges(t *testing.T) {
 	}
 	if opts.MaxSendKbps != 50 {
 		t.Error("Expected 50 for MaxSendKbps, got", opts.MaxSendKbps)
+	}
+}
+
+func TestNetworkPriorityConfigAPI(t *testing.T) {
+	t.Parallel()
+
+	const testAPIKey = "foobarbaz"
+	cfg := config.Configuration{
+		GUI: config.GUIConfiguration{
+			RawAddress: "127.0.0.1:0",
+			APIKey:     testAPIKey,
+		},
+	}
+	configPath := filepath.Join(t.TempDir(), "config.xml")
+	wrapper := config.Wrap(configPath, cfg, protocol.LocalDeviceID, events.NoopLogger)
+	cfgCtx, cfgCancel := context.WithCancel(context.Background())
+	go wrapper.Serve(cfgCtx)
+	t.Cleanup(cfgCancel)
+	baseURL := startHTTP(t, wrapper)
+
+	client := &http.Client{Timeout: time.Minute}
+	do := func(method, path string, data any, wantStatus int) *http.Response {
+		t.Helper()
+		var body io.Reader
+		if data != nil {
+			bs, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = bytes.NewReader(bs)
+		}
+		req, err := http.NewRequest(method, baseURL+path, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-API-Key", testAPIKey)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != wantStatus {
+			resp.Body.Close()
+			t.Fatalf("%s %s returned %s, expected status %d", method, path, resp.Status, wantStatus)
+		}
+		return resp
+	}
+	getFolder := func(path string) config.FolderConfiguration {
+		t.Helper()
+		resp := do(http.MethodGet, path, nil, http.StatusOK)
+		defer resp.Body.Close()
+		var folder config.FolderConfiguration
+		if err := json.NewDecoder(resp.Body).Decode(&folder); err != nil {
+			t.Fatal(err)
+		}
+		return folder
+	}
+
+	folderPath := "/rest/config/folders/priority"
+	resp := do(http.MethodPut, "/rest/config/folders", []config.FolderConfiguration{{
+		ID:              "priority",
+		Path:            "priority",
+		Label:           "preserve me",
+		RescanIntervalS: 1234,
+		NetworkPriority: config.NetworkPriorityMin,
+	}}, http.StatusOK)
+	resp.Body.Close()
+
+	resp = do(http.MethodGet, "/rest/config/folders", nil, http.StatusOK)
+	var folders []config.FolderConfiguration
+	if err := json.NewDecoder(resp.Body).Decode(&folders); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(folders) != 1 || folders[0].NetworkPriority != config.NetworkPriorityMin {
+		t.Fatalf("folder list did not round-trip minimum Network Priority: %#v", folders)
+	}
+
+	resp = do(http.MethodPut, folderPath, config.FolderConfiguration{
+		ID:              "priority",
+		Path:            "priority",
+		Label:           "preserve me",
+		RescanIntervalS: 1234,
+		NetworkPriority: config.NetworkPriorityMax,
+	}, http.StatusOK)
+	resp.Body.Close()
+	if priority := getFolder(folderPath).NetworkPriority; priority != config.NetworkPriorityMax {
+		t.Fatalf("PUT Network Priority is %d, expected %d", priority, config.NetworkPriorityMax)
+	}
+
+	resp = do(http.MethodPatch, folderPath, map[string]int{"networkPriority": 50}, http.StatusOK)
+	resp.Body.Close()
+	folder := getFolder(folderPath)
+	if folder.NetworkPriority != 50 {
+		t.Fatalf("PATCH Network Priority is %d, expected 50", folder.NetworkPriority)
+	}
+	if folder.Label != "preserve me" || folder.RescanIntervalS != 1234 {
+		t.Fatalf("partial PATCH reset unrelated folder fields: %#v", folder)
+	}
+
+	beforeInvalid, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = do(http.MethodPatch, folderPath, map[string]int{"networkPriority": config.NetworkPriorityMax + 1}, http.StatusInternalServerError)
+	resp.Body.Close()
+	if priority := getFolder(folderPath).NetworkPriority; priority != 50 {
+		t.Fatalf("invalid PATCH changed Network Priority to %d", priority)
+	}
+	afterInvalid, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeInvalid, afterInvalid) {
+		t.Fatal("invalid PATCH changed persisted configuration")
+	}
+
+	defaultFolderPath := "/rest/config/defaults/folder"
+	resp = do(http.MethodPut, defaultFolderPath, map[string]int{"networkPriority": config.NetworkPriorityMin}, http.StatusOK)
+	resp.Body.Close()
+	if priority := getFolder(defaultFolderPath).NetworkPriority; priority != config.NetworkPriorityMin {
+		t.Fatalf("default folder PUT Network Priority is %d, expected %d", priority, config.NetworkPriorityMin)
+	}
+	resp = do(http.MethodPatch, defaultFolderPath, map[string]int{"networkPriority": config.NetworkPriorityMax}, http.StatusOK)
+	resp.Body.Close()
+	if priority := getFolder(defaultFolderPath).NetworkPriority; priority != config.NetworkPriorityMax {
+		t.Fatalf("default folder PATCH Network Priority is %d, expected %d", priority, config.NetworkPriorityMax)
+	}
+}
+
+func TestNetworkPrioritySchedulerStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		featureFlags []string
+		wantActive   bool
+	}{
+		{name: "inactive"},
+		{name: "active", featureFlags: []string{config.FeatureFlagNetworkPriority}, wantActive: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			const testAPIKey = "foobarbaz"
+			cfg := config.Configuration{
+				GUI: config.GUIConfiguration{
+					RawAddress: "127.0.0.1:0",
+					APIKey:     testAPIKey,
+				},
+				Options: config.OptionsConfiguration{FeatureFlags: tc.featureFlags},
+			}
+			wrapper := config.Wrap(filepath.Join(t.TempDir(), "config.xml"), cfg, protocol.LocalDeviceID, events.NoopLogger)
+			baseURL := startHTTP(t, wrapper)
+
+			req, err := http.NewRequest(http.MethodGet, baseURL+"/rest/db/status?folder=priority", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-API-Key", testAPIKey)
+			resp, err := (&http.Client{Timeout: time.Minute}).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET /rest/db/status returned %s", resp.Status)
+			}
+
+			var status struct {
+				NetworkPrioritySchedulingActive *bool `json:"networkPrioritySchedulingActive"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+				t.Fatal(err)
+			}
+			if status.NetworkPrioritySchedulingActive == nil {
+				t.Fatal("REST status does not explicitly report Network Priority scheduler state")
+			}
+			if *status.NetworkPrioritySchedulingActive != tc.wantActive {
+				t.Fatalf("Network Priority scheduler active is %v, expected %v", *status.NetworkPrioritySchedulingActive, tc.wantActive)
+			}
+		})
+	}
+}
+
+func TestNetworkPriorityEditor(t *testing.T) {
+	cfg := newMockedConfig()
+	cfg.GUIReturns(config.GUIConfiguration{
+		RawAddress: "127.0.0.1:0",
+		APIKey:     testAPIKey,
+	})
+	baseURL := startHTTP(t, cfg)
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/syncthing/folder/editFolderModalView.html", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-Key", testAPIKey)
+	resp, err := (&http.Client{Timeout: time.Minute}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET advanced folder editor returned %s", resp.Status)
+	}
+
+	doc, err := html.Parse(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var priorityInput *html.Node
+	presets := make(map[string]string)
+	var nodeText func(*html.Node) string
+	nodeText = func(node *html.Node) string {
+		if node.Type == html.TextNode {
+			return node.Data
+		}
+		var text strings.Builder
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			text.WriteString(nodeText(child))
+		}
+		return text.String()
+	}
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			attributes := make(map[string]string, len(node.Attr))
+			for _, attr := range node.Attr {
+				attributes[attr.Key] = attr.Val
+			}
+			if node.Data == "input" && attributes["name"] == "networkPriority" {
+				priorityInput = node
+			}
+			if node.Data == "button" && strings.HasPrefix(attributes["ng-click"], "currentFolder.networkPriority = ") {
+				presets[attributes["ng-click"]] = strings.TrimSpace(nodeText(node))
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
+
+	if priorityInput == nil {
+		t.Fatal("advanced folder editor has no Network Priority input")
+	}
+	attributes := make(map[string]string, len(priorityInput.Attr))
+	for _, attr := range priorityInput.Attr {
+		attributes[attr.Key] = attr.Val
+	}
+	for name, want := range map[string]string{
+		"type":     "number",
+		"ng-model": "currentFolder.networkPriority",
+		"min":      "-100",
+		"max":      "100",
+		"step":     "1",
+	} {
+		if got := attributes[name]; got != want {
+			t.Errorf("Network Priority input %s attribute is %q, expected %q", name, got, want)
+		}
+	}
+	if _, ok := attributes["required"]; !ok {
+		t.Error("Network Priority input is not required")
+	}
+
+	for action, label := range map[string]string{
+		"currentFolder.networkPriority = -50": "Low (-50)",
+		"currentFolder.networkPriority = 0":   "Normal (0)",
+		"currentFolder.networkPriority = 50":  "High (50)",
+		"currentFolder.networkPriority = 100": "Critical (100)",
+	} {
+		if got := presets[action]; got != label {
+			t.Errorf("Network Priority preset %q has label %q, expected %q", action, got, label)
+		}
 	}
 }
 
