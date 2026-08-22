@@ -157,7 +157,7 @@ type model struct {
 	downloadScheduler *blockTransferScheduler
 	// folderIOLimiter limits the number of concurrent I/O heavy operations,
 	// such as scans and pulls.
-	folderIOLimiter *semaphore.Semaphore
+	folderIOLimiter *folderWorkScheduler
 	fatalChan       chan error
 	started         chan struct{}
 	keyGen          *protocol.KeyGenerator
@@ -191,7 +191,7 @@ type model struct {
 
 var _ config.Verifier = &model{}
 
-type folderFactory func(*model, *ignore.Matcher, config.FolderConfiguration, versioner.Versioner, events.Logger, *semaphore.Semaphore) service
+type folderFactory func(*model, *ignore.Matcher, config.FolderConfiguration, versioner.Versioner, events.Logger) service
 
 var folderFactories = make(map[config.FolderType]folderFactory)
 
@@ -226,6 +226,8 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 	configureUploadBlockTransferScheduler(uploadScheduler, cfg.RawCopy())
 	downloadScheduler := newBlockTransferScheduler()
 	configureDownloadBlockTransferScheduler(downloadScheduler, cfg.RawCopy())
+	folderIOLimiter := newFolderWorkScheduler()
+	configureFolderWorkScheduler(folderIOLimiter, cfg.RawCopy())
 	m := &model{
 		Supervisor: suture.New("model", spec),
 
@@ -242,7 +244,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		globalRequestLimiter: semaphore.New(1024 * cfg.Options().MaxConcurrentIncomingRequestKiB()),
 		uploadScheduler:      uploadScheduler,
 		downloadScheduler:    downloadScheduler,
-		folderIOLimiter:      semaphore.New(cfg.Options().MaxFolderConcurrency()),
+		folderIOLimiter:      folderIOLimiter,
 		fatalChan:            make(chan error),
 		started:              make(chan struct{}),
 		keyGen:               keyGen,
@@ -433,7 +435,7 @@ func (m *model) addAndStartFolderLockedWithIgnores(cfg config.FolderConfiguratio
 
 	m.warnAboutOverwritingProtectedFiles(cfg, ignores)
 
-	p := folderFactory(m, ignores, cfg, ver, m.evLogger, m.folderIOLimiter)
+	p := folderFactory(m, ignores, cfg, ver, m.evLogger)
 	m.folderRunners.Add(folder, p)
 
 	slog.Info("Ready to synchronize", cfg.LogAttr())
@@ -1341,6 +1343,16 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 	m.mut.Lock()
 	m.remoteFolderStates[deviceID] = states
 	m.mut.Unlock()
+	if m.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority) {
+		for folder, state := range states {
+			if state != remoteFolderValid {
+				continue
+			}
+			if runner, ok := m.folderRunners.Get(folder); ok {
+				runner.SchedulePull()
+			}
+		}
+	}
 	m.downloadScheduler.refreshRunnableTransfers(func(descriptor blockTransferDescriptor) bool {
 		return descriptor.hasDevice(deviceID)
 	})
@@ -3222,6 +3234,7 @@ func (m *model) CommitConfiguration(from, to config.Configuration) bool {
 	<-m.started
 	configureUploadBlockTransferScheduler(m.uploadScheduler, to)
 	configureDownloadBlockTransferScheduler(m.downloadScheduler, to)
+	configureFolderWorkScheduler(m.folderIOLimiter, to)
 
 	// Go through the folder configs and figure out if we need to restart or not.
 
@@ -3370,8 +3383,6 @@ func (m *model) CommitConfiguration(from, to config.Configuration) bool {
 	m.cleanPending(toDevices, toFolders, ignoredDevices, removedFolders)
 
 	m.globalRequestLimiter.SetCapacity(1024 * to.Options.MaxConcurrentIncomingRequestKiB())
-	m.folderIOLimiter.SetCapacity(to.Options.MaxFolderConcurrency())
-
 	// Some options don't require restart as those components handle it fine
 	// by themselves. Compare the options structs containing only the
 	// attributes that require restart and act appropriately.
@@ -3411,6 +3422,18 @@ func configureUploadBlockTransferScheduler(scheduler *blockTransferScheduler, cf
 
 func configureDownloadBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration) {
 	configureBlockTransferScheduler(scheduler, cfg, 1024*cfg.Options.MaxConcurrentOutgoingRequestKiB(), make(map[protocol.DeviceID]int))
+}
+
+func configureFolderWorkScheduler(scheduler *folderWorkScheduler, cfg config.Configuration) {
+	priorities := make(map[string]int, len(cfg.Folders))
+	for _, folder := range cfg.Folders {
+		priorities[folder.ID] = folder.NetworkPriority
+	}
+	scheduler.configure(
+		cfg.Options.FeatureFlag(config.FeatureFlagNetworkPriority),
+		cfg.Options.MaxFolderConcurrency(),
+		priorities,
+	)
 }
 
 func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration, globalLimit int, deviceLimits map[protocol.DeviceID]int) {
