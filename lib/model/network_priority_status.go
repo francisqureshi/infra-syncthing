@@ -29,16 +29,16 @@ type NetworkPrioritySchedulerStateProvider interface {
 }
 
 func (m *model) NetworkPrioritySchedulerState(folder string) NetworkPrioritySchedulerState {
-	upload, uploadActive := m.uploadScheduler.directionState(folder)
-	download, downloadActive := m.downloadScheduler.directionState(folder)
+	upload := m.uploadScheduler.directionState(folder)
+	download := m.downloadScheduler.directionState(folder)
 	return NetworkPrioritySchedulerState{
-		Active:   uploadActive && downloadActive,
+		Active:   true,
 		Upload:   upload,
 		Download: download,
 	}
 }
 
-func (s *blockTransferScheduler) directionState(folder string) (NetworkPrioritySchedulerDirectionState, bool) {
+func (s *blockTransferScheduler) directionState(folder string) NetworkPrioritySchedulerDirectionState {
 	s.mut.Lock()
 	defer s.mut.Unlock()
 
@@ -58,5 +58,5 @@ func (s *blockTransferScheduler) directionState(folder string) (NetworkPriorityS
 		}
 	}
 	state.OldestSchedulingWaitSeconds = oldestWait
-	return state, s.enabled
+	return state
 }

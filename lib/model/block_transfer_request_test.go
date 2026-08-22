@@ -106,7 +106,7 @@ func TestModelRequestSchedulesBeforeFileOpenAndReleasesOnCompletion(t *testing.T
 	awaitBlockTransferRequest(t, lowResult).Close()
 }
 
-func TestNetworkPriorityPrototypeEqualPriorityShareThroughModelRequest(t *testing.T) {
+func TestNetworkPriorityEqualPriorityShareThroughModelRequest(t *testing.T) {
 	wrapper, controls := newBlockTransferRequestConfig(t, map[string]int{
 		"gate": 100,
 		"a":    0,
@@ -154,7 +154,62 @@ func TestNetworkPriorityPrototypeEqualPriorityShareThroughModelRequest(t *testin
 	}
 }
 
-func TestNetworkPriorityPrototypeEqualPriorityShareAcrossDevicesThroughModelRequest(t *testing.T) {
+func TestDefaultNetworkPriorityUsesEqualPriorityShareThroughModelRequest(t *testing.T) {
+	wrapper, controls := newBlockTransferRequestConfigWithLimits(t, map[string]int{
+		"gate": 0,
+		"a":    0,
+		"b":    0,
+	}, 0, 4, device1)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.FeatureFlags = nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	gatePayload := make([]byte, 4*1024)
+	aPayload := make([]byte, 4*1024)
+	bPayload := make([]byte, 1024)
+	for folder, payload := range map[string][]byte{
+		"gate": gatePayload,
+		"a":    aPayload,
+		"b":    bPayload,
+	} {
+		writeFile(t, controls[folder].filesystem, "payload", payload)
+	}
+
+	gateHash := sha256.Sum256(gatePayload)
+	gate, err := m.Request(device1Conn, &protocol.Request{Folder: "gate", Name: "payload", Size: len(gatePayload), Hash: gateHash[:]})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enqueued := observeEnqueuedBlockTransfers(m.model)
+	results := make(chan namedBlockTransferRequestResult)
+	queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "a", "payload", aPayload, enqueued, results)
+	queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "a", "payload", aPayload, enqueued, results)
+	for range 4 {
+		queueNamedBlockTransferRequest(t, m.model, device1Conn, device1, "b", "payload", bPayload, enqueued, results)
+	}
+
+	gate.Close()
+	for _, wantFolder := range []string{"a", "b", "b", "b", "b", "a"} {
+		result := awaitNamedBlockTransferRequest(t, results)
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.folder != wantFolder {
+			result.response.Close()
+			t.Fatalf("default Equal-Priority Share admitted folder %q, want %q", result.folder, wantFolder)
+		}
+		result.response.Close()
+	}
+}
+
+func TestNetworkPriorityEqualPriorityShareAcrossDevicesThroughModelRequest(t *testing.T) {
 	const blockSize = protocol.MaxBlockSize
 	wrapper, controls := newBlockTransferRequestConfigWithLimits(t, map[string]int{
 		"gate":   100,
@@ -201,7 +256,7 @@ func TestNetworkPriorityPrototypeEqualPriorityShareAcrossDevicesThroughModelRequ
 	gate2.Close()
 }
 
-func TestNetworkPriorityPrototypeRepeatedLowPriorityRefillThroughModelRequest(t *testing.T) {
+func TestNetworkPriorityRepeatedLowPriorityRefillThroughModelRequest(t *testing.T) {
 	const (
 		largeBlock = protocol.MaxBlockSize
 		tailBlock  = protocol.MaxBlockSize / 2
@@ -273,7 +328,7 @@ func TestNetworkPriorityPrototypeRepeatedLowPriorityRefillThroughModelRequest(t 
 	}
 }
 
-func TestNetworkPriorityPrototypeLiveReprioritizationThroughModelRequest(t *testing.T) {
+func TestNetworkPriorityLiveReprioritizationThroughModelRequest(t *testing.T) {
 	wrapper, controls := newBlockTransferRequestConfig(t, map[string]int{
 		"bulk":  0,
 		"focus": -100,
@@ -624,7 +679,6 @@ func newBlockTransferRequestConfigWithLimits(t *testing.T, priorities map[string
 	t.Helper()
 	cfg := config.New(myID)
 	cfg.Options.MinHomeDiskFree.Value = 0
-	cfg.Options.FeatureFlags = []string{config.FeatureFlagNetworkPriority}
 	cfg.Options.RawMaxCIRequestKiB = globalLimitKiB
 	folderDevices := make([]config.FolderDeviceConfiguration, 0, len(devices))
 	for _, deviceID := range devices {

@@ -1955,30 +1955,24 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 }
 
 func TestNetworkPrioritySchedulerStatus(t *testing.T) {
-	for _, tc := range []struct {
-		name           string
-		featureFlags   []string
-		wantActive     bool
-		wantScheduling model.NetworkPrioritySchedulerState
-	}{
-		{name: "feature flag absent"},
-		{
-			name:         "feature flag active",
-			featureFlags: []string{config.FeatureFlagNetworkPriority},
-			wantActive:   true,
-			wantScheduling: model.NetworkPrioritySchedulerState{
-				Upload: model.NetworkPrioritySchedulerDirectionState{
-					QueuedBytes:                 11,
-					ActiveBytes:                 12,
-					OldestSchedulingWaitSeconds: 13,
-				},
-				Download: model.NetworkPrioritySchedulerDirectionState{
-					QueuedBytes:                 21,
-					ActiveBytes:                 22,
-					OldestSchedulingWaitSeconds: 23,
-				},
-			},
+	wantScheduling := model.NetworkPrioritySchedulerState{
+		Upload: model.NetworkPrioritySchedulerDirectionState{
+			QueuedBytes:                 11,
+			ActiveBytes:                 12,
+			OldestSchedulingWaitSeconds: 13,
 		},
+		Download: model.NetworkPrioritySchedulerDirectionState{
+			QueuedBytes:                 21,
+			ActiveBytes:                 22,
+			OldestSchedulingWaitSeconds: 23,
+		},
+	}
+	for _, tc := range []struct {
+		name         string
+		featureFlags []string
+	}{
+		{name: "default configuration"},
+		{name: "upgraded feature flagged configuration", featureFlags: []string{"networkPriority"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1993,7 +1987,10 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 			}
 			wrapper := config.Wrap(filepath.Join(t.TempDir(), "config.xml"), cfg, protocol.LocalDeviceID, events.NoopLogger)
 			summary := &modelmocks.FolderSummaryService{}
-			summary.SummaryReturns(&model.FolderSummary{NetworkPriorityScheduling: tc.wantScheduling}, nil)
+			summary.SummaryReturns(&model.FolderSummary{
+				NetworkPrioritySchedulingActive: true,
+				NetworkPriorityScheduling:       wantScheduling,
+			}, nil)
 			baseURL := startHTTPWithSummary(t, wrapper, summary)
 
 			req, err := http.NewRequest(http.MethodGet, baseURL+"/rest/db/status?folder=priority", nil)
@@ -2020,14 +2017,14 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 			if status.NetworkPrioritySchedulingActive == nil {
 				t.Fatal("REST status does not explicitly report Network Priority scheduler state")
 			}
-			if *status.NetworkPrioritySchedulingActive != tc.wantActive {
-				t.Fatalf("Network Priority scheduler active is %v, expected %v", *status.NetworkPrioritySchedulingActive, tc.wantActive)
+			if !*status.NetworkPrioritySchedulingActive {
+				t.Fatal("Network Priority scheduler is inactive")
 			}
 			if status.NetworkPriorityScheduling == nil {
 				t.Fatal("REST status does not expose per-direction Network Priority scheduler state")
 			}
-			if *status.NetworkPriorityScheduling != tc.wantScheduling {
-				t.Fatalf("REST Network Priority scheduling = %#v, want %#v", *status.NetworkPriorityScheduling, tc.wantScheduling)
+			if *status.NetworkPriorityScheduling != wantScheduling {
+				t.Fatalf("REST Network Priority scheduling = %#v, want %#v", *status.NetworkPriorityScheduling, wantScheduling)
 			}
 		})
 	}

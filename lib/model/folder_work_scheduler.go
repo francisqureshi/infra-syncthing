@@ -11,14 +11,13 @@ import (
 	"sync"
 )
 
-// folderWorkScheduler limits concurrent folder I/O. When Network Priority is
-// enabled, queued pulls and scans are admitted by Network Priority. Work that
+// folderWorkScheduler limits concurrent folder I/O. Queued pulls and scans are
+// admitted by Network Priority. Work that
 // does not enable network traffic, such as version cleanup, keeps its arrival
 // order without participating in Network Priority.
 type folderWorkScheduler struct {
 	mut sync.Mutex
 
-	enabled    bool
 	capacity   int
 	active     int
 	priorities map[string]int
@@ -45,12 +44,11 @@ func newFolderWorkScheduler() *folderWorkScheduler {
 	}
 }
 
-func (s *folderWorkScheduler) configure(enabled bool, capacity int, priorities map[string]int) {
+func (s *folderWorkScheduler) configure(capacity int, priorities map[string]int) {
 	if capacity < 0 {
 		capacity = 0
 	}
 	s.mut.Lock()
-	s.enabled = enabled
 	s.capacity = capacity
 	s.priorities = priorities
 	s.scheduleLocked()
@@ -118,10 +116,6 @@ func (s *folderWorkScheduler) scheduleLocked() {
 }
 
 func (s *folderWorkScheduler) nextWaiterLocked() int {
-	if !s.enabled {
-		return 0
-	}
-
 	// Already-waiting maintenance retains its opportunity, but once network
 	// work is at the front, all queued network work participates in strict
 	// Network Priority regardless of maintenance arrival positions.

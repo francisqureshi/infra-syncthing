@@ -41,7 +41,6 @@ import (
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/stats"
@@ -149,11 +148,10 @@ type model struct {
 	// requests
 	globalRequestLimiter *semaphore.Semaphore
 	// uploadScheduler orders incoming Block Transfers before buffers or file
-	// data are acquired when Network Priority scheduling is active.
+	// data are acquired.
 	uploadScheduler *blockTransferScheduler
 	// downloadScheduler orders outgoing Block Transfers before a connection
-	// is selected and a request is sent when Network Priority scheduling is
-	// active.
+	// is selected and a request is sent.
 	downloadScheduler *blockTransferScheduler
 	// folderIOLimiter limits the number of concurrent I/O heavy operations,
 	// such as scans and pulls.
@@ -1167,17 +1165,11 @@ func (p *pager) done() bool {
 // NetworkPriority supplies the connection writer with the current device-local
 // priority for folder-owned output.
 func (m *model) NetworkPriority(folder string) protocol.NetworkPriorityPolicy {
-	if !m.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority) {
-		return protocol.NetworkPriorityPolicy{}
-	}
-	if folder == "" {
-		return protocol.NetworkPriorityPolicy{Enabled: true}
-	}
 	cfg, ok := m.cfg.Folder(folder)
 	if !ok {
 		return protocol.NetworkPriorityPolicy{}
 	}
-	return protocol.NetworkPriorityPolicy{Priority: cfg.NetworkPriority, Enabled: true}
+	return protocol.NetworkPriorityPolicy{Priority: cfg.NetworkPriority}
 }
 
 // Index is called when a new device is connected and we receive their full index.
@@ -1343,14 +1335,12 @@ func (m *model) ClusterConfig(conn protocol.Connection, cm *protocol.ClusterConf
 	m.mut.Lock()
 	m.remoteFolderStates[deviceID] = states
 	m.mut.Unlock()
-	if m.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority) {
-		for folder, state := range states {
-			if state != remoteFolderValid {
-				continue
-			}
-			if runner, ok := m.folderRunners.Get(folder); ok {
-				runner.SchedulePull()
-			}
+	for folder, state := range states {
+		if state != remoteFolderValid {
+			continue
+		}
+		if runner, ok := m.folderRunners.Get(folder); ok {
+			runner.SchedulePull()
 		}
 	}
 	m.downloadScheduler.refreshRunnableTransfers(func(descriptor blockTransferDescriptor) bool {
@@ -2629,32 +2619,16 @@ func (m *model) requestGlobalWithAvailability(ctx context.Context, availability 
 	if err != nil {
 		return nil, candidates[0], err
 	}
-	if admission != nil {
-		defer admission.close()
-	}
+	defer admission.close()
 
-	var selected Availability
-	var conn protocol.Connection
-	var connOK bool
-	if admission == nil {
-		legacyCandidates := make([]Availability, len(sources))
-		for i, source := range sources {
-			legacyCandidates[i] = Availability{ID: source.device, FromTemporary: source.fromTemporary}
-		}
-		selected = legacyCandidates[activity.leastBusy(legacyCandidates)]
-		conn, connOK = m.requestConnectionForDevice(selected.ID)
-	} else {
-		selected = Availability{ID: admission.device, FromTemporary: admission.fromTemporary}
-		m.mut.RLock()
-		conn, connOK = m.connections[admission.connection]
-		m.mut.RUnlock()
-	}
+	selected := Availability{ID: admission.device, FromTemporary: admission.fromTemporary}
+	m.mut.RLock()
+	conn, connOK := m.connections[admission.connection]
+	m.mut.RUnlock()
 	if !connOK {
 		return nil, selected, fmt.Errorf("requestGlobal: no connection to device: %s", selected.ID.Short())
 	}
 
-	activity.using(selected)
-	defer activity.done(selected)
 	req.FromTemporary = selected.FromTemporary
 	l.Debugf("%v REQ(out): %s (%s): %q / %q b=%d o=%d s=%d h=%x ft=%t", m, selected.ID.Short(), conn, req.Folder, req.Name, req.BlockNo, req.Offset, req.Size, req.Hash, req.FromTemporary)
 	data, err := conn.Request(ctx, req)
@@ -2709,33 +2683,6 @@ func (m *model) requestConnectionsForDevice(deviceID protocol.DeviceID) []string
 		}
 	}
 	return connections
-}
-
-// requestConnectionForDevice returns a connection to the given device, to
-// be used for sending a request. If there is only one device connection,
-// this is the one to use. If there are multiple then we avoid the first
-// ("primary") connection, which is dedicated to index data, and pick a
-// random one of the others.
-func (m *model) requestConnectionForDevice(deviceID protocol.DeviceID) (protocol.Connection, bool) {
-	m.mut.RLock()
-	defer m.mut.RUnlock()
-
-	connIDs, ok := m.deviceConnIDs[deviceID]
-	if !ok {
-		return nil, false
-	}
-
-	// If there is an entry in deviceConns, it always contains at least one
-	// connection.
-	connID := connIDs[0]
-	if len(connIDs) > 1 {
-		// Pick a random connection of the non-primary ones
-		idx := rand.Intn(len(connIDs)-1) + 1
-		connID = connIDs[idx]
-	}
-
-	conn, connOK := m.connections[connID]
-	return conn, connOK
 }
 
 func (m *model) ScanFolders() map[string]error {
@@ -3429,16 +3376,11 @@ func configureFolderWorkScheduler(scheduler *folderWorkScheduler, cfg config.Con
 	for _, folder := range cfg.Folders {
 		priorities[folder.ID] = folder.NetworkPriority
 	}
-	scheduler.configure(
-		cfg.Options.FeatureFlag(config.FeatureFlagNetworkPriority),
-		cfg.Options.MaxFolderConcurrency(),
-		priorities,
-	)
+	scheduler.configure(cfg.Options.MaxFolderConcurrency(), priorities)
 }
 
 func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration, globalLimit int, deviceLimits map[protocol.DeviceID]int) {
 	scheduler.configure(blockTransferSchedulerConfiguration{
-		enabled:      cfg.Options.FeatureFlag(config.FeatureFlagNetworkPriority),
 		globalLimit:  globalLimit,
 		deviceLimits: deviceLimits,
 		folders:      configuredBlockTransferFolders(cfg),

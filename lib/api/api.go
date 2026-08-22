@@ -796,9 +796,7 @@ func (s *service) getDBStatus(w http.ResponseWriter, r *http.Request) {
 	if sum, err := s.fss.Summary(folder); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 	} else {
-		status := *sum
-		status.NetworkPrioritySchedulingActive = s.cfg.Options().FeatureFlag(config.FeatureFlagNetworkPriority)
-		sendJSON(w, status)
+		sendJSON(w, sum)
 	}
 }
 

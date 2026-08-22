@@ -91,8 +91,8 @@ code-signed.
 ## Documentation
 
 Please see the Syncthing [documentation site][6] [[source]][17].
-Operators testing the feature-flagged scheduler should also read the
-[Network Priority operator guide][18].
+Operators using Network Priority should also read the [Network Priority
+operator guide][18].
 
 All code is licensed under the [MPLv2 License][7].
 

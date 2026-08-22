@@ -87,7 +87,7 @@ func TestLimiterInit(t *testing.T) {
 	checkActualAndExpected(t, actualR, actualW, expectedR, expectedW)
 }
 
-func TestNetworkPriorityFeatureFlagDoesNotChangeUploadRateLimits(t *testing.T) {
+func TestNetworkPrioritySchedulingPreservesUploadRateLimits(t *testing.T) {
 	wrapper, wrapperCancel := initConfig()
 	defer wrapperCancel()
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
@@ -104,7 +104,7 @@ func TestNetworkPriorityFeatureFlagDoesNotChangeUploadRateLimits(t *testing.T) {
 	globalLimit := lim.write.Limit()
 	deviceLimit := lim.deviceWriteLimiters[device2].Limit()
 	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
-		cfg.Options.FeatureFlags = append(cfg.Options.FeatureFlags, config.FeatureFlagNetworkPriority)
+		cfg.Defaults.Folder.NetworkPriority = config.NetworkPriorityMax
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestNetworkPriorityFeatureFlagDoesNotChangeUploadRateLimits(t *testing.T) {
 	}
 }
 
-func TestNetworkPriorityFeatureFlagDoesNotChangeDownloadRateLimits(t *testing.T) {
+func TestNetworkPrioritySchedulingPreservesDownloadRateLimits(t *testing.T) {
 	wrapper, wrapperCancel := initConfig()
 	defer wrapperCancel()
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
@@ -136,7 +136,7 @@ func TestNetworkPriorityFeatureFlagDoesNotChangeDownloadRateLimits(t *testing.T)
 	globalLimit := lim.read.Limit()
 	deviceLimit := lim.deviceReadLimiters[device2].Limit()
 	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
-		cfg.Options.FeatureFlags = append(cfg.Options.FeatureFlags, config.FeatureFlagNetworkPriority)
+		cfg.Defaults.Folder.NetworkPriority = config.NetworkPriorityMax
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +191,7 @@ func TestNetworkPriorityControlledLoadPreservesRateLimitedByteTotals(t *testing.
 
 	beforeRead, beforeWritten := transfer()
 	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
-		cfg.Options.FeatureFlags = append(cfg.Options.FeatureFlags, config.FeatureFlagNetworkPriority)
+		cfg.Defaults.Folder.NetworkPriority = config.NetworkPriorityMax
 	})
 	if err != nil {
 		t.Fatal(err)

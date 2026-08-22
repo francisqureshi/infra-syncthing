@@ -35,7 +35,6 @@ type blockTransferSource struct {
 type blockTransferScheduler struct {
 	mut sync.Mutex
 
-	enabled         bool
 	globalLimit     int
 	globalInFlight  int
 	deviceLimits    map[protocol.DeviceID]int
@@ -60,7 +59,6 @@ type blockTransferFolder struct {
 }
 
 type blockTransferSchedulerConfiguration struct {
-	enabled      bool
 	globalLimit  int
 	deviceLimits map[protocol.DeviceID]int
 	folders      map[string]blockTransferFolder
@@ -133,21 +131,14 @@ func newBlockTransferScheduler() *blockTransferScheduler {
 func (s *blockTransferScheduler) configure(cfg blockTransferSchedulerConfiguration) {
 	s.mut.Lock()
 	previousFolders := s.folders
-	if !cfg.enabled {
-		s.finishQueuedLocked(func(*blockTransferWaiter) bool { return true }, blockTransferResult{})
-	} else {
-		s.finishQueuedLocked(func(waiter *blockTransferWaiter) bool {
-			folder, ok := cfg.folders[waiter.descriptor.folder]
-			return !ok || !folder.runnable
-		}, blockTransferResult{err: protocol.ErrGeneric})
-	}
-	s.enabled = cfg.enabled
+	s.finishQueuedLocked(func(waiter *blockTransferWaiter) bool {
+		folder, ok := cfg.folders[waiter.descriptor.folder]
+		return !ok || !folder.runnable
+	}, blockTransferResult{err: protocol.ErrGeneric})
 	s.globalLimit = max(cfg.globalLimit, 0)
 	s.deviceLimits = cfg.deviceLimits
 	s.folders = cfg.folders
-	if cfg.enabled {
-		s.initializeReprioritizedFairnessAccountsLocked(previousFolders)
-	}
+	s.initializeReprioritizedFairnessAccountsLocked(previousFolders)
 	s.scheduleLocked()
 	s.mut.Unlock()
 }
@@ -184,11 +175,6 @@ func (s *blockTransferScheduler) enqueue(descriptor blockTransferDescriptor) *bl
 		result:     make(chan blockTransferResult, 1),
 	}
 	s.nextSequence++
-	if !s.enabled {
-		waiter.result <- blockTransferResult{}
-		s.mut.Unlock()
-		return waiter
-	}
 	if folder, ok := s.folders[descriptor.folder]; !ok || !folder.runnable {
 		waiter.result <- blockTransferResult{err: protocol.ErrGeneric}
 		s.mut.Unlock()
@@ -408,9 +394,6 @@ func (s *blockTransferScheduler) finishQueuedLocked(match func(*blockTransferWai
 }
 
 func (s *blockTransferScheduler) scheduleLocked() {
-	if !s.enabled {
-		return
-	}
 	for {
 		priorities := s.queuedPrioritiesLocked()
 		reservedGlobal := 0

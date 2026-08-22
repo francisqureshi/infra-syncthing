@@ -1,9 +1,10 @@
 # Operating Network Priority scheduling
 
 Network Priority is a device-local integer from -100 through 100, defaulting
-to zero. While the temporary `networkPriority` feature flag is active, higher
-values strictly precede lower values for the next runnable Block Transfer.
-Active transfers and active protocol frames finish without preemption.
+to zero. Higher values strictly precede lower values for the next runnable
+Block Transfer. Active transfers and active protocol frames finish without
+preemption. The scheduler also serves installations where every folder keeps
+the default priority of zero, applying Equal-Priority Share universally.
 
 Strict priority intentionally permits starvation. Continuously runnable work
 at a higher priority can keep lower-priority work queued indefinitely. Use the
@@ -27,10 +28,9 @@ valid because each device controls its own resources.
 ```
 
 The inclusive bounds are -100 and 100. Invalid values reject the configuration
-update without changing the current value. During burn-in, add `networkPriority`
-to the options `featureFlags` list to activate scheduling. When the flag is
-absent, configured priorities remain persisted and visible while transfers use
-legacy admission behavior.
+update without changing the current value. No feature flag or configuration
+migration is required. An existing `networkPriority` entry in the generic
+`featureFlags` list is harmless but no longer controls scheduling.
 
 ## In-Flight Limits are not rate limits
 
