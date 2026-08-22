@@ -148,6 +148,9 @@ type model struct {
 	// globalRequestLimiter limits the amount of data in concurrent incoming
 	// requests
 	globalRequestLimiter *semaphore.Semaphore
+	// uploadScheduler orders incoming Block Transfers before buffers or file
+	// data are acquired when Network Priority scheduling is active.
+	uploadScheduler *blockTransferScheduler
 	// folderIOLimiter limits the number of concurrent I/O heavy operations,
 	// such as scans and pulls.
 	folderIOLimiter *semaphore.Semaphore
@@ -214,6 +217,8 @@ var (
 // for file data without altering the local folder in any way.
 func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFiles []string, evLogger events.Logger, keyGen *protocol.KeyGenerator) Model {
 	spec := svcutil.SpecWithDebugLogger()
+	uploadScheduler := newBlockTransferScheduler()
+	configureBlockTransferScheduler(uploadScheduler, cfg.RawCopy())
 	m := &model{
 		Supervisor: suture.New("model", spec),
 
@@ -228,6 +233,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		progressEmitter:      NewProgressEmitter(cfg, evLogger),
 		shortID:              id.Short(),
 		globalRequestLimiter: semaphore.New(1024 * cfg.Options().MaxConcurrentIncomingRequestKiB()),
+		uploadScheduler:      uploadScheduler,
 		folderIOLimiter:      semaphore.New(cfg.Options().MaxFolderConcurrency()),
 		fatalChan:            make(chan error),
 		started:              make(chan struct{}),
@@ -1873,6 +1879,7 @@ func (m *model) introduceDevice(device protocol.Device, introducerCfg config.Dev
 func (m *model) Closed(conn protocol.Connection, err error) {
 	connID := conn.ConnectionID()
 	deviceID := conn.DeviceID()
+	m.uploadScheduler.cancelConnection(connID)
 
 	m.mut.Lock()
 	conn, ok := m.connections[connID]
@@ -1932,9 +1939,10 @@ func (m *model) Closed(conn protocol.Connection, err error) {
 
 // Implements protocol.RequestResponse
 type requestResponse struct {
-	data   []byte
-	closed chan struct{}
-	once   sync.Once
+	data      []byte
+	closed    chan struct{}
+	admission *blockTransferAdmission
+	once      sync.Once
 }
 
 func newRequestResponse(size int) *requestResponse {
@@ -1952,11 +1960,20 @@ func (r *requestResponse) Close() {
 	r.once.Do(func() {
 		protocol.BufferPool.Put(r.data)
 		close(r.closed)
+		if r.admission != nil {
+			r.admission.close()
+		}
 	})
 }
 
 func (r *requestResponse) Wait() {
 	<-r.closed
+}
+
+func (r *requestResponse) WaitForResponse() {
+	if r.admission != nil {
+		r.admission.waitForResponse()
+	}
 }
 
 // Request returns the specified data segment by reading it from local disk.
@@ -2010,6 +2027,16 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 		return nil, protocol.ErrInvalid
 	}
 
+	admission, err := m.uploadScheduler.enqueue(blockTransferDescriptor{
+		folder:     req.Folder,
+		device:     deviceID,
+		connection: conn.ConnectionID(),
+		bytes:      req.Size,
+	}).wait()
+	if err != nil {
+		return nil, err
+	}
+
 	// Restrict parallel requests by connection/device
 
 	m.mut.RLock()
@@ -2019,6 +2046,7 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 	// The requestResponse releases the bytes to the buffer pool and the
 	// limiters when its Close method is called.
 	res := newLimitedRequestResponse(req.Size, limiter, m.globalRequestLimiter)
+	res.admission = admission
 
 	defer func() {
 		// Close it ourselves if it isn't returned due to an error
@@ -2956,6 +2984,7 @@ func (m *model) CommitConfiguration(from, to config.Configuration) bool {
 
 	// Delay processing config changes until after the initial setup
 	<-m.started
+	configureBlockTransferScheduler(m.uploadScheduler, to)
 
 	// Go through the folder configs and figure out if we need to restart or not.
 
@@ -3126,6 +3155,33 @@ func (m *model) setConnRequestLimitersLocked(cfg config.DeviceConfiguration) {
 	case cfg.MaxRequestKiB == 0:
 		m.connRequestLimiters[cfg.DeviceID] = semaphore.New(1024 * defaultPullerPendingKiB)
 	}
+}
+
+func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration) {
+	deviceLimits := make(map[protocol.DeviceID]int, len(cfg.Devices))
+	for _, device := range cfg.Devices {
+		switch {
+		case device.MaxRequestKiB > 0:
+			deviceLimits[device.DeviceID] = 1024 * device.MaxRequestKiB
+		case device.MaxRequestKiB == 0:
+			deviceLimits[device.DeviceID] = 1024 * defaultPullerPendingKiB
+		default:
+			deviceLimits[device.DeviceID] = 0
+		}
+	}
+	folders := make(map[string]blockTransferFolder, len(cfg.Folders))
+	for _, folder := range cfg.Folders {
+		folders[folder.ID] = blockTransferFolder{
+			priority: folder.NetworkPriority,
+			runnable: !folder.Paused,
+		}
+	}
+	scheduler.configure(blockTransferSchedulerConfiguration{
+		enabled:      cfg.Options.FeatureFlag(config.FeatureFlagNetworkPriority),
+		globalLimit:  1024 * cfg.Options.MaxConcurrentIncomingRequestKiB(),
+		deviceLimits: deviceLimits,
+		folders:      folders,
+	})
 }
 
 func (m *model) cleanPending(existingDevices map[protocol.DeviceID]config.DeviceConfiguration, existingFolders map[string]config.FolderConfiguration, ignoredDevices deviceIDSet, removedFolders map[string]struct{}) {
