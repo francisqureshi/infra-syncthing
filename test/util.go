@@ -27,6 +27,7 @@ import (
 	"unicode"
 
 	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/rc"
 )
 
@@ -413,8 +414,11 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 		}
 
 		rn, _ := filepath.Rel(dir, path)
-		if rn == "." || rn == ".stfolder" {
+		if rn == "." {
 			return nil
+		}
+		if rn == ".stfolder" {
+			return filepath.SkipDir
 		}
 		if rn == ".stversions" {
 			return filepath.SkipDir
@@ -521,6 +525,20 @@ func checkedStop(t *testing.T, p *rc.Process) {
 	if _, err := p.Stop(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func saveLoadedFolderConfiguration(cfg config.Wrapper, folder config.FolderConfiguration) error {
+	raw := cfg.RawCopy()
+	raw.SetFolder(folder)
+	fd, err := os.Create(cfg.ConfigPath())
+	if err != nil {
+		return err
+	}
+	if err := raw.WriteXML(fd); err != nil {
+		fd.Close()
+		return err
+	}
+	return fd.Close()
 }
 
 func startInstance(t *testing.T, i int) *rc.Process {

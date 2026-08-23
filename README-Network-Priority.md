@@ -82,3 +82,51 @@ Prometheus exposes equivalent gauges with only the bounded `folder` and
 - `syncthing_model_network_priority_queued_bytes`
 - `syncthing_model_network_priority_active_bytes`
 - `syncthing_model_network_priority_oldest_scheduling_wait_seconds`
+
+## Validate a three-peer studio workload
+
+The bounded integration profile starts three real daemons with the repository
+fixture identities and direct TCP connections. It creates exactly 30 folders:
+five High/Critical, fifteen Normal, five Low ingests, and five Dynamic
+projects. The default seed is `363`; set `STUDIO_SEED` to replay an alternate
+deterministic data set. Build the integration binary before running the focused
+test:
+
+```sh
+go run build.go install syncthing
+go test -v -timeout 60m -tags integration ./test \
+  -run '^TestNetworkPriorityStudioWorkload$' -count=10
+```
+
+Failures retain the generated homes, configurations, daemon logs, project
+data, JSON Lines timeline, and JSON summary under
+`test/logs/network-priority`. Set `STUDIO_ARTIFACT_DIR` to use another artifact
+root.
+
+The opt-in soak uses the same scenario engine behind the existing
+`integration,benchmark` tags:
+
+```sh
+STUDIO_SOAK_TOTAL_BYTES=12GiB \
+go test -v -timeout 12h -tags 'integration,benchmark' ./test \
+  -run '^TestBenchmarkNetworkPriorityStudioSoak$'
+```
+
+Soak controls are:
+
+- `STUDIO_SOAK_TOTAL_BYTES`: total real source bytes; accepts bytes or
+  `KiB`/`MiB`/`GiB`/`TiB` (and decimal `KB`/`MB`/`GB`/`TB`). Literal
+  multi-terabyte runs are supported.
+- `STUDIO_SOAK_DISTRIBUTION`: `equal` or `ramp` project sizes.
+- `STUDIO_SOAK_DURATION`: positive Go duration used as the scenario timeout.
+- `STUDIO_SOAK_SEND_KIB` and `STUDIO_SOAK_RECEIVE_KIB`: node rate limits.
+- `STUDIO_SOAK_UPLOAD_INFLIGHT_KIB` and
+  `STUDIO_SOAK_DOWNLOAD_INFLIGHT_KIB`: directional In-Flight Limits.
+- `STUDIO_SOAK_DISK_MULTIPLIER`: disk safety multiplier, minimum and default
+  `4`. The soak refuses to create data unless free space is at least this
+  multiple of the requested logical source bytes.
+
+Soak artifacts are always retained. The end-of-run summary records completion
+order, Equal-Priority Share tolerance, work-conservation throughput, rate and
+In-Flight observations, reconnect/error counts, total transferred bytes,
+per-process CPU and peak RSS, and checksum results.

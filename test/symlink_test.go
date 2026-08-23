@@ -30,10 +30,11 @@ func TestSymlinks(t *testing.T) {
 	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Versioning = config.VersioningConfiguration{}
-	cfg.SetFolder(fld)
 	os.Rename("h2/config.xml", "h2/config.xml.orig")
 	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
-	cfg.Save()
+	if err := saveLoadedFolderConfiguration(cfg, fld); err != nil {
+		t.Fatal(err)
+	}
 
 	testSymlinks(t)
 }
@@ -51,10 +52,11 @@ func TestSymlinksSimpleVersioning(t *testing.T) {
 		Type:   "simple",
 		Params: map[string]string{"keep": "5"},
 	}
-	cfg.SetFolder(fld)
 	os.Rename("h2/config.xml", "h2/config.xml.orig")
 	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
-	cfg.Save()
+	if err := saveLoadedFolderConfiguration(cfg, fld); err != nil {
+		t.Fatal(err)
+	}
 
 	testSymlinks(t)
 }
@@ -71,10 +73,11 @@ func TestSymlinksStaggeredVersioning(t *testing.T) {
 	fld.Versioning = config.VersioningConfiguration{
 		Type: "staggered",
 	}
-	cfg.SetFolder(fld)
 	os.Rename("h2/config.xml", "h2/config.xml.orig")
 	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
-	cfg.Save()
+	if err := saveLoadedFolderConfiguration(cfg, fld); err != nil {
+		t.Fatal(err)
+	}
 
 	testSymlinks(t)
 }
