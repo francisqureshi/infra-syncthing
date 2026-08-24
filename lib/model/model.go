@@ -228,6 +228,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 	folderIOLimiter := newFolderWorkScheduler()
 	configureFolderWorkScheduler(folderIOLimiter, cfg.RawCopy())
 	sourceHashCoordinator := scanner.NewSourceHashCoordinator(cfg.Options().HashCapacity())
+	configureSourceHashCoordinator(sourceHashCoordinator, cfg.RawCopy())
 	m := &model{
 		Supervisor: suture.New("model", spec),
 
@@ -3176,6 +3177,7 @@ func (m *model) CommitConfiguration(from, to config.Configuration) bool {
 	configureUploadBlockTransferScheduler(m.uploadScheduler, to)
 	configureDownloadBlockTransferScheduler(m.downloadScheduler, to)
 	configureFolderWorkScheduler(m.folderIOLimiter, to)
+	configureSourceHashCoordinator(m.sourceHashCoordinator, to)
 
 	// Go through the folder configs and figure out if we need to restart or not.
 
@@ -3371,6 +3373,16 @@ func configureFolderWorkScheduler(scheduler *folderWorkScheduler, cfg config.Con
 		priorities[folder.ID] = folder.FolderPriority
 	}
 	scheduler.configure(cfg.Options.MaxFolderConcurrency(), priorities)
+}
+
+func configureSourceHashCoordinator(coordinator scanner.SourceHashCoordinator, cfg config.Configuration) {
+	priorities := make(map[string]int, len(cfg.Folders))
+	for _, folder := range cfg.Folders {
+		if !folder.Paused {
+			priorities[folder.ID] = folder.FolderPriority
+		}
+	}
+	coordinator.Configure(cfg.Options.HashCapacity(), priorities)
 }
 
 func configureBlockTransferScheduler(scheduler *blockTransferScheduler, cfg config.Configuration, globalLimit int, deviceLimits map[protocol.DeviceID]int) {

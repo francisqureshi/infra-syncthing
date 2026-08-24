@@ -1439,8 +1439,8 @@ func TestHashCapacity(t *testing.T) {
 	if got := explicit.HashCapacity(); got != 3 {
 		t.Fatalf("explicit Hash Capacity = %d, want 3", got)
 	}
-	if got := explicit.RequiresRestartOnly().RawHashCapacity; got != 3 {
-		t.Fatalf("restart-only Hash Capacity = %d, want 3", got)
+	if got := explicit.RequiresRestartOnly().RawHashCapacity; got != 0 {
+		t.Fatalf("restart-only Hash Capacity = %d, want live value omitted", got)
 	}
 
 	folder := FolderConfiguration{Hashers: 2}

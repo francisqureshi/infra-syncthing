@@ -63,6 +63,7 @@ type SourceHashEpoch interface {
 // to the coordinator. Completion, continuation eligibility, slot release, and
 // replacement selection are serialized as one transition.
 type SourceHashCoordinator interface {
+	Configure(capacity int, priorities map[string]int)
 	BeginSourceHashEpoch(SourceHashFolder) SourceHashEpoch
 	Submit(context.Context, SourceHashRequest) SourceHashSubmission
 }
@@ -72,11 +73,15 @@ type sourceHashCoordinator struct {
 
 	capacity      int
 	active        int
+	priorities    map[string]int
+	configured    bool
+	activeWorks   map[*coordinatedSourceHashWork]struct{}
 	byFolder      map[string]int
 	charged       map[equalPriorityShareKey]int64
 	activeBytes   map[equalPriorityShareKey]int64
 	activeByShare map[equalPriorityShareKey]int
-	epochs        map[equalPriorityShareKey]int
+	epochs        map[string]int
+	epochPriority map[string]int
 	queued        []*coordinatedSourceHashWork
 }
 
@@ -87,7 +92,7 @@ type equalPriorityShareKey struct {
 
 type sourceHashEpoch struct {
 	coordinator *sourceHashCoordinator
-	shareKey    equalPriorityShareKey
+	folder      string
 	once        sync.Once
 }
 
@@ -99,6 +104,8 @@ type coordinatedSourceHashWork struct {
 	wasAdmitted bool
 	bytes       int64
 	activeBytes int64
+	activeShare equalPriorityShareKey
+	canceled    bool
 }
 
 // NewSourceHashCoordinator returns a coordinator with the given positive Hash
@@ -109,32 +116,123 @@ func NewSourceHashCoordinator(capacity int) SourceHashCoordinator {
 	}
 	return &sourceHashCoordinator{
 		capacity:      capacity,
+		priorities:    make(map[string]int),
+		activeWorks:   make(map[*coordinatedSourceHashWork]struct{}),
 		byFolder:      make(map[string]int),
 		charged:       make(map[equalPriorityShareKey]int64),
 		activeBytes:   make(map[equalPriorityShareKey]int64),
 		activeByShare: make(map[equalPriorityShareKey]int),
-		epochs:        make(map[equalPriorityShareKey]int),
+		epochs:        make(map[string]int),
+		epochPriority: make(map[string]int),
 	}
 }
 
-func (c *sourceHashCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) SourceHashEpoch {
-	shareKey := equalPriorityShareKey{priority: folder.Priority, folder: folder.ID}
+// Configure applies live node-wide Hash Capacity and Folder Priority policy.
+// Active Hashing Quanta remain non-preemptive; queued work is reordered before
+// newly available capacity is admitted.
+func (c *sourceHashCoordinator) Configure(capacity int, priorities map[string]int) {
+	if capacity < 1 {
+		panic("Hash Capacity must be positive")
+	}
+	nextPriorities := make(map[string]int, len(priorities))
+	for folder, priority := range priorities {
+		nextPriorities[folder] = priority
+	}
 	c.mut.Lock()
+	reprioritized := make(map[int]map[string]struct{})
+	if c.configured {
+		for folder, priority := range nextPriorities {
+			if previous, ok := c.priorities[folder]; ok && previous != priority {
+				if reprioritized[priority] == nil {
+					reprioritized[priority] = make(map[string]struct{})
+				}
+				reprioritized[priority][folder] = struct{}{}
+			}
+		}
+	}
+	baselines := make(map[int]int64, len(reprioritized))
+	for priority, folders := range reprioritized {
+		baselines[priority] = c.minimumFairnessLocked(priority, folders)
+	}
+
+	c.capacity = capacity
+	c.priorities = nextPriorities
+	for priority, folders := range reprioritized {
+		for folder := range folders {
+			c.charged[equalPriorityShareKey{priority: priority, folder: folder}] = baselines[priority]
+		}
+	}
+	for folder := range c.epochs {
+		if priority, ok := c.priorities[folder]; ok {
+			c.epochPriority[folder] = priority
+		} else {
+			delete(c.epochPriority, folder)
+		}
+	}
+	c.configured = true
+	for work := range c.activeWorks {
+		priority, ok := c.priorities[work.request.Folder.ID]
+		if !ok {
+			work.canceled = true
+			continue
+		}
+		work.request.Folder.Priority = priority
+	}
+	canceled := make([]*coordinatedSourceHashWork, 0)
+	queued := c.queued[:0]
+	for _, work := range c.queued {
+		priority, ok := c.priorities[work.request.Folder.ID]
+		if !ok {
+			canceled = append(canceled, work)
+			continue
+		}
+		work.request.Folder.Priority = priority
+		queued = append(queued, work)
+	}
+	c.queued = queued
+	c.scheduleLocked()
+	c.mut.Unlock()
+	for _, work := range canceled {
+		c.cancel(work)
+	}
+}
+
+func (*sourceHashCoordinator) cancel(work *coordinatedSourceHashWork) {
+	work.request.Work.Close()
+	completeCanceledSourceHashWork(work)
+}
+
+func completeCanceledSourceHashWork(work *coordinatedSourceHashWork) {
+	work.completion <- SourceHashCompletion{
+		Bytes: work.bytes,
+		Err:   context.Canceled,
+	}
+	close(work.completion)
+}
+
+func (c *sourceHashCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) SourceHashEpoch {
+	c.mut.Lock()
+	if priority, ok := c.priorities[folder.ID]; c.configured && ok {
+		folder.Priority = priority
+	}
+	shareKey := equalPriorityShareKey{priority: folder.Priority, folder: folder.ID}
 	c.initializeFairnessLocked(shareKey)
-	c.epochs[shareKey]++
+	c.epochs[folder.ID]++
+	c.epochPriority[folder.ID] = folder.Priority
 	c.mut.Unlock()
 	return &sourceHashEpoch{
 		coordinator: c,
-		shareKey:    shareKey,
+		folder:      folder.ID,
 	}
 }
 
 func (e *sourceHashEpoch) Close() {
 	e.once.Do(func() {
 		e.coordinator.mut.Lock()
-		e.coordinator.epochs[e.shareKey]--
-		if e.coordinator.epochs[e.shareKey] == 0 {
-			delete(e.coordinator.epochs, e.shareKey)
+		e.coordinator.epochs[e.folder]--
+		if e.coordinator.epochs[e.folder] == 0 {
+			delete(e.coordinator.epochs, e.folder)
+			delete(e.coordinator.epochPriority, e.folder)
 		}
 		e.coordinator.mut.Unlock()
 	})
@@ -148,6 +246,18 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 		admitted:   make(chan struct{}),
 	}
 	c.mut.Lock()
+	if c.configured {
+		priority, ok := c.priorities[request.Folder.ID]
+		if !ok {
+			c.mut.Unlock()
+			c.cancel(work)
+			return SourceHashSubmission{
+				Admitted:   work.admitted,
+				Completion: work.completion,
+			}
+		}
+		work.request.Folder.Priority = priority
+	}
 	c.initializeFairnessLocked(work.shareKey())
 	c.queued = append(c.queued, work)
 	c.scheduleLocked()
@@ -167,10 +277,12 @@ func (c *sourceHashCoordinator) scheduleLocked() {
 		work := c.queued[next]
 		c.queued = append(c.queued[:next], c.queued[next+1:]...)
 		c.active++
+		c.activeWorks[work] = struct{}{}
 		c.byFolder[work.request.Folder.ID]++
-		c.activeByShare[work.shareKey()]++
+		work.activeShare = work.shareKey()
+		c.activeByShare[work.activeShare]++
 		work.activeBytes = max(work.request.Work.NextHashingQuantumBytes(), 0)
-		c.activeBytes[work.shareKey()] += work.activeBytes
+		c.activeBytes[work.activeShare] += work.activeBytes
 		if !work.wasAdmitted {
 			work.wasAdmitted = true
 			close(work.admitted)
@@ -214,12 +326,34 @@ func (c *sourceHashCoordinator) initializeFairnessLocked(shareKey equalPriorityS
 	c.charged[shareKey] = minimum
 }
 
+func (c *sourceHashCoordinator) minimumFairnessLocked(priority int, excludedFolders map[string]struct{}) int64 {
+	var minimum int64
+	found := false
+	for candidate := range c.charged {
+		if candidate.priority != priority || !c.participatingLocked(candidate) {
+			continue
+		}
+		if _, excluded := excludedFolders[candidate.folder]; excluded {
+			continue
+		}
+		bytes := c.fairnessScoreLocked(candidate)
+		if !found || bytes < minimum {
+			minimum = bytes
+			found = true
+		}
+	}
+	return minimum
+}
+
 func (c *sourceHashCoordinator) fairnessScoreLocked(shareKey equalPriorityShareKey) int64 {
 	return c.charged[shareKey] + c.activeBytes[shareKey]
 }
 
 func (c *sourceHashCoordinator) participatingLocked(shareKey equalPriorityShareKey) bool {
-	if c.epochs[shareKey] > 0 || c.activeByShare[shareKey] > 0 {
+	if c.epochs[shareKey.folder] > 0 && c.epochPriority[shareKey.folder] == shareKey.priority {
+		return true
+	}
+	if c.activeByShare[shareKey] > 0 {
 		return true
 	}
 	for _, work := range c.queued {
@@ -235,13 +369,21 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 
 	c.mut.Lock()
 	work.bytes += result.Bytes
-	c.charged[work.shareKey()] += result.Bytes
-	c.activeBytes[work.shareKey()] -= work.activeBytes
+	c.charged[work.activeShare] += result.Bytes
+	c.activeBytes[work.activeShare] -= work.activeBytes
 	work.activeBytes = 0
-	c.active--
-	c.byFolder[work.request.Folder.ID]--
-	c.activeByShare[work.shareKey()]--
-	if err == nil && !result.Done {
+	if work.canceled {
+		c.mut.Unlock()
+		work.request.Work.Close()
+		c.mut.Lock()
+		c.releaseActiveLocked(work)
+		c.scheduleLocked()
+		c.mut.Unlock()
+		completeCanceledSourceHashWork(work)
+		return
+	}
+	c.releaseActiveLocked(work)
+	if !work.canceled && err == nil && !result.Done {
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
 		c.mut.Unlock()
@@ -257,6 +399,14 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 		Err:   err,
 	}
 	close(work.completion)
+}
+
+func (c *sourceHashCoordinator) releaseActiveLocked(work *coordinatedSourceHashWork) {
+	c.active--
+	delete(c.activeWorks, work)
+	c.byFolder[work.request.Folder.ID]--
+	c.activeByShare[work.activeShare]--
+	work.activeShare = equalPriorityShareKey{}
 }
 
 func (w *coordinatedSourceHashWork) shareKey() equalPriorityShareKey {

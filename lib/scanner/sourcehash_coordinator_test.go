@@ -9,6 +9,7 @@ package scanner
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,6 +100,414 @@ func TestSourceHashCoordinatorAdmitsNewHigherPriorityWorkAtQuantumBoundary(t *te
 	close(lowSecond)
 	if completed := awaitCoordinatorResult(t, lowResult); completed.Err != nil || completed.Bytes != 7 {
 		t.Fatalf("Low completion = %+v, want 7 consumed bytes and no error", completed)
+	}
+}
+
+func TestSourceHashCoordinatorReordersQueuedSourceHashWorkAfterLiveFolderPriorityChange(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.Configure(1, map[string]int{
+		"active": 0,
+		"bulk":   0,
+		"focus":  -100,
+	})
+	started := make(chan string, 3)
+	activeRelease := make(chan struct{})
+	bulkRelease := make(chan struct{})
+	focusRelease := make(chan struct{})
+
+	activeResult := coordinator.Submit(t.Context(), coordinatorRequest("active", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "active-1", activeRelease, 4),
+	)).Completion
+	if got := awaitCoordinatorStart(t, started); got != "active-1" {
+		t.Fatalf("active admission = %q, want active-1", got)
+	}
+	bulkResult := coordinator.Submit(t.Context(), coordinatorRequest("bulk", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "bulk-1", bulkRelease, 2),
+	)).Completion
+	focusResult := coordinator.Submit(t.Context(), coordinatorRequest("focus", -100, 0,
+		newSingleQuantumCoordinatorWork(started, "focus-1", focusRelease, 2),
+	)).Completion
+
+	coordinator.Configure(1, map[string]int{
+		"active": 0,
+		"bulk":   0,
+		"focus":  100,
+	})
+	select {
+	case got := <-started:
+		t.Fatalf("priority change preempted active quantum with %q", got)
+	default:
+	}
+
+	close(activeRelease)
+	if completed := awaitCoordinatorResult(t, activeResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	if got := awaitCoordinatorStart(t, started); got != "focus-1" {
+		t.Fatalf("first admission after reprioritization = %q, want focus-1", got)
+	}
+	close(focusRelease)
+	if completed := awaitCoordinatorResult(t, focusResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	if got := awaitCoordinatorStart(t, started); got != "bulk-1" {
+		t.Fatalf("remaining admission = %q, want bulk-1", got)
+	}
+	close(bulkRelease)
+	if completed := awaitCoordinatorResult(t, bulkResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+}
+
+func TestSourceHashCoordinatorReprioritizedActiveSourceHashWorkRejoinsEqualPriorityShare(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.Configure(1, map[string]int{"a": 0, "b": 0, "gate": 200})
+	started := make(chan string, 8)
+	aFirstRelease := make(chan struct{})
+	aSecondRelease := make(chan struct{})
+	bFirstRelease := make(chan struct{})
+	aEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "a", Priority: 0})
+	bEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "b", Priority: 0})
+	t.Cleanup(aEpoch.Close)
+	t.Cleanup(bEpoch.Close)
+
+	aResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
+		&controlledCoordinatorWork{
+			started: started,
+			quanta: []controlledCoordinatorQuantum{
+				{label: "a-1", release: aFirstRelease, bytes: 8},
+				{label: "a-2", release: aSecondRelease, bytes: 8, done: true},
+			},
+		},
+	)).Completion
+	if got := awaitCoordinatorStart(t, started); got != "a-1" {
+		t.Fatalf("initial admission = %q, want a-1", got)
+	}
+	bFirstResult := coordinator.Submit(t.Context(), coordinatorRequest("b", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "b-1", bFirstRelease, 4),
+	)).Completion
+
+	coordinator.Configure(1, map[string]int{"a": 100, "b": 0, "gate": 200})
+	close(aFirstRelease)
+	if got := awaitCoordinatorStart(t, started); got != "a-2" {
+		t.Fatalf("continuation after reprioritization = %q, want a-2", got)
+	}
+	close(aSecondRelease)
+	if completed := awaitCoordinatorResult(t, aResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	if got := awaitCoordinatorStart(t, started); got != "b-1" {
+		t.Fatalf("remaining original-share admission = %q, want b-1", got)
+	}
+	close(bFirstRelease)
+	if completed := awaitCoordinatorResult(t, bFirstResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+
+	gateRelease := make(chan struct{})
+	gateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 200, 0,
+		newSingleQuantumCoordinatorWork(started, "gate-1", gateRelease, 1),
+	)).Completion
+	if got := awaitCoordinatorStart(t, started); got != "gate-1" {
+		t.Fatalf("gate admission = %q, want gate-1", got)
+	}
+	coordinator.Configure(1, map[string]int{"a": 0, "b": 0, "gate": 200})
+	aFreshRelease := make(chan struct{})
+	bFreshRelease := make(chan struct{})
+	aFreshResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "a-fresh", aFreshRelease, 2),
+	)).Completion
+	bFreshResult := coordinator.Submit(t.Context(), coordinatorRequest("b", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "b-fresh", bFreshRelease, 2),
+	)).Completion
+
+	close(gateRelease)
+	if completed := awaitCoordinatorResult(t, gateResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	if got := awaitCoordinatorStart(t, started); got != "a-fresh" {
+		t.Fatalf("first admission after rejoining Equal-Priority Share = %q, want a-fresh", got)
+	}
+	close(aFreshRelease)
+	if completed := awaitCoordinatorResult(t, aFreshResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	if got := awaitCoordinatorStart(t, started); got != "b-fresh" {
+		t.Fatalf("remaining fresh admission = %q, want b-fresh", got)
+	}
+	close(bFreshRelease)
+	if completed := awaitCoordinatorResult(t, bFreshResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+}
+
+func TestSourceHashCoordinatorFillsLiveHashCapacityGrowthImmediately(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	priorities := map[string]int{"a": 0, "b": 0}
+	coordinator.Configure(1, priorities)
+	started := make(chan string, 2)
+	aRelease := make(chan struct{})
+	bRelease := make(chan struct{})
+
+	aResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "a-1", aRelease, 2),
+	)).Completion
+	if got := awaitCoordinatorStart(t, started); got != "a-1" {
+		t.Fatalf("first admission = %q, want a-1", got)
+	}
+	bSubmission := coordinator.Submit(t.Context(), coordinatorRequest("b", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "b-1", bRelease, 2),
+	))
+
+	coordinator.Configure(2, priorities)
+	select {
+	case <-bSubmission.Admitted:
+	default:
+		t.Fatal("Hash Capacity growth returned without filling the new compatible slot")
+	}
+	if got := awaitCoordinatorStart(t, started); got != "b-1" {
+		t.Fatalf("growth admission = %q, want b-1", got)
+	}
+
+	close(aRelease)
+	close(bRelease)
+	for description, result := range map[string]<-chan SourceHashCompletion{
+		"A": aResult,
+		"B": bSubmission.Completion,
+	} {
+		if completed := awaitCoordinatorResult(t, result); completed.Err != nil {
+			t.Fatalf("%s completion: %v", description, completed.Err)
+		}
+	}
+}
+
+func TestSourceHashCoordinatorCancelsQueuedSourceHashWorkForUnavailableFolder(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.Configure(1, map[string]int{"gate": 100, "victim": 0})
+	started := make(chan string, 2)
+	gateRelease := make(chan struct{})
+	victimRelease := make(chan struct{})
+	victimClosed := make(chan struct{})
+
+	gateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
+		newSingleQuantumCoordinatorWork(started, "gate-1", gateRelease, 2),
+	)).Completion
+	if got := awaitCoordinatorStart(t, started); got != "gate-1" {
+		t.Fatalf("gate admission = %q, want gate-1", got)
+	}
+	victimWork := newSingleQuantumCoordinatorWork(started, "victim-1", victimRelease, 2)
+	victimWork.closed = victimClosed
+	victimSubmission := coordinator.Submit(t.Context(), coordinatorRequest("victim", 0, 0, victimWork))
+
+	coordinator.Configure(1, map[string]int{"gate": 100})
+	select {
+	case completed := <-victimSubmission.Completion:
+		if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != 0 {
+			t.Fatalf("queued cancellation = %+v, want zero bytes and context cancellation", completed)
+		}
+	default:
+		t.Fatal("Folder lifecycle change returned without canceling queued Source Hash Work")
+	}
+	select {
+	case <-victimSubmission.Admitted:
+		t.Fatal("canceled queued Source Hash Work was admitted")
+	default:
+	}
+	select {
+	case <-victimClosed:
+	default:
+		t.Fatal("queued cancellation did not close its source owner")
+	}
+
+	close(gateRelease)
+	if completed := awaitCoordinatorResult(t, gateResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+}
+
+func TestSourceHashCoordinatorRejectsNewSourceHashWorkForUnavailableFolder(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.Configure(1, map[string]int{})
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	closed := make(chan struct{})
+	work := newSingleQuantumCoordinatorWork(started, "removed-1", release, 2)
+	work.closed = closed
+
+	submission := coordinator.Submit(t.Context(), coordinatorRequest("removed", 0, 0, work))
+	select {
+	case completed := <-submission.Completion:
+		if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != 0 {
+			t.Fatalf("unavailable Folder submission = %+v, want zero bytes and context cancellation", completed)
+		}
+	default:
+		t.Fatal("unavailable Folder submission was not rejected synchronously")
+	}
+	select {
+	case <-submission.Admitted:
+		t.Fatal("unavailable Folder Source Hash Work was admitted")
+	default:
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("unavailable Folder source owner was not closed")
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("unavailable Folder started Hashing Quantum %q", got)
+	default:
+	}
+}
+
+func TestSourceHashCoordinatorCleansUpActiveSourceHashWorkAtHashingQuantumBoundary(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.Configure(1, map[string]int{"victim": 0})
+	started := make(chan string, 2)
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+	closed := make(chan struct{})
+	work := &controlledCoordinatorWork{
+		started: started,
+		quanta: []controlledCoordinatorQuantum{
+			{label: "victim-1", release: firstRelease, bytes: 5},
+			{label: "victim-2", release: secondRelease, bytes: 3, done: true},
+		},
+		closed: closed,
+	}
+	submission := coordinator.Submit(t.Context(), coordinatorRequest("victim", 0, 0, work))
+	if got := awaitCoordinatorStart(t, started); got != "victim-1" {
+		t.Fatalf("active admission = %q, want victim-1", got)
+	}
+
+	coordinator.Configure(1, map[string]int{})
+	select {
+	case completed := <-submission.Completion:
+		t.Fatalf("active quantum was preempted by lifecycle change: %+v", completed)
+	default:
+	}
+	select {
+	case <-closed:
+		t.Fatal("active source owner closed before its quantum boundary")
+	default:
+	}
+
+	close(firstRelease)
+	select {
+	case completed := <-submission.Completion:
+		if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != 5 || completed.File.Name != "" {
+			t.Fatalf("active cancellation = %+v, want five charged bytes, no file, and context cancellation", completed)
+		}
+	case got := <-started:
+		t.Fatalf("canceled Source Hash Work continued with %q", got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for active cancellation cleanup")
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("active cancellation did not close its source owner")
+	}
+}
+
+func TestSourceHashCoordinatorCleansUpCanceledOwnerBeforeReplacementAdmission(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.Configure(1, map[string]int{"victim": 100, "replacement": 0})
+	started := make(chan string, 2)
+	victimRelease := make(chan struct{})
+	closeStarted := make(chan struct{})
+	closeRelease := make(chan struct{})
+	replacementRelease := make(chan struct{})
+	victimWork := &controlledCoordinatorWork{
+		started: started,
+		quanta: []controlledCoordinatorQuantum{
+			{label: "victim-1", release: victimRelease, bytes: 5},
+		},
+		closeStarted: closeStarted,
+		closeRelease: closeRelease,
+	}
+	victimSubmission := coordinator.Submit(t.Context(), coordinatorRequest("victim", 100, 0, victimWork))
+	if got := awaitCoordinatorStart(t, started); got != "victim-1" {
+		t.Fatalf("active admission = %q, want victim-1", got)
+	}
+	replacementSubmission := coordinator.Submit(t.Context(), coordinatorRequest("replacement", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "replacement-1", replacementRelease, 2),
+	))
+
+	coordinator.Configure(1, map[string]int{"replacement": 0})
+	close(victimRelease)
+	awaitCoordinatorSignal(t, closeStarted, "canceled source owner cleanup")
+	select {
+	case <-replacementSubmission.Admitted:
+		t.Fatal("replacement admitted before canceled source owner cleanup finished")
+	default:
+	}
+
+	close(closeRelease)
+	if completed := awaitCoordinatorResult(t, victimSubmission.Completion); !errors.Is(completed.Err, context.Canceled) || completed.Bytes != 5 {
+		t.Fatalf("canceled completion = %+v, want five bytes and context cancellation", completed)
+	}
+	awaitCoordinatorSignal(t, replacementSubmission.Admitted, "replacement after canceled owner cleanup")
+	if got := awaitCoordinatorStart(t, started); got != "replacement-1" {
+		t.Fatalf("replacement admission = %q, want replacement-1", got)
+	}
+	close(replacementRelease)
+	if completed := awaitCoordinatorResult(t, replacementSubmission.Completion); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+}
+
+func TestSourceHashCoordinatorDrainsLiveHashCapacityShrinkBeforeReplacement(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(2)
+	priorities := map[string]int{"a": 0, "b": 0, "c": 0}
+	coordinator.Configure(2, priorities)
+	started := make(chan string, 3)
+	releases := map[string]chan struct{}{
+		"a": make(chan struct{}),
+		"b": make(chan struct{}),
+		"c": make(chan struct{}),
+	}
+
+	aResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "a-1", releases["a"], 2),
+	)).Completion
+	bResult := coordinator.Submit(t.Context(), coordinatorRequest("b", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "b-1", releases["b"], 2),
+	)).Completion
+	initial := map[string]bool{"a-1": false, "b-1": false}
+	for range 2 {
+		got := awaitCoordinatorStart(t, started)
+		if _, ok := initial[got]; !ok || initial[got] {
+			t.Fatalf("unexpected initial admission %q", got)
+		}
+		initial[got] = true
+	}
+	cSubmission := coordinator.Submit(t.Context(), coordinatorRequest("c", 0, 0,
+		newSingleQuantumCoordinatorWork(started, "c-1", releases["c"], 2),
+	))
+
+	coordinator.Configure(1, priorities)
+	close(releases["a"])
+	if completed := awaitCoordinatorResult(t, aResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	select {
+	case <-cSubmission.Admitted:
+		t.Fatal("replacement admitted while active usage equaled shrunken Hash Capacity")
+	default:
+	}
+
+	close(releases["b"])
+	if completed := awaitCoordinatorResult(t, bResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	awaitCoordinatorSignal(t, cSubmission.Admitted, "replacement admission after shrink drain")
+	if got := awaitCoordinatorStart(t, started); got != "c-1" {
+		t.Fatalf("post-drain admission = %q, want c-1", got)
+	}
+	close(releases["c"])
+	if completed := awaitCoordinatorResult(t, cSubmission.Completion); completed.Err != nil {
+		t.Fatal(completed.Err)
 	}
 }
 
@@ -534,9 +943,13 @@ type controlledCoordinatorQuantum struct {
 }
 
 type controlledCoordinatorWork struct {
-	started chan<- string
-	quanta  []controlledCoordinatorQuantum
-	next    int
+	started      chan<- string
+	quanta       []controlledCoordinatorQuantum
+	next         int
+	closed       chan struct{}
+	closeStarted chan struct{}
+	closeRelease <-chan struct{}
+	close        sync.Once
 }
 
 func coordinatorRequest(folder string, priority, ceiling int, work HashingQuantumWork) SourceHashRequest {
@@ -600,7 +1013,19 @@ func (w *controlledCoordinatorWork) NextHashingQuantumBytes() int64 {
 	return w.quanta[w.next].bytes
 }
 
-func (*controlledCoordinatorWork) Close() {}
+func (w *controlledCoordinatorWork) Close() {
+	w.close.Do(func() {
+		if w.closed != nil {
+			close(w.closed)
+		}
+		if w.closeStarted != nil {
+			close(w.closeStarted)
+		}
+		if w.closeRelease != nil {
+			<-w.closeRelease
+		}
+	})
+}
 
 func awaitCoordinatorStart(t *testing.T, started <-chan string) string {
 	t.Helper()
@@ -621,5 +1046,14 @@ func awaitCoordinatorResult(t *testing.T, result <-chan SourceHashCompletion) So
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for Source Hash Work completion")
 		return SourceHashCompletion{}
+	}
+}
+
+func awaitCoordinatorSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
 	}
 }
