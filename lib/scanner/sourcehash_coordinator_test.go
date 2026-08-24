@@ -7,9 +7,11 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,19 +247,25 @@ func TestSourceHashCoordinatorUsesEveryCompatibleSlotByFolderPriority(t *testing
 	t.Run("saturated pool replaces Low with High at every boundary", func(t *testing.T) {
 		coordinator := NewSourceHashCoordinator(3)
 		started := make(chan string, 12)
-		lowFirst := []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
-		lowSecond := []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
-		highOnly := []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
-		lowResults := make([]<-chan SourceHashCompletion, 3)
-		highResults := make([]<-chan SourceHashCompletion, 3)
+		lowWork := make([]struct {
+			first  chan struct{}
+			second chan struct{}
+			result <-chan SourceHashCompletion
+		}, 3)
+		highWork := make([]struct {
+			release chan struct{}
+			result  <-chan SourceHashCompletion
+		}, 3)
 
-		for index := range lowResults {
-			lowResults[index] = coordinator.Submit(t.Context(), coordinatorRequest("low", 0, 0,
+		for index := range lowWork {
+			lowWork[index].first = make(chan struct{})
+			lowWork[index].second = make(chan struct{})
+			lowWork[index].result = coordinator.Submit(t.Context(), coordinatorRequest("low", 0, 0,
 				&controlledCoordinatorWork{
 					started: started,
 					quanta: []controlledCoordinatorQuantum{
-						{label: fmt.Sprintf("low-%d-first", index), release: lowFirst[index], bytes: 4},
-						{label: fmt.Sprintf("low-%d-second", index), release: lowSecond[index], bytes: 4, done: true},
+						{label: fmt.Sprintf("low-%d-first", index), release: lowWork[index].first, bytes: 4},
+						{label: fmt.Sprintf("low-%d-second", index), release: lowWork[index].second, bytes: 4, done: true},
 					},
 				},
 			)).Completion
@@ -265,30 +273,31 @@ func TestSourceHashCoordinatorUsesEveryCompatibleSlotByFolderPriority(t *testing
 				t.Fatalf("initial saturated admission %d = %q, want %q", index, got, want)
 			}
 		}
-		for index := range highResults {
-			highResults[index] = coordinator.Submit(t.Context(), coordinatorRequest("high", 100, 0,
-				newSingleQuantumCoordinatorWork(started, fmt.Sprintf("high-%d", index), highOnly[index], 2),
+		for index := range highWork {
+			highWork[index].release = make(chan struct{})
+			highWork[index].result = coordinator.Submit(t.Context(), coordinatorRequest("high", 100, 0,
+				newSingleQuantumCoordinatorWork(started, fmt.Sprintf("high-%d", index), highWork[index].release, 2),
 			)).Completion
 		}
 
-		for index := range lowFirst {
-			close(lowFirst[index])
+		for index := range lowWork {
+			close(lowWork[index].first)
 			if got, want := awaitCoordinatorStart(t, started), fmt.Sprintf("high-%d", index); got != want {
 				t.Fatalf("replacement admission %d = %q, want %q", index, got, want)
 			}
 		}
-		for index := range highOnly {
-			close(highOnly[index])
-			if completed := awaitCoordinatorResult(t, highResults[index]); completed.Err != nil {
+		for index := range highWork {
+			close(highWork[index].release)
+			if completed := awaitCoordinatorResult(t, highWork[index].result); completed.Err != nil {
 				t.Fatalf("High completion %d: %v", index, completed.Err)
 			}
 		}
 
-		remainingLow := make(map[string]chan struct{}, len(lowSecond))
-		for index, release := range lowSecond {
-			remainingLow[fmt.Sprintf("low-%d-second", index)] = release
+		remainingLow := make(map[string]chan struct{}, len(lowWork))
+		for index, work := range lowWork {
+			remainingLow[fmt.Sprintf("low-%d-second", index)] = work.second
 		}
-		for range lowSecond {
+		for range lowWork {
 			label := awaitCoordinatorStart(t, started)
 			release, ok := remainingLow[label]
 			if !ok {
@@ -297,8 +306,8 @@ func TestSourceHashCoordinatorUsesEveryCompatibleSlotByFolderPriority(t *testing
 			close(release)
 			delete(remainingLow, label)
 		}
-		for index, result := range lowResults {
-			if completed := awaitCoordinatorResult(t, result); completed.Err != nil || completed.Bytes != 8 {
+		for index, work := range lowWork {
+			if completed := awaitCoordinatorResult(t, work.result); completed.Err != nil || completed.Bytes != 8 {
 				t.Fatalf("Low completion %d = %+v, want eight consumed bytes and no error", index, completed)
 			}
 		}
@@ -714,6 +723,11 @@ func TestWalkRestartsDisplacedSourceHashWorkAfterFreshOpen(t *testing.T) {
 		if len(completed.Blocks) == 0 || len(completed.BlocksHash) == 0 {
 			t.Errorf("%s did not publish a complete file: %+v", folder, completed)
 		}
+		size := protocol.MinBlockSize
+		if folder == "low" {
+			size = 2 * protocol.MinBlockSize
+		}
+		assertCoordinatorFileMatchesWholeFileBaseline(t, folder, completed, make([]byte, size))
 	}
 	if got := lowFilesystem.opens.Load(); got != 2 {
 		t.Errorf("Low source opens = %d, want initial plus fresh reopen", got)
@@ -1719,6 +1733,22 @@ func newSingleQuantumCoordinatorWork(started chan<- string, label string, releas
 		quanta: []controlledCoordinatorQuantum{
 			{label: label, release: release, bytes: bytes, done: true},
 		},
+	}
+}
+
+func assertCoordinatorFileMatchesWholeFileBaseline(t *testing.T, folder string, got protocol.FileInfo, data []byte) {
+	t.Helper()
+	blockSize := protocol.FileInfo{Size: int64(len(data))}.BlockSize()
+	wantBlocks, err := Blocks(t.Context(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Blocks, wantBlocks) {
+		t.Errorf("%s scheduled blocks = %v, want whole-file baseline %v", folder, got.Blocks, wantBlocks)
+	}
+	wantBlocksHash := protocol.BlocksHash(wantBlocks)
+	if !bytes.Equal(got.BlocksHash, wantBlocksHash) {
+		t.Errorf("%s scheduled BlocksHash = %x, want whole-file baseline %x", folder, got.BlocksHash, wantBlocksHash)
 	}
 }
 

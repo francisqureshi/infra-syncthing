@@ -930,7 +930,7 @@ func TestBufferedWalkRemovesDiscoverySpoolAfterHashingFailure(t *testing.T) {
 	}
 }
 
-func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPriorityDiscovery(t *testing.T) {
+func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPrioritySourceHashWork(t *testing.T) {
 	const (
 		lowFiles         = 32 << 10
 		highFiles        = 320
@@ -938,46 +938,107 @@ func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPriorityDiscovery(t *test
 		maxRetainedBytes = 8 << 20
 		window           = 2
 	)
-	filesystems := map[string]*logicalInventoryFilesystem{
-		"low": {
-			Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
-			files:      lowFiles,
-			fileSize:   logicalFileSize,
+	workloads := []struct {
+		folder     string
+		priority   int
+		filesystem *logicalInventoryFilesystem
+		cancel     context.CancelFunc
+		walkResult WalkResult
+	}{
+		{
+			folder:   "low",
+			priority: -100,
+			filesystem: &logicalInventoryFilesystem{
+				Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
+				files:      lowFiles,
+				fileSize:   logicalFileSize,
+			},
 		},
-		"high": {
-			Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
-			files:      highFiles,
-			fileSize:   logicalFileSize,
+		{
+			folder:   "high",
+			priority: 100,
+			filesystem: &logicalInventoryFilesystem{
+				Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
+				files:      highFiles,
+				fileSize:   logicalFileSize,
+			},
 		},
 	}
+	started := make(chan string, 4*window)
+	releases := map[string]chan struct{}{
+		"low":  make(chan struct{}),
+		"high": make(chan struct{}),
+	}
 	coordinator := &inventorySourceHashCoordinator{
-		submitted: make(chan struct{}, 2*window),
+		SourceHashCoordinator: NewSourceHashCoordinator(window),
+		submitted:             make(chan string, 4*window),
+		started:               started,
+		releases: map[string]<-chan struct{}{
+			"low":  releases["low"],
+			"high": releases["high"],
+		},
 	}
 
 	runtime.GC()
 	var before runtime.MemStats
 	runtime.ReadMemStats(&before)
-	walkResults := make(map[string]WalkResult, len(filesystems))
-	cancels := make(map[string]context.CancelFunc, len(filesystems))
-	for _, folder := range []string{"low", "high"} {
+	for index := range workloads {
+		workload := &workloads[index]
 		cfg, cfgCancel := testConfig()
 		t.Cleanup(cfgCancel)
-		cfg.Folder = "buffered-spool-logical-inventory-" + folder
-		cfg.Filesystem = filesystems[folder]
+		cfg.Folder = "buffered-spool-logical-inventory-" + workload.folder
+		cfg.Filesystem = workload.filesystem
 		cfg.Hashers = window
 		cfg.SourceHashFolder = SourceHashFolder{
-			ID:       folder,
-			Priority: map[string]int{"low": -100, "high": 100}[folder],
+			ID:       workload.folder,
+			Priority: workload.priority,
 		}
 		cfg.SourceHashCoordinator = coordinator
 
 		ctx, cancel := context.WithCancel(t.Context())
-		cancels[folder] = cancel
-		walkResults[folder] = Walk(ctx, cfg)
-		awaitScannerSignal(t, walkResults[folder].TraversalDone, folder+" synthetic logical inventory traversal")
+		workload.cancel = cancel
+		workload.walkResult = Walk(ctx, cfg)
+		awaitScannerSignal(t, workload.walkResult.TraversalDone, workload.folder+" synthetic logical inventory traversal")
 		for range window {
-			awaitScannerSignal(t, coordinator.submitted, folder+" bounded Source Hash Work submission")
+			if got := awaitCoordinatorStart(t, coordinator.submitted); got != workload.folder {
+				t.Fatalf("bounded Source Hash Work submission = %q, want %s", got, workload.folder)
+			}
 		}
+		if workload.folder == "low" {
+			for range window {
+				if got := awaitCoordinatorStart(t, started); got != "low" {
+					t.Fatalf("initial synthetic Hashing Quantum = %q, want Low", got)
+				}
+			}
+		}
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("synthetic High workload preempted active Low Hashing Quantum with %q", got)
+	default:
+	}
+	provider := coordinator.SourceHashCoordinator.(SourceHashWorkStateProvider)
+	lowState := provider.SourceHashWorkState("low")
+	highState := provider.SourceHashWorkState("high")
+	if lowState.Active != window || lowState.Queued != lowFiles-window {
+		t.Fatalf("Low synthetic coordinator state = %#v, want %d active and %d queued", lowState, window, lowFiles-window)
+	}
+	if highState.Active != 0 || highState.Queued != highFiles {
+		t.Fatalf("High synthetic coordinator state = %#v, want zero active and %d queued", highState, highFiles)
+	}
+	if lowState.RetainedHandles != window || lowState.RetainedHandleBudget != window+sourceHashLookahead {
+		t.Fatalf("synthetic retained-handle state = %#v, want %d retained within budget %d", lowState, window, window+sourceHashLookahead)
+	}
+	if got := coordinator.enrolled.Load(); got != 2*window {
+		t.Fatalf("real coordinator owns %d synthetic files, want fixed multi-Folder window %d", got, 2*window)
+	}
+	if got := coordinator.peak.Load(); got > 2*window {
+		t.Fatalf("real coordinator peak enrollment = %d, want at most fixed window %d", got, 2*window)
+	}
+
+	releases["low"] <- struct{}{}
+	if got := awaitCoordinatorStart(t, started); got != "high" {
+		t.Fatalf("synthetic admission after Low quantum = %q, want High", got)
 	}
 
 	runtime.GC()
@@ -990,12 +1051,9 @@ func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPriorityDiscovery(t *test
 	if retained > maxRetainedBytes {
 		t.Fatalf("buffered discovery retained %d bytes for %d files, want at most %d", retained, lowFiles+highFiles, maxRetainedBytes)
 	}
-	if got := coordinator.enrolled.Load(); got != 2*window {
-		t.Fatalf("Source Hash Work materialized %d files, want fixed multi-Folder window %d", got, 2*window)
-	}
-	for folder, filesystem := range filesystems {
-		if got := filesystem.opens.Load(); got != 0 {
-			t.Fatalf("%s buffered discovery opened %d source handles before admission, want zero", folder, got)
+	for _, workload := range workloads {
+		if got := workload.filesystem.opens.Load(); got != 0 {
+			t.Fatalf("%s buffered discovery opened %d real source handles, want zero", workload.folder, got)
 		}
 	}
 	if logicalBytes := int64(lowFiles) * logicalFileSize; logicalBytes != 5<<40 {
@@ -1005,11 +1063,19 @@ func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPriorityDiscovery(t *test
 		t.Fatalf("High synthetic workload = %d bytes, want 50 GiB", logicalBytes)
 	}
 
-	for _, cancel := range cancels {
-		cancel()
+	for _, workload := range workloads {
+		workload.cancel()
 	}
-	for _, walkResult := range walkResults {
-		for range walkResult.Results {
+	for _, workload := range workloads {
+		for range workload.walkResult.Results {
+		}
+	}
+	if got := coordinator.enrolled.Load(); got != 0 {
+		t.Fatalf("real coordinator retained %d synthetic files after cancellation", got)
+	}
+	for _, folder := range []string{"low", "high"} {
+		if got := provider.SourceHashWorkState(folder); got.Active != 0 || got.Queued != 0 || got.RetainedHandles != 0 {
+			t.Fatalf("%s synthetic state after cancellation = %#v, want drained state", folder, got)
 		}
 	}
 }
@@ -1389,34 +1455,83 @@ func (*logicalInventoryFilesystem) PlatformData(string, bool, bool, fs.XattrFilt
 }
 
 type inventorySourceHashCoordinator struct {
+	SourceHashCoordinator
+	submitted chan string
+	started   chan string
+	releases  map[string]<-chan struct{}
 	enrolled  atomic.Int64
-	submitted chan struct{}
-}
-
-func (*inventorySourceHashCoordinator) Configure(int, map[string]int) {}
-
-func (*inventorySourceHashCoordinator) BeginSourceHashEpoch(SourceHashFolder) SourceHashEpoch {
-	return noopSourceHashEpoch{}
+	peak      atomic.Int64
 }
 
 func (c *inventorySourceHashCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
-	c.enrolled.Add(1)
-	c.submitted <- struct{}{}
-	admitted := make(chan struct{})
-	close(admitted)
+	request.Work.Close()
+	request.Work = &inventorySourceHashWork{
+		folder:  request.Folder.ID,
+		started: c.started,
+		release: c.releases[request.Folder.ID],
+	}
+	submission := c.SourceHashCoordinator.Submit(ctx, request)
+	current := c.enrolled.Add(1)
+	for peak := c.peak.Load(); current > peak && !c.peak.CompareAndSwap(peak, current); peak = c.peak.Load() {
+	}
+	select {
+	case c.submitted <- request.Folder.ID:
+	default:
+	}
+
 	completion := make(chan SourceHashCompletion, 1)
 	go func() {
-		<-ctx.Done()
-		request.Work.Close()
-		completion <- SourceHashCompletion{Err: ctx.Err()}
+		result, ok := <-submission.Completion
+		if ok {
+			completion <- result
+		}
 		close(completion)
+		c.enrolled.Add(-1)
 	}()
-	return SourceHashSubmission{Admitted: admitted, Completion: completion}
+	return SourceHashSubmission{Admitted: submission.Admitted, Completion: completion}
 }
 
-type noopSourceHashEpoch struct{}
+type inventorySourceHashWork struct {
+	folder   string
+	started  chan<- string
+	release  <-chan struct{}
+	retained atomic.Bool
+}
 
-func (noopSourceHashEpoch) Close() {}
+func (w *inventorySourceHashWork) HashNext(ctx context.Context) (HashingQuantumResult, error) {
+	w.retained.Store(true)
+	select {
+	case w.started <- w.folder:
+	case <-ctx.Done():
+		return HashingQuantumResult{}, ctx.Err()
+	}
+	select {
+	case <-w.release:
+		return HashingQuantumResult{
+			Bytes: 1,
+			Done:  true,
+			File:  protocol.FileInfo{Name: "synthetic-" + w.folder},
+		}, nil
+	case <-ctx.Done():
+		return HashingQuantumResult{}, ctx.Err()
+	}
+}
+
+func (*inventorySourceHashWork) NextHashingQuantumBytes() int64 {
+	return 1
+}
+
+func (w *inventorySourceHashWork) RetainedHandle() bool {
+	return w.retained.Load()
+}
+
+func (w *inventorySourceHashWork) ReleaseRetainedHandle() {
+	w.retained.Store(false)
+}
+
+func (w *inventorySourceHashWork) Close() {
+	w.retained.Store(false)
+}
 
 func (f *openErrorFilesystem) Open(name string) (fs.File, error) {
 	if name == f.path {
