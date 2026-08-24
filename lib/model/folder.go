@@ -574,7 +574,14 @@ func (f *folder) scanSubdirsWithClass(ctx context.Context, subDirs []string, cla
 	if err := f.ioLimiter.takeWithContext(ctx, f.ID, class); err != nil {
 		return err
 	}
-	defer f.ioLimiter.give()
+	traversalLeaseHeld := true
+	releaseTraversalLease := func() {
+		if traversalLeaseHeld {
+			f.ioLimiter.give()
+			traversalLeaseHeld = false
+		}
+	}
+	defer releaseTraversalLease()
 
 	metricFolderScans.WithLabelValues(f.ID).Inc()
 	scanCtx, cancel := context.WithCancel(ctx)
@@ -617,7 +624,7 @@ func (f *folder) scanSubdirsWithClass(ctx context.Context, subDirs []string, cla
 		}
 	}()
 
-	changesHere, err := f.scanSubdirsChangedAndNew(ctx, subDirs, batch)
+	changesHere, err := f.scanSubdirsChangedAndNew(ctx, subDirs, batch, releaseTraversalLease)
 	changes += changesHere
 	if err != nil {
 		return err
@@ -636,13 +643,19 @@ func (f *folder) scanSubdirsWithClass(ctx context.Context, subDirs []string, cla
 	// Do a scan of the database for each prefix, to check for deleted and
 	// ignored files.
 
-	changesHere, err = f.scanSubdirsDeletedAndIgnored(ctx, subDirs, batch)
-	changes += changesHere
-	if err != nil {
+	if err := f.ioLimiter.takeWithContext(ctx, f.ID, folderWorkMaintenance); err != nil {
 		return err
 	}
-
-	if err := batch.Flush(); err != nil {
+	err = func() error {
+		defer f.ioLimiter.give()
+		changesHere, err = f.scanSubdirsDeletedAndIgnored(ctx, subDirs, batch)
+		changes += changesHere
+		if err != nil {
+			return err
+		}
+		return batch.Flush()
+	}()
+	if err != nil {
 		return err
 	}
 
@@ -743,13 +756,12 @@ func (b *scanBatch) Update(fi protocol.FileInfo) (bool, error) {
 	return true, nil
 }
 
-func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string, batch *scanBatch) (int, error) {
+func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string, batch *scanBatch, traversalComplete func()) (int, error) {
 	changes := 0
 
 	// If we return early e.g. due to a folder health error, the scan needs
 	// to be cancelled.
 	scanCtx, scanCancel := context.WithCancel(ctx)
-	defer scanCancel()
 
 	scanConfig := scanner.Config{
 		Folder:                f.ID,
@@ -770,48 +782,68 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 		ScanXattrs:            f.SendXattrs || f.SyncXattrs,
 		XattrFilter:           f.XattrFilter,
 	}
-	var fchan chan scanner.ScanResult
+	var walkResult scanner.WalkResult
 	if f.Type == config.FolderTypeReceiveEncrypted {
-		fchan = scanner.WalkWithoutHashing(scanCtx, scanConfig)
+		walkResult = scanner.WalkWithoutHashing(scanCtx, scanConfig)
 	} else {
-		fchan = scanner.Walk(scanCtx, scanConfig)
+		walkResult = scanner.Walk(scanCtx, scanConfig)
 	}
+	fchan := walkResult.Results
+	traversalDone := walkResult.TraversalDone
+	defer func() {
+		scanCancel()
+		if traversalDone != nil {
+			<-traversalDone
+			traversalComplete()
+		}
+	}()
 
-	for res := range fchan {
-		if res.Err != nil {
-			f.newScanError(res.Path, res.Err)
+	for fchan != nil {
+		select {
+		case <-traversalDone:
+			traversalComplete()
+			traversalDone = nil
 			continue
-		}
-
-		if err := batch.FlushIfFull(); err != nil {
-			// Prevent a race between the scan aborting due to context
-			// cancellation and releasing the snapshot in defer here.
-			scanCancel()
-			for range fchan {
+		case res, ok := <-fchan:
+			if !ok {
+				fchan = nil
+				continue
 			}
-			return changes, err
-		}
+			if res.Err != nil {
+				f.newScanError(res.Path, res.Err)
+				continue
+			}
 
-		if ok, err := batch.Update(res.File); err != nil {
-			return 0, err
-		} else if ok {
-			changes++
-		}
+			if err := batch.FlushIfFull(); err != nil {
+				// Prevent a race between the scan aborting due to context
+				// cancellation and releasing the snapshot in defer here.
+				scanCancel()
+				for range walkResult.Results {
+				}
+				return changes, err
+			}
 
-		switch f.Type {
-		case config.FolderTypeReceiveOnly, config.FolderTypeReceiveEncrypted:
-		default:
-			// Rename detection is comparatively expensive, so only attempt
-			// it for files that appeared as new on disk during this scan. A
-			// rename that overwrites an existing file (the destination path
-			// already had an entry, so it scans as an update rather than a
-			// new file) is not optimised as a rename.
-			if res.File.New && res.File.Size > 0 {
-				if nf, ok := f.findRename(ctx, res.File, batch); ok {
-					if ok, err := batch.Update(nf); err != nil {
-						return 0, err
-					} else if ok {
-						changes++
+			if ok, err := batch.Update(res.File); err != nil {
+				return 0, err
+			} else if ok {
+				changes++
+			}
+
+			switch f.Type {
+			case config.FolderTypeReceiveOnly, config.FolderTypeReceiveEncrypted:
+			default:
+				// Rename detection is comparatively expensive, so only attempt
+				// it for files that appeared as new on disk during this scan. A
+				// rename that overwrites an existing file (the destination path
+				// already had an entry, so it scans as an update rather than a
+				// new file) is not optimised as a rename.
+				if res.File.New && res.File.Size > 0 {
+					if nf, ok := f.findRename(ctx, res.File, batch); ok {
+						if ok, err := batch.Update(nf); err != nil {
+							return 0, err
+						} else if ok {
+							changes++
+						}
 					}
 				}
 			}

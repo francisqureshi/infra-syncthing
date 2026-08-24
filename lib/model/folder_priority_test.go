@@ -121,8 +121,8 @@ func TestPrerequisiteScansUseFolderPriorityWithinFolderConcurrency(t *testing.T)
 	if folder := awaitFirstScanningFolder(t, sub, "low", "high"); folder != "high" {
 		t.Fatalf("first queued prerequisite scan is for folder %q, want high", folder)
 	}
-	awaitFolderStateEvent(t, sub, "high", FolderIdle)
 	awaitFolderStateEvent(t, sub, "low", FolderScanning)
+	awaitFolderStateEvent(t, sub, "high", FolderIdle)
 	awaitFolderStateEvent(t, sub, "low", FolderIdle)
 }
 
