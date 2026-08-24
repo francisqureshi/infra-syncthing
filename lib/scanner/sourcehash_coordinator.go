@@ -87,7 +87,7 @@ type equalPriorityShareKey struct {
 
 type sourceHashEpoch struct {
 	coordinator *sourceHashCoordinator
-	account     equalPriorityShareKey
+	shareKey    equalPriorityShareKey
 	once        sync.Once
 }
 
@@ -118,23 +118,23 @@ func NewSourceHashCoordinator(capacity int) SourceHashCoordinator {
 }
 
 func (c *sourceHashCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) SourceHashEpoch {
-	account := equalPriorityShareKey{priority: folder.Priority, folder: folder.ID}
+	shareKey := equalPriorityShareKey{priority: folder.Priority, folder: folder.ID}
 	c.mut.Lock()
-	c.initializeFairnessLocked(account)
-	c.epochs[account]++
+	c.initializeFairnessLocked(shareKey)
+	c.epochs[shareKey]++
 	c.mut.Unlock()
 	return &sourceHashEpoch{
 		coordinator: c,
-		account:     account,
+		shareKey:    shareKey,
 	}
 }
 
 func (e *sourceHashEpoch) Close() {
 	e.once.Do(func() {
 		e.coordinator.mut.Lock()
-		e.coordinator.epochs[e.account]--
-		if e.coordinator.epochs[e.account] == 0 {
-			delete(e.coordinator.epochs, e.account)
+		e.coordinator.epochs[e.shareKey]--
+		if e.coordinator.epochs[e.shareKey] == 0 {
+			delete(e.coordinator.epochs, e.shareKey)
 		}
 		e.coordinator.mut.Unlock()
 	})
@@ -148,7 +148,7 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 		admitted:   make(chan struct{}),
 	}
 	c.mut.Lock()
-	c.initializeFairnessLocked(work.account())
+	c.initializeFairnessLocked(work.shareKey())
 	c.queued = append(c.queued, work)
 	c.scheduleLocked()
 	c.mut.Unlock()
@@ -168,9 +168,9 @@ func (c *sourceHashCoordinator) scheduleLocked() {
 		c.queued = append(c.queued[:next], c.queued[next+1:]...)
 		c.active++
 		c.byFolder[work.request.Folder.ID]++
-		c.activeByShare[work.account()]++
+		c.activeByShare[work.shareKey()]++
 		work.activeBytes = max(work.request.Work.NextHashingQuantumBytes(), 0)
-		c.activeBytes[work.account()] += work.activeBytes
+		c.activeBytes[work.shareKey()] += work.activeBytes
 		if !work.wasAdmitted {
 			work.wasAdmitted = true
 			close(work.admitted)
@@ -188,21 +188,21 @@ func (c *sourceHashCoordinator) nextLocked() int {
 		}
 		if next < 0 || request.Folder.Priority > c.queued[next].request.Folder.Priority ||
 			(request.Folder.Priority == c.queued[next].request.Folder.Priority &&
-				c.fairnessScoreLocked(c.queued[i].account()) < c.fairnessScoreLocked(c.queued[next].account())) {
+				c.fairnessScoreLocked(c.queued[i].shareKey()) < c.fairnessScoreLocked(c.queued[next].shareKey())) {
 			next = i
 		}
 	}
 	return next
 }
 
-func (c *sourceHashCoordinator) initializeFairnessLocked(account equalPriorityShareKey) {
-	if c.participatingLocked(account) {
+func (c *sourceHashCoordinator) initializeFairnessLocked(shareKey equalPriorityShareKey) {
+	if c.participatingLocked(shareKey) {
 		return
 	}
 	var minimum int64
 	found := false
 	for candidate := range c.charged {
-		if candidate.priority != account.priority || !c.participatingLocked(candidate) {
+		if candidate.priority != shareKey.priority || !c.participatingLocked(candidate) {
 			continue
 		}
 		bytes := c.fairnessScoreLocked(candidate)
@@ -211,19 +211,19 @@ func (c *sourceHashCoordinator) initializeFairnessLocked(account equalPrioritySh
 			found = true
 		}
 	}
-	c.charged[account] = minimum
+	c.charged[shareKey] = minimum
 }
 
-func (c *sourceHashCoordinator) fairnessScoreLocked(account equalPriorityShareKey) int64 {
-	return c.charged[account] + c.activeBytes[account]
+func (c *sourceHashCoordinator) fairnessScoreLocked(shareKey equalPriorityShareKey) int64 {
+	return c.charged[shareKey] + c.activeBytes[shareKey]
 }
 
-func (c *sourceHashCoordinator) participatingLocked(account equalPriorityShareKey) bool {
-	if c.epochs[account] > 0 || c.activeByShare[account] > 0 {
+func (c *sourceHashCoordinator) participatingLocked(shareKey equalPriorityShareKey) bool {
+	if c.epochs[shareKey] > 0 || c.activeByShare[shareKey] > 0 {
 		return true
 	}
 	for _, work := range c.queued {
-		if work.account() == account {
+		if work.shareKey() == shareKey {
 			return true
 		}
 	}
@@ -235,12 +235,12 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 
 	c.mut.Lock()
 	work.bytes += result.Bytes
-	c.charged[work.account()] += result.Bytes
-	c.activeBytes[work.account()] -= work.activeBytes
+	c.charged[work.shareKey()] += result.Bytes
+	c.activeBytes[work.shareKey()] -= work.activeBytes
 	work.activeBytes = 0
 	c.active--
 	c.byFolder[work.request.Folder.ID]--
-	c.activeByShare[work.account()]--
+	c.activeByShare[work.shareKey()]--
 	if err == nil && !result.Done {
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
@@ -259,7 +259,7 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 	close(work.completion)
 }
 
-func (w *coordinatedSourceHashWork) account() equalPriorityShareKey {
+func (w *coordinatedSourceHashWork) shareKey() equalPriorityShareKey {
 	return equalPriorityShareKey{
 		priority: w.request.Folder.Priority,
 		folder:   w.request.Folder.ID,

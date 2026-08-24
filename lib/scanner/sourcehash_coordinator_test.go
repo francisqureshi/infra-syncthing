@@ -464,7 +464,7 @@ func TestSourceHashCoordinatorChargesDiscardedWork(t *testing.T) {
 func TestSourceHashCoordinatorNewParticipantJoinsItsPriorityShare(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
 	started := make(chan string, 10)
-	highEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "high-account", Priority: 50})
+	highEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "high-share", Priority: 50})
 	incumbentEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "incumbent", Priority: 0})
 	t.Cleanup(highEpoch.Close)
 	t.Cleanup(incumbentEpoch.Close)
@@ -474,16 +474,16 @@ func TestSourceHashCoordinatorNewParticipantJoinsItsPriorityShare(t *testing.T) 
 	newcomerRelease := make(chan struct{})
 
 	releaseGate := occupyCoordinatorSlot(t, coordinator, started, "gate-1")
-	highResult := coordinator.Submit(t.Context(), coordinatorRequest("high-account", 50, 0,
-		newSingleQuantumCoordinatorWork(started, "high-account-1", highRelease, 1),
+	highResult := coordinator.Submit(t.Context(), coordinatorRequest("high-share", 50, 0,
+		newSingleQuantumCoordinatorWork(started, "high-share-1", highRelease, 1),
 	)).Completion
 	incumbentFirstResult := coordinator.Submit(t.Context(), coordinatorRequest("incumbent", 0, 0,
 		newSingleQuantumCoordinatorWork(started, "incumbent-1", incumbentFirst, 8),
 	)).Completion
 
 	releaseGate()
-	if got := awaitCoordinatorStart(t, started); got != "high-account-1" {
-		t.Fatalf("higher-priority account admission = %q, want high-account-1", got)
+	if got := awaitCoordinatorStart(t, started); got != "high-share-1" {
+		t.Fatalf("higher-priority share admission = %q, want high-share-1", got)
 	}
 	close(highRelease)
 	if completed := awaitCoordinatorResult(t, highResult); completed.Err != nil {
