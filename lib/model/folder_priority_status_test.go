@@ -13,7 +13,7 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-func TestNetworkPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
+func TestFolderPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	upload := newBlockTransferScheduler()
 	upload.now = func() time.Time { return now }
@@ -54,17 +54,17 @@ func TestNetworkPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 
 	now = now.Add(9 * time.Second)
 	m := &model{uploadScheduler: upload, downloadScheduler: download}
-	got := m.NetworkPrioritySchedulerState("alpha")
-	want := NetworkPrioritySchedulerState{
+	got := m.FolderPrioritySchedulerState("alpha")
+	want := FolderPrioritySchedulerState{
 		Active: true,
-		Upload: NetworkPrioritySchedulerDirectionState{
+		Upload: FolderPrioritySchedulerDirectionState{
 			QueuedBytes:                 7,
 			ActiveBytes:                 10,
 			OldestSchedulingWaitSeconds: 9,
 		},
 	}
 	if got != want {
-		t.Fatalf("Network Priority scheduler state = %#v, want %#v", got, want)
+		t.Fatalf("Folder Priority scheduler state = %#v, want %#v", got, want)
 	}
 
 	active.close()
@@ -73,8 +73,8 @@ func TestNetworkPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(next.close)
-	got = m.NetworkPrioritySchedulerState("alpha")
+	got = m.FolderPrioritySchedulerState("alpha")
 	if got.Upload.QueuedBytes != 0 || got.Upload.OldestSchedulingWaitSeconds != 0 || got.Upload.ActiveBytes != 7 {
-		t.Fatalf("Network Priority scheduler retained historical queue state after admission: %#v", got.Upload)
+		t.Fatalf("Folder Priority scheduler retained historical queue state after admission: %#v", got.Upload)
 	}
 }

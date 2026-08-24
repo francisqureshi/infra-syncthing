@@ -803,7 +803,7 @@ func TestRequestResponseFrameIsNonPreemptiveOnWire(t *testing.T) {
 
 func TestConnectionCriticalTrafficLeadsQueuedFolderWork(t *testing.T) {
 	t.Run("configured priority", func(t *testing.T) {
-		testConnectionCriticalTrafficLeadsQueuedFolderWork(t, &networkPriorityTestModel{
+		testConnectionCriticalTrafficLeadsQueuedFolderWork(t, &folderPriorityTestModel{
 			TestModel:  newTestModel(),
 			priorities: map[string]int{"folder": 100},
 		})
@@ -856,8 +856,8 @@ func testConnectionCriticalTrafficLeadsQueuedFolderWork(t *testing.T, model Mode
 	}
 }
 
-func TestFolderScopedMetadataInheritsCurrentNetworkPriority(t *testing.T) {
-	model := &networkPriorityTestModel{
+func TestFolderScopedMetadataInheritsCurrentFolderPriority(t *testing.T) {
+	model := &folderPriorityTestModel{
 		TestModel: newTestModel(),
 		priorities: map[string]int{
 			"low":  -100,
@@ -875,12 +875,12 @@ func TestFolderScopedMetadataInheritsCurrentNetworkPriority(t *testing.T) {
 	close(initialWrite.complete)
 	lowWrite := awaitControlledWireWrite(t, writer)
 	if got := indexFolderFromWire(t, lowWrite.data); got != "low" {
-		t.Fatalf("first metadata folder is %q, expected reprioritized current Network Priority", got)
+		t.Fatalf("first metadata folder is %q, expected reprioritized current Folder Priority", got)
 	}
 	close(lowWrite.complete)
 	highWrite := awaitControlledWireWrite(t, writer)
 	if got := indexFolderFromWire(t, highWrite.data); got != "high" {
-		t.Fatalf("second metadata folder is %q, expected the remaining Network Priority", got)
+		t.Fatalf("second metadata folder is %q, expected the remaining Folder Priority", got)
 	}
 	close(highWrite.complete)
 	for range 2 {
@@ -891,7 +891,7 @@ func TestFolderScopedMetadataInheritsCurrentNetworkPriority(t *testing.T) {
 }
 
 func TestFolderScopedMetadataYieldsToSamePriorityBlock(t *testing.T) {
-	model := &networkPriorityTestModel{
+	model := &folderPriorityTestModel{
 		TestModel:  newTestModel(),
 		priorities: map[string]int{"folder": 10},
 	}
@@ -940,7 +940,7 @@ func TestFolderScopedMetadataYieldsToSamePriorityBlock(t *testing.T) {
 }
 
 func TestConnectionCriticalTrafficDoesNotResetMetadataBatch(t *testing.T) {
-	model := &networkPriorityTestModel{
+	model := &folderPriorityTestModel{
 		TestModel:  newTestModel(),
 		priorities: map[string]int{"folder": 10},
 	}
@@ -990,7 +990,7 @@ func TestConnectionCriticalTrafficDoesNotResetMetadataBatch(t *testing.T) {
 }
 
 func TestMetadataBatchStateResetsWhenPriorityBucketEmpties(t *testing.T) {
-	model := &networkPriorityTestModel{
+	model := &folderPriorityTestModel{
 		TestModel:  newTestModel(),
 		priorities: map[string]int{"folder": 10},
 	}
@@ -1040,7 +1040,7 @@ func TestMetadataBatchStateResetsWhenPriorityBucketEmpties(t *testing.T) {
 }
 
 func TestMetadataBatchStateIsScopedByConnection(t *testing.T) {
-	model := &networkPriorityTestModel{
+	model := &folderPriorityTestModel{
 		TestModel:  newTestModel(),
 		priorities: map[string]int{"folder": 10},
 	}
@@ -1099,8 +1099,8 @@ func TestMetadataBatchStateIsScopedByConnection(t *testing.T) {
 	}
 }
 
-func TestMetadataBatchStateIsScopedByNetworkPriority(t *testing.T) {
-	model := &networkPriorityTestModel{
+func TestMetadataBatchStateIsScopedByFolderPriority(t *testing.T) {
+	model := &folderPriorityTestModel{
 		TestModel: newTestModel(),
 		priorities: map[string]int{
 			"low":  10,
@@ -1281,13 +1281,13 @@ type orderedFakeRequestResponse struct {
 	closeOnce             sync.Once
 }
 
-type networkPriorityTestModel struct {
+type folderPriorityTestModel struct {
 	*TestModel
 	priorities map[string]int
 }
 
-func (m *networkPriorityTestModel) NetworkPriority(folder string) NetworkPriorityPolicy {
-	return NetworkPriorityPolicy{Priority: m.priorities[folder]}
+func (m *folderPriorityTestModel) FolderPriority(folder string) FolderPriorityPolicy {
+	return FolderPriorityPolicy{Priority: m.priorities[folder]}
 }
 
 func newOrderedFakeRequestResponse(previous <-chan struct{}) *orderedFakeRequestResponse {

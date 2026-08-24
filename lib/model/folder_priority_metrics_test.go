@@ -17,33 +17,33 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-type staticNetworkPrioritySchedulerStateProvider struct {
-	state NetworkPrioritySchedulerState
+type staticFolderPrioritySchedulerStateProvider struct {
+	state FolderPrioritySchedulerState
 }
 
-func (p staticNetworkPrioritySchedulerStateProvider) NetworkPrioritySchedulerState(string) NetworkPrioritySchedulerState {
+func (p staticFolderPrioritySchedulerStateProvider) FolderPrioritySchedulerState(string) FolderPrioritySchedulerState {
 	return p.state
 }
 
-func TestNetworkPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
+func TestFolderPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 	wrapper := config.Wrap(filepath.Join(t.TempDir(), "config.xml"), config.Configuration{
 		Folders: []config.FolderConfiguration{{ID: "alpha"}},
 	}, protocol.LocalDeviceID, events.NoopLogger)
-	provider := staticNetworkPrioritySchedulerStateProvider{state: NetworkPrioritySchedulerState{
+	provider := staticFolderPrioritySchedulerStateProvider{state: FolderPrioritySchedulerState{
 		Active: true,
-		Upload: NetworkPrioritySchedulerDirectionState{
+		Upload: FolderPrioritySchedulerDirectionState{
 			QueuedBytes:                 11,
 			ActiveBytes:                 12,
 			OldestSchedulingWaitSeconds: 13,
 		},
-		Download: NetworkPrioritySchedulerDirectionState{
+		Download: FolderPrioritySchedulerDirectionState{
 			QueuedBytes:                 21,
 			ActiveBytes:                 22,
 			OldestSchedulingWaitSeconds: 23,
 		},
 	}}
 	registry := prometheus.NewPedanticRegistry()
-	registry.MustRegister(newNetworkPriorityMetricsCollector(wrapper, &provider))
+	registry.MustRegister(newFolderPriorityMetricsCollector(wrapper, &provider))
 
 	families, err := registry.Gather()
 	if err != nil {
@@ -65,19 +65,19 @@ func TestNetworkPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 		got[family.GetName()] = values
 	}
 	want := map[string]map[string]float64{
-		"syncthing_model_network_priority_active_bytes": {
+		"syncthing_model_folder_priority_active_bytes": {
 			"download/alpha": 22,
 			"upload/alpha":   12,
 		},
-		"syncthing_model_network_priority_oldest_scheduling_wait_seconds": {
+		"syncthing_model_folder_priority_oldest_scheduling_wait_seconds": {
 			"download/alpha": 23,
 			"upload/alpha":   13,
 		},
-		"syncthing_model_network_priority_queued_bytes": {
+		"syncthing_model_folder_priority_queued_bytes": {
 			"download/alpha": 21,
 			"upload/alpha":   11,
 		},
-		"syncthing_model_network_priority_scheduler_active": {
+		"syncthing_model_folder_priority_scheduler_active": {
 			"download/alpha": 1,
 			"upload/alpha":   1,
 		},
@@ -103,7 +103,7 @@ func TestNetworkPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, family := range families {
-		if family.GetName() != "syncthing_model_network_priority_oldest_scheduling_wait_seconds" {
+		if family.GetName() != "syncthing_model_folder_priority_oldest_scheduling_wait_seconds" {
 			continue
 		}
 		for _, metric := range family.Metric {

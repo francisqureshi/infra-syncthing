@@ -66,7 +66,7 @@ const (
 	studioClassDynamic studioProjectClass = "dynamic"
 )
 
-type networkPriorityStudioProfile struct {
+type folderPriorityStudioProfile struct {
 	Name                string
 	Seed                int64
 	ProjectSizes        []int64
@@ -81,16 +81,16 @@ type networkPriorityStudioProfile struct {
 }
 
 type studioProject struct {
-	ID                     string             `json:"id"`
-	Class                  studioProjectClass `json:"class"`
-	Source                 int                `json:"sourcePeer"`
-	InitialNetworkPriority int                `json:"initialNetworkPriority"`
-	FinalNetworkPriority   int                `json:"finalNetworkPriority"`
-	Size                   int64              `json:"size"`
-	ReentryBytes           int64              `json:"reentryBytes,omitempty"`
-	ControlBytes           int64              `json:"controlBytes,omitempty"`
-	DemotionBytes          int64              `json:"demotionBytes,omitempty"`
-	DirectionBytes         int64              `json:"directionBytes,omitempty"`
+	ID                    string             `json:"id"`
+	Class                 studioProjectClass `json:"class"`
+	Source                int                `json:"sourcePeer"`
+	InitialFolderPriority int                `json:"initialFolderPriority"`
+	FinalFolderPriority   int                `json:"finalFolderPriority"`
+	Size                  int64              `json:"size"`
+	ReentryBytes          int64              `json:"reentryBytes,omitempty"`
+	ControlBytes          int64              `json:"controlBytes,omitempty"`
+	DemotionBytes         int64              `json:"demotionBytes,omitempty"`
+	DirectionBytes        int64              `json:"directionBytes,omitempty"`
 }
 
 type studioActiveTransfer struct {
@@ -125,16 +125,16 @@ type studioDirectionStatus struct {
 }
 
 type studioFolderStatus struct {
-	GlobalBytes                     int64  `json:"globalBytes"`
-	InSyncBytes                     int64  `json:"inSyncBytes"`
-	NeedBytes                       int64  `json:"needBytes"`
-	NeedTotalItems                  int    `json:"needTotalItems"`
-	State                           string `json:"state"`
-	NetworkPrioritySchedulingActive bool   `json:"networkPrioritySchedulingActive"`
-	NetworkPriorityScheduling       struct {
+	GlobalBytes                    int64  `json:"globalBytes"`
+	InSyncBytes                    int64  `json:"inSyncBytes"`
+	NeedBytes                      int64  `json:"needBytes"`
+	NeedTotalItems                 int    `json:"needTotalItems"`
+	State                          string `json:"state"`
+	FolderPrioritySchedulingActive bool   `json:"folderPrioritySchedulingActive"`
+	FolderPriorityScheduling       struct {
 		Upload   studioDirectionStatus `json:"upload"`
 		Download studioDirectionStatus `json:"download"`
-	} `json:"networkPriorityScheduling"`
+	} `json:"folderPriorityScheduling"`
 }
 
 type studioTimelineEntry struct {
@@ -146,7 +146,7 @@ type studioTimelineEntry struct {
 	Peer                        string    `json:"peer,omitempty"`
 	Folder                      string    `json:"folder,omitempty"`
 	Direction                   string    `json:"direction,omitempty"`
-	NetworkPriority             int       `json:"networkPriority,omitempty"`
+	FolderPriority              int       `json:"folderPriority,omitempty"`
 	GlobalBytes                 int64     `json:"globalBytes,omitempty"`
 	InSyncBytes                 int64     `json:"inSyncBytes,omitempty"`
 	NeedBytes                   int64     `json:"needBytes,omitempty"`
@@ -184,17 +184,17 @@ type studioReport struct {
 	Limitations               []string                        `json:"limitations,omitempty"`
 }
 
-type networkPriorityStudio struct {
+type folderPriorityStudio struct {
 	t                              *testing.T
-	profile                        networkPriorityStudioProfile
+	profile                        folderPriorityStudioProfile
 	projects                       []studioProject
 	peers                          [studioPeerCount]*studioPeer
 	runDir                         string
 	started                        time.Time
 	phaseMu                        sync.RWMutex
 	phase                          string
-	networkPriorityMu              sync.RWMutex
-	networkPriorities              map[int]map[string]int
+	folderPriorityMu               sync.RWMutex
+	folderPriorities               map[int]map[string]int
 	timelineMu                     sync.Mutex
 	timeline                       *os.File
 	reportMu                       sync.Mutex
@@ -208,11 +208,11 @@ type networkPriorityStudio struct {
 	closed                         bool
 }
 
-func TestNetworkPriorityStudioWorkload(t *testing.T) {
-	runNetworkPriorityStudioWorkload(t, gatedNetworkPriorityStudioProfile())
+func TestFolderPriorityStudioWorkload(t *testing.T) {
+	runFolderPriorityStudioWorkload(t, gatedFolderPriorityStudioProfile())
 }
 
-func gatedNetworkPriorityStudioProfile() networkPriorityStudioProfile {
+func gatedFolderPriorityStudioProfile() folderPriorityStudioProfile {
 	seed := studioEnvInt64("STUDIO_SEED", studioDefaultSeed)
 	sizes := make([]int64, studioProjectCount)
 	for i := range sizes {
@@ -221,7 +221,7 @@ func gatedNetworkPriorityStudioProfile() networkPriorityStudioProfile {
 	for i := studioHighProjects + studioNormalProjects; i < studioHighProjects+studioNormalProjects+studioLowProjects; i++ {
 		sizes[i] = 64 << 20
 	}
-	return networkPriorityStudioProfile{
+	return folderPriorityStudioProfile{
 		Name:                "gated",
 		Seed:                seed,
 		ProjectSizes:        sizes,
@@ -231,13 +231,13 @@ func gatedNetworkPriorityStudioProfile() networkPriorityStudioProfile {
 		DownloadInFlightKiB: studioDefaultInFlightKiB,
 		ObservationInterval: 2 * time.Second,
 		Timeout:             12 * time.Minute,
-		ArtifactRoot:        studioEnvString("STUDIO_ARTIFACT_DIR", filepath.Join("logs", "network-priority")),
+		ArtifactRoot:        studioEnvString("STUDIO_ARTIFACT_DIR", filepath.Join("logs", "folder-priority")),
 	}
 }
 
-func runNetworkPriorityStudioWorkload(t *testing.T, profile networkPriorityStudioProfile) {
+func runFolderPriorityStudioWorkload(t *testing.T, profile folderPriorityStudioProfile) {
 	t.Helper()
-	studio, err := newNetworkPriorityStudio(t, profile)
+	studio, err := newFolderPriorityStudio(t, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func runNetworkPriorityStudioWorkload(t *testing.T, profile networkPriorityStudi
 
 	studio.must(studio.prepare(), "prepare isolated studio topology")
 	studio.must(studio.startPeers(ctx), "start studio peers")
-	studio.must(studio.configureThroughREST(ctx), "apply rates, In-Flight Limits, and Network Priority through REST")
+	studio.must(studio.configureThroughREST(ctx), "apply rates, In-Flight Limits, and Folder Priority through REST")
 	studio.startObserver(ctx)
 
 	studio.setPhase("low-ingest")
@@ -261,8 +261,8 @@ func runNetworkPriorityStudioWorkload(t *testing.T, profile networkPriorityStudi
 	studio.setPhase("mixed-workload")
 	studio.must(studio.generateNonLow(), "generate High, Normal, and Dynamic data")
 	studio.must(studio.rescanNonLow(ctx), "queue High, Normal, and Dynamic data")
-	studio.must(studio.waitForMixedNetworkPriorityQueue(ctx), "observe mixed Network Priority queue")
-	studio.must(studio.verifyDirectionalNetworkPriority(ctx), "verify direction-specific Network Priority behavior")
+	studio.must(studio.waitForMixedFolderPriorityQueue(ctx), "observe mixed Folder Priority queue")
+	studio.must(studio.verifyDirectionalFolderPriority(ctx), "verify direction-specific Folder Priority behavior")
 	studio.must(studio.measureIndependentDirections(ctx), "validate simultaneous upload and download")
 	studio.must(studio.verifyStrictWaiting(ctx), "observe strict Scheduling Wait")
 
@@ -270,7 +270,7 @@ func runNetworkPriorityStudioWorkload(t *testing.T, profile networkPriorityStudi
 	activeDynamic, err := studio.activateDynamicDemotion(ctx)
 	studio.must(err, "observe active Dynamic work before reprioritization")
 	studio.must(studio.exerciseLifecycleAndReprioritization(ctx, activeDynamic), "exercise lifecycle pressure and live REST reprioritization")
-	studio.must(studio.verifyNoDaemonRestartForNetworkPriorityChanges(), "verify live Network Priority changes did not restart available daemons")
+	studio.must(studio.verifyNoDaemonRestartForFolderPriorityChanges(), "verify live Folder Priority changes did not restart available daemons")
 
 	studio.setPhase("strict-drain")
 	studio.must(studio.waitForHighPrecedence(ctx), "verify later High work precedes comparison projects")
@@ -278,7 +278,7 @@ func runNetworkPriorityStudioWorkload(t *testing.T, profile networkPriorityStudi
 	studio.setPhase("equal-priority-share")
 	studio.must(studio.measureNormalFairness(ctx), "measure Equal-Priority Share")
 	studio.must(studio.exerciseFolderPause(ctx), "exercise folder pause and resume")
-	studio.must(studio.verifyLowResumes(ctx), "verify Low work resumes after higher Network Priority work drains")
+	studio.must(studio.verifyLowResumes(ctx), "verify Low work resumes after higher Folder Priority work drains")
 
 	studio.setPhase("convergence")
 	studio.must(studio.waitForConvergence(ctx), "wait for all 30 projects to converge")
@@ -290,7 +290,7 @@ func runNetworkPriorityStudioWorkload(t *testing.T, profile networkPriorityStudi
 	studio.reportMu.Unlock()
 }
 
-func newNetworkPriorityStudio(t *testing.T, profile networkPriorityStudioProfile) (*networkPriorityStudio, error) {
+func newFolderPriorityStudio(t *testing.T, profile folderPriorityStudioProfile) (*folderPriorityStudio, error) {
 	if len(profile.ProjectSizes) != studioProjectCount {
 		return nil, fmt.Errorf("profile has %d project sizes, expected %d", len(profile.ProjectSizes), studioProjectCount)
 	}
@@ -317,13 +317,13 @@ func newNetworkPriorityStudio(t *testing.T, profile networkPriorityStudioProfile
 	if err != nil {
 		return nil, err
 	}
-	studio := &networkPriorityStudio{
+	studio := &folderPriorityStudio{
 		t:                          t,
 		profile:                    profile,
 		runDir:                     runDir,
 		started:                    time.Now().UTC(),
 		phase:                      "setup",
-		networkPriorities:          make(map[int]map[string]int),
+		folderPriorities:           make(map[int]map[string]int),
 		timeline:                   timeline,
 		observerDone:               make(chan struct{}),
 		completionTime:             make(map[string]time.Time),
@@ -351,19 +351,19 @@ func studioProjectPlan(sizes []int64) []studioProject {
 		return sizes[len(projects)]
 	}
 	for i := 0; i < studioHighProjects; i++ {
-		networkPriority := 50
+		folderPriority := 50
 		if i == 0 {
-			networkPriority = config.NetworkPriorityMax
+			folderPriority = config.FolderPriorityMax
 		}
 		projects = append(projects, studioProject{
 			ID: fmt.Sprintf("studio-high-%02d", i), Class: studioClassHigh, Source: studioPeerHub,
-			InitialNetworkPriority: networkPriority, FinalNetworkPriority: networkPriority, Size: nextSize(),
+			InitialFolderPriority: folderPriority, FinalFolderPriority: folderPriority, Size: nextSize(),
 		})
 	}
 	for i := 0; i < studioNormalProjects; i++ {
 		project := studioProject{
 			ID: fmt.Sprintf("studio-normal-%02d", i), Class: studioClassNormal, Source: studioPeerHub,
-			InitialNetworkPriority: 0, FinalNetworkPriority: 0, Size: nextSize(),
+			InitialFolderPriority: 0, FinalFolderPriority: 0, Size: nextSize(),
 		}
 		if i == 0 {
 			project.ControlBytes = min(project.Size-1, studioControlMaxBytes)
@@ -373,7 +373,7 @@ func studioProjectPlan(sizes []int64) []studioProject {
 	for i := 0; i < studioLowProjects; i++ {
 		project := studioProject{
 			ID: fmt.Sprintf("studio-low-%02d", i), Class: studioClassLow, Source: studioPeerIngest,
-			InitialNetworkPriority: -50, FinalNetworkPriority: -50, Size: nextSize(),
+			InitialFolderPriority: -50, FinalFolderPriority: -50, Size: nextSize(),
 		}
 		if i == 0 {
 			project.ReentryBytes = min(project.Size-1, studioReentryMaxBytes)
@@ -382,12 +382,12 @@ func studioProjectPlan(sizes []int64) []studioProject {
 		}
 		projects = append(projects, project)
 	}
-	dynamicInitialNetworkPriorities := []int{0, -50, 50, 0, 0}
-	dynamicFinalNetworkPriorities := []int{50, 50, -50, 50, -50}
+	dynamicInitialFolderPriorities := []int{0, -50, 50, 0, 0}
+	dynamicFinalFolderPriorities := []int{50, 50, -50, 50, -50}
 	for i := 0; i < studioDynamicProjects; i++ {
 		project := studioProject{
 			ID: fmt.Sprintf("studio-dynamic-%02d", i), Class: studioClassDynamic, Source: studioPeerHub,
-			InitialNetworkPriority: dynamicInitialNetworkPriorities[i], FinalNetworkPriority: dynamicFinalNetworkPriorities[i], Size: nextSize(),
+			InitialFolderPriority: dynamicInitialFolderPriorities[i], FinalFolderPriority: dynamicFinalFolderPriorities[i], Size: nextSize(),
 		}
 		if i == 2 {
 			project.DemotionBytes = min(project.Size-1, studioDemotionMaxBytes)
@@ -397,7 +397,7 @@ func studioProjectPlan(sizes []int64) []studioProject {
 	return projects
 }
 
-func (s *networkPriorityStudio) prepare() error {
+func (s *folderPriorityStudio) prepare() error {
 	ids := []string{id1, id2, id3}
 	names := []string{"storage-hub", "ingest", "edit-delivery"}
 	for i := 0; i < studioPeerCount; i++ {
@@ -422,7 +422,7 @@ func (s *networkPriorityStudio) prepare() error {
 			}
 		}
 		s.peers[i] = peer
-		s.networkPriorities[i] = make(map[string]int)
+		s.folderPriorities[i] = make(map[string]int)
 	}
 
 	for _, peer := range s.peers {
@@ -437,7 +437,7 @@ func (s *networkPriorityStudio) prepare() error {
 	return os.WriteFile(filepath.Join(s.runDir, "project-plan.json"), append(plan, '\n'), 0o644)
 }
 
-func (s *networkPriorityStudio) writePeerConfig(peer *studioPeer) error {
+func (s *folderPriorityStudio) writePeerConfig(peer *studioPeer) error {
 	cfg := config.New(peer.id)
 	cfg.GUI.RawAddress = peer.apiAddress
 	cfg.GUI.APIKey = apiKey
@@ -479,7 +479,7 @@ func (s *networkPriorityStudio) writePeerConfig(peer *studioPeer) error {
 		folder.IgnorePerms = true
 		folder.DisableFsync = true
 		folder.MaxConflicts = -1
-		folder.NetworkPriority = 0
+		folder.FolderPriority = 0
 		if project.ReentryBytes > 0 {
 			folder.PullerPauseS = 1
 		}
@@ -496,7 +496,7 @@ func (s *networkPriorityStudio) writePeerConfig(peer *studioPeer) error {
 	return cfg.WriteXML(fd)
 }
 
-func (s *networkPriorityStudio) startPeers(ctx context.Context) error {
+func (s *folderPriorityStudio) startPeers(ctx context.Context) error {
 	for _, peer := range s.peers {
 		if err := s.startPeer(ctx, peer); err != nil {
 			return err
@@ -508,7 +508,7 @@ func (s *networkPriorityStudio) startPeers(ctx context.Context) error {
 	return nil
 }
 
-func (s *networkPriorityStudio) startPeer(ctx context.Context, peer *studioPeer) error {
+func (s *folderPriorityStudio) startPeer(ctx context.Context, peer *studioPeer) error {
 	bin, err := filepath.Abs(filepath.Join("..", "bin", "syncthing"))
 	if err != nil {
 		return err
@@ -541,7 +541,7 @@ func (s *networkPriorityStudio) startPeer(ctx context.Context, peer *studioPeer)
 	}
 }
 
-func (s *networkPriorityStudio) configureThroughREST(ctx context.Context) error {
+func (s *folderPriorityStudio) configureThroughREST(ctx context.Context) error {
 	options := map[string]any{
 		"maxSendKbps":                     s.profile.SendRateKiB,
 		"maxRecvKbps":                     s.profile.ReceiveRateKiB,
@@ -555,7 +555,7 @@ func (s *networkPriorityStudio) configureThroughREST(ctx context.Context) error 
 			return err
 		}
 		for _, project := range s.projects {
-			if err := s.patchNetworkPriority(ctx, peer, project.ID, project.InitialNetworkPriority); err != nil {
+			if err := s.patchFolderPriority(ctx, peer, project.ID, project.InitialFolderPriority); err != nil {
 				return err
 			}
 		}
@@ -563,28 +563,28 @@ func (s *networkPriorityStudio) configureThroughREST(ctx context.Context) error 
 	return s.captureTimeline(ctx, "configuration-applied")
 }
 
-func (s *networkPriorityStudio) patchNetworkPriority(ctx context.Context, peer *studioPeer, folder string, networkPriority int) error {
+func (s *folderPriorityStudio) patchFolderPriority(ctx context.Context, peer *studioPeer, folder string, folderPriority int) error {
 	verify := func(bs []byte) error {
 		var got config.FolderConfiguration
 		if err := json.Unmarshal(bs, &got); err != nil {
 			return err
 		}
-		if got.NetworkPriority != networkPriority {
-			return fmt.Errorf("%s accepted Network Priority %d for %s as %d", peer.name, networkPriority, folder, got.NetworkPriority)
+		if got.FolderPriority != folderPriority {
+			return fmt.Errorf("%s accepted Folder Priority %d for %s as %d", peer.name, folderPriority, folder, got.FolderPriority)
 		}
 		return nil
 	}
 	path := "/rest/config/folders/" + url.PathEscape(folder)
-	if err := s.patchAndVerify(ctx, peer, path, map[string]int{"networkPriority": networkPriority}, verify); err != nil {
+	if err := s.patchAndVerify(ctx, peer, path, map[string]int{"folderPriority": folderPriority}, verify); err != nil {
 		return err
 	}
-	s.networkPriorityMu.Lock()
-	s.networkPriorities[peer.index][folder] = networkPriority
-	s.networkPriorityMu.Unlock()
+	s.folderPriorityMu.Lock()
+	s.folderPriorities[peer.index][folder] = folderPriority
+	s.folderPriorityMu.Unlock()
 	return nil
 }
 
-func (s *networkPriorityStudio) patchFolderPaused(ctx context.Context, peer *studioPeer, folder string, paused bool) error {
+func (s *folderPriorityStudio) patchFolderPaused(ctx context.Context, peer *studioPeer, folder string, paused bool) error {
 	verify := func(bs []byte) error {
 		var got config.FolderConfiguration
 		if err := json.Unmarshal(bs, &got); err != nil {
@@ -598,7 +598,7 @@ func (s *networkPriorityStudio) patchFolderPaused(ctx context.Context, peer *stu
 	return s.patchAndVerify(ctx, peer, "/rest/config/folders/"+url.PathEscape(folder), map[string]bool{"paused": paused}, verify)
 }
 
-func (s *networkPriorityStudio) patchAndVerify(ctx context.Context, peer *studioPeer, path string, body any, verify func([]byte) error) error {
+func (s *folderPriorityStudio) patchAndVerify(ctx context.Context, peer *studioPeer, path string, body any, verify func([]byte) error) error {
 	if _, err := s.requestJSON(ctx, peer, http.MethodPatch, path, body); err != nil {
 		return fmt.Errorf("PATCH %s on %s: %w", path, peer.name, err)
 	}
@@ -619,7 +619,7 @@ func (s *networkPriorityStudio) patchAndVerify(ctx context.Context, peer *studio
 	return nil
 }
 
-func (s *networkPriorityStudio) requestJSON(ctx context.Context, peer *studioPeer, method, path string, body any) ([]byte, error) {
+func (s *folderPriorityStudio) requestJSON(ctx context.Context, peer *studioPeer, method, path string, body any) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		bs, err := json.Marshal(body)
@@ -652,7 +652,7 @@ func (s *networkPriorityStudio) requestJSON(ctx context.Context, peer *studioPee
 	return bs, nil
 }
 
-func (s *networkPriorityStudio) generateClass(class studioProjectClass) error {
+func (s *folderPriorityStudio) generateClass(class studioProjectClass) error {
 	for _, project := range s.projects {
 		if project.Class != class {
 			continue
@@ -664,7 +664,7 @@ func (s *networkPriorityStudio) generateClass(class studioProjectClass) error {
 	return nil
 }
 
-func (s *networkPriorityStudio) generateNonLow() error {
+func (s *folderPriorityStudio) generateNonLow() error {
 	for _, project := range s.projects {
 		if project.Class == studioClassLow {
 			continue
@@ -676,11 +676,11 @@ func (s *networkPriorityStudio) generateNonLow() error {
 	return nil
 }
 
-func (s *networkPriorityStudio) generateProject(project studioProject) error {
+func (s *folderPriorityStudio) generateProject(project studioProject) error {
 	return s.generateProjectFile(project, "media.bin", project.Size-project.ReentryBytes-project.ControlBytes-project.DemotionBytes-project.DirectionBytes, project.ID)
 }
 
-func (s *networkPriorityStudio) generateProjectFile(project studioProject, name string, size int64, seedLabel string) error {
+func (s *folderPriorityStudio) generateProjectFile(project studioProject, name string, size int64, seedLabel string) error {
 	path := filepath.Join(s.folderPath(s.peers[project.Source], project.ID), name)
 	seed := s.profile.Seed + int64(studioStableHash(seedLabel))
 	rng := rand.New(rand.NewSource(seed))
@@ -707,7 +707,7 @@ func (s *networkPriorityStudio) generateProjectFile(project studioProject, name 
 	return nil
 }
 
-func (s *networkPriorityStudio) rescanClass(class studioProjectClass) error {
+func (s *folderPriorityStudio) rescanClass(class studioProjectClass) error {
 	for _, project := range s.projects {
 		if project.Class == class {
 			if err := s.peers[project.Source].process.Rescan(project.ID); err != nil {
@@ -718,8 +718,8 @@ func (s *networkPriorityStudio) rescanClass(class studioProjectClass) error {
 	return nil
 }
 
-func (s *networkPriorityStudio) rescanNonLow(ctx context.Context) error {
-	// Stage lower Network Priority work before High work so the profile
+func (s *folderPriorityStudio) rescanNonLow(ctx context.Context) error {
+	// Stage lower Folder Priority work before High work so the profile
 	// deterministically observes later High arrivals overtaking a live queue.
 	for _, class := range []studioProjectClass{studioClassNormal, studioClassDynamic, studioClassHigh} {
 		if class == studioClassHigh {
@@ -739,7 +739,7 @@ func (s *networkPriorityStudio) rescanNonLow(ctx context.Context) error {
 	return nil
 }
 
-func (s *networkPriorityStudio) snapshotNonPreemptiveLow(ctx context.Context) error {
+func (s *folderPriorityStudio) snapshotNonPreemptiveLow(ctx context.Context) error {
 	var nonPreemptiveLow []string
 	for _, project := range s.projectsByClass(studioClassLow) {
 		if project.ReentryBytes > 0 || project.DirectionBytes > 0 {
@@ -749,7 +749,7 @@ func (s *networkPriorityStudio) snapshotNonPreemptiveLow(ctx context.Context) er
 		if err != nil {
 			return err
 		}
-		if status.NeedBytes == 0 || status.NetworkPriorityScheduling.Download.ActiveBytes > 0 {
+		if status.NeedBytes == 0 || status.FolderPriorityScheduling.Download.ActiveBytes > 0 {
 			s.nonPreemptiveLowProjectIDs[project.ID] = struct{}{}
 			nonPreemptiveLow = append(nonPreemptiveLow, project.ID)
 		}
@@ -761,7 +761,7 @@ func (s *networkPriorityStudio) snapshotNonPreemptiveLow(ctx context.Context) er
 	return nil
 }
 
-func (s *networkPriorityStudio) resumeAll() error {
+func (s *folderPriorityStudio) resumeAll() error {
 	for _, peer := range s.peers {
 		if err := peer.process.ResumeAll(); err != nil {
 			return err
@@ -770,7 +770,7 @@ func (s *networkPriorityStudio) resumeAll() error {
 	return nil
 }
 
-func (s *networkPriorityStudio) waitForLowProgress(ctx context.Context) error {
+func (s *folderPriorityStudio) waitForLowProgress(ctx context.Context) error {
 	return s.waitUntil(ctx, 200*time.Millisecond, func() (bool, error) {
 		var global, inSync int64
 		for _, project := range s.projectsByClass(studioClassLow) {
@@ -785,7 +785,7 @@ func (s *networkPriorityStudio) waitForLowProgress(ctx context.Context) error {
 	})
 }
 
-func (s *networkPriorityStudio) measureLowWorkConservation(ctx context.Context) error {
+func (s *folderPriorityStudio) measureLowWorkConservation(ctx context.Context) error {
 	before, err := s.aggregateProgress(ctx, studioPeerEdit, studioClassLow)
 	if err != nil {
 		return err
@@ -816,7 +816,7 @@ func (s *networkPriorityStudio) measureLowWorkConservation(ctx context.Context) 
 	return nil
 }
 
-func (s *networkPriorityStudio) waitForMixedNetworkPriorityQueue(ctx context.Context) error {
+func (s *folderPriorityStudio) waitForMixedFolderPriorityQueue(ctx context.Context) error {
 	high := s.projectsByClass(studioClassHigh)
 	normal := s.projectsByClass(studioClassNormal)
 	return s.waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
@@ -840,7 +840,7 @@ func (s *networkPriorityStudio) waitForMixedNetworkPriorityQueue(ctx context.Con
 	})
 }
 
-func (s *networkPriorityStudio) verifyDirectionalNetworkPriority(ctx context.Context) error {
+func (s *folderPriorityStudio) verifyDirectionalFolderPriority(ctx context.Context) error {
 	high := s.projectsByClass(studioClassHigh)
 	normal := s.projectsByClass(studioClassNormal)
 	hub := s.peers[studioPeerHub]
@@ -856,8 +856,8 @@ func (s *networkPriorityStudio) verifyDirectionalNetworkPriority(ctx context.Con
 			if err != nil {
 				return false, err
 			}
-			hubHighUploadActive = hubHighUploadActive || hubStatus.NetworkPriorityScheduling.Upload.ActiveBytes > 0
-			editHighDownloadActive = editHighDownloadActive || editStatus.NetworkPriorityScheduling.Download.ActiveBytes > 0
+			hubHighUploadActive = hubHighUploadActive || hubStatus.FolderPriorityScheduling.Upload.ActiveBytes > 0
+			editHighDownloadActive = editHighDownloadActive || editStatus.FolderPriorityScheduling.Download.ActiveBytes > 0
 		}
 
 		var hubNormalUploadQueued, editNormalDownloadQueued bool
@@ -870,8 +870,8 @@ func (s *networkPriorityStudio) verifyDirectionalNetworkPriority(ctx context.Con
 			if err != nil {
 				return false, err
 			}
-			hubNormalUploadQueued = hubNormalUploadQueued || hubStatus.NetworkPriorityScheduling.Upload.QueuedBytes > 0
-			editNormalDownloadQueued = editNormalDownloadQueued || editStatus.NetworkPriorityScheduling.Download.QueuedBytes > 0
+			hubNormalUploadQueued = hubNormalUploadQueued || hubStatus.FolderPriorityScheduling.Upload.QueuedBytes > 0
+			editNormalDownloadQueued = editNormalDownloadQueued || editStatus.FolderPriorityScheduling.Download.QueuedBytes > 0
 		}
 
 		if hubHighUploadActive && hubNormalUploadQueued && editHighDownloadActive && editNormalDownloadQueued {
@@ -885,7 +885,7 @@ func (s *networkPriorityStudio) verifyDirectionalNetworkPriority(ctx context.Con
 	})
 }
 
-func (s *networkPriorityStudio) measureIndependentDirections(ctx context.Context) error {
+func (s *folderPriorityStudio) measureIndependentDirections(ctx context.Context) error {
 	hub := s.peers[studioPeerHub]
 	directionProject := s.projectsByClass(studioClassLow)[1]
 	if directionProject.Source != studioPeerIngest || directionProject.DirectionBytes <= 0 {
@@ -956,7 +956,7 @@ func (s *networkPriorityStudio) measureIndependentDirections(ctx context.Context
 	return nil
 }
 
-func (s *networkPriorityStudio) waitForSimultaneousDirections(ctx context.Context, peer *studioPeer, downloadProject studioProject) (int64, int64, error) {
+func (s *folderPriorityStudio) waitForSimultaneousDirections(ctx context.Context, peer *studioPeer, downloadProject studioProject) (int64, int64, error) {
 	var activeUpload, activeDownload int64
 	err := s.waitUntil(ctx, 25*time.Millisecond, func() (bool, error) {
 		var highUploadActive, downloadProjectActive bool
@@ -966,8 +966,8 @@ func (s *networkPriorityStudio) waitForSimultaneousDirections(ctx context.Contex
 			if err != nil {
 				return false, err
 			}
-			upload := status.NetworkPriorityScheduling.Upload.ActiveBytes
-			download := status.NetworkPriorityScheduling.Download.ActiveBytes
+			upload := status.FolderPriorityScheduling.Upload.ActiveBytes
+			download := status.FolderPriorityScheduling.Download.ActiveBytes
 			activeUpload += upload
 			activeDownload += download
 			if project.Class == studioClassHigh && upload > 0 {
@@ -985,7 +985,7 @@ func (s *networkPriorityStudio) waitForSimultaneousDirections(ctx context.Contex
 	return activeUpload, activeDownload, nil
 }
 
-func (s *networkPriorityStudio) maximumActiveBytes(ctx context.Context, peer *studioPeer) (int64, int64, error) {
+func (s *folderPriorityStudio) maximumActiveBytes(ctx context.Context, peer *studioPeer) (int64, int64, error) {
 	var maxUpload, maxDownload int64
 	deadline := time.NewTimer(750 * time.Millisecond)
 	defer deadline.Stop()
@@ -996,8 +996,8 @@ func (s *networkPriorityStudio) maximumActiveBytes(ctx context.Context, peer *st
 			if err != nil {
 				return 0, 0, err
 			}
-			upload += status.NetworkPriorityScheduling.Upload.ActiveBytes
-			download += status.NetworkPriorityScheduling.Download.ActiveBytes
+			upload += status.FolderPriorityScheduling.Upload.ActiveBytes
+			download += status.FolderPriorityScheduling.Download.ActiveBytes
 		}
 		maxUpload = max(maxUpload, upload)
 		maxDownload = max(maxDownload, download)
@@ -1011,7 +1011,7 @@ func (s *networkPriorityStudio) maximumActiveBytes(ctx context.Context, peer *st
 	}
 }
 
-func (s *networkPriorityStudio) verifyStrictWaiting(ctx context.Context) error {
+func (s *folderPriorityStudio) verifyStrictWaiting(ctx context.Context) error {
 	low := s.projectsByClass(studioClassLow)
 	return s.waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
 		for _, project := range low {
@@ -1019,10 +1019,10 @@ func (s *networkPriorityStudio) verifyStrictWaiting(ctx context.Context) error {
 			if err != nil {
 				return false, err
 			}
-			wait := status.NetworkPriorityScheduling.Download.OldestSchedulingWaitSeconds
-			queued := status.NetworkPriorityScheduling.Download.QueuedBytes
+			wait := status.FolderPriorityScheduling.Download.OldestSchedulingWaitSeconds
+			queued := status.FolderPriorityScheduling.Download.QueuedBytes
 			if queued > 0 && wait > 0 {
-				s.record(studioTimelineEntry{Kind: "assertion", Peer: s.peers[studioPeerEdit].name, Folder: project.ID, Direction: "download", QueuedBytes: queued, OldestSchedulingWaitSeconds: wait, Detail: "intentional strict Network Priority starvation observed"})
+				s.record(studioTimelineEntry{Kind: "assertion", Peer: s.peers[studioPeerEdit].name, Folder: project.ID, Direction: "download", QueuedBytes: queued, OldestSchedulingWaitSeconds: wait, Detail: "intentional strict Folder Priority starvation observed"})
 				return true, nil
 			}
 		}
@@ -1030,7 +1030,7 @@ func (s *networkPriorityStudio) verifyStrictWaiting(ctx context.Context) error {
 	})
 }
 
-func (s *networkPriorityStudio) activateDynamicDemotion(ctx context.Context) (studioActiveTransfer, error) {
+func (s *folderPriorityStudio) activateDynamicDemotion(ctx context.Context) (studioActiveTransfer, error) {
 	dynamic := s.projectsByClass(studioClassDynamic)
 	demoted := dynamic[2]
 	if demoted.Source != studioPeerHub || demoted.DemotionBytes <= 0 {
@@ -1048,11 +1048,11 @@ func (s *networkPriorityStudio) activateDynamicDemotion(ctx context.Context) (st
 		if err != nil {
 			return false, err
 		}
-		if status.NeedBytes > 0 && status.NetworkPriorityScheduling.Download.ActiveBytes > 0 {
+		if status.NeedBytes > 0 && status.FolderPriorityScheduling.Download.ActiveBytes > 0 {
 			active = studioActiveTransfer{
 				ProjectID:   demoted.ID,
 				InSyncBytes: status.InSyncBytes,
-				ActiveBytes: status.NetworkPriorityScheduling.Download.ActiveBytes,
+				ActiveBytes: status.FolderPriorityScheduling.Download.ActiveBytes,
 			}
 			return true, nil
 		}
@@ -1064,30 +1064,30 @@ func (s *networkPriorityStudio) activateDynamicDemotion(ctx context.Context) (st
 	return active, nil
 }
 
-func (s *networkPriorityStudio) exerciseLifecycleAndReprioritization(ctx context.Context, active studioActiveTransfer) error {
+func (s *folderPriorityStudio) exerciseLifecycleAndReprioritization(ctx context.Context, active studioActiveTransfer) error {
 	dynamic := s.projectsByClass(studioClassDynamic)
 	demoted := dynamic[2]
 	if active.ProjectID != demoted.ID || active.ActiveBytes <= 0 {
 		return fmt.Errorf("active demotion precondition missing for %s", demoted.ID)
 	}
 	edit := s.peers[studioPeerEdit]
-	if err := s.patchNetworkPriority(ctx, edit, demoted.ID, demoted.FinalNetworkPriority); err != nil {
+	if err := s.patchFolderPriority(ctx, edit, demoted.ID, demoted.FinalFolderPriority); err != nil {
 		return err
 	}
 	afterDemotion, err := s.folderStatus(ctx, edit, demoted.ID)
 	if err != nil {
 		return err
 	}
-	if afterDemotion.NetworkPriorityScheduling.Download.ActiveBytes == 0 && afterDemotion.InSyncBytes <= active.InSyncBytes {
+	if afterDemotion.FolderPriorityScheduling.Download.ActiveBytes == 0 && afterDemotion.InSyncBytes <= active.InSyncBytes {
 		return fmt.Errorf("active Block Transfer for %s was neither retained nor completed across demotion", demoted.ID)
 	}
 	s.nonPreemptiveDemotionProjectID = demoted.ID
 	s.record(studioTimelineEntry{
 		Kind: "assertion", Peer: edit.name, Folder: demoted.ID, Direction: "download",
-		NetworkPriority: demoted.FinalNetworkPriority,
-		InSyncBytes:     afterDemotion.InSyncBytes,
-		ActiveBytes:     afterDemotion.NetworkPriorityScheduling.Download.ActiveBytes,
-		Detail:          fmt.Sprintf("active Block Transfer remained non-preemptive across demotion; beforeInSync=%d beforeActive=%d", active.InSyncBytes, active.ActiveBytes),
+		FolderPriority: demoted.FinalFolderPriority,
+		InSyncBytes:    afterDemotion.InSyncBytes,
+		ActiveBytes:    afterDemotion.FolderPriorityScheduling.Download.ActiveBytes,
+		Detail:         fmt.Sprintf("active Block Transfer remained non-preemptive across demotion; beforeInSync=%d beforeActive=%d", active.InSyncBytes, active.ActiveBytes),
 	})
 
 	ingest := s.peers[studioPeerIngest]
@@ -1115,12 +1115,12 @@ func (s *networkPriorityStudio) exerciseLifecycleAndReprioritization(ctx context
 			if peer.index == studioPeerEdit && project.ID == demoted.ID {
 				continue
 			}
-			if err := s.patchNetworkPriority(ctx, peer, project.ID, project.FinalNetworkPriority); err != nil {
+			if err := s.patchFolderPriority(ctx, peer, project.ID, project.FinalFolderPriority); err != nil {
 				return err
 			}
 		}
 	}
-	s.record(studioTimelineEntry{Kind: "lifecycle", Peer: ingest.name, Detail: "Network Priority changed on available peers while this peer was unavailable"})
+	s.record(studioTimelineEntry{Kind: "lifecycle", Peer: ingest.name, Detail: "Folder Priority changed on available peers while this peer was unavailable"})
 	if err := s.waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
 		availableAfter, err := s.aggregateAvailableProgress(ctx)
 		return availableAfter > availableBefore, err
@@ -1140,7 +1140,7 @@ func (s *networkPriorityStudio) exerciseLifecycleAndReprioritization(ctx context
 		return err
 	}
 	for _, project := range dynamic {
-		if err := s.patchNetworkPriority(ctx, ingest, project.ID, project.FinalNetworkPriority); err != nil {
+		if err := s.patchFolderPriority(ctx, ingest, project.ID, project.FinalFolderPriority); err != nil {
 			return err
 		}
 	}
@@ -1175,22 +1175,22 @@ func (s *networkPriorityStudio) exerciseLifecycleAndReprioritization(ctx context
 	s.reportMu.Lock()
 	s.report.Restarts++
 	s.reportMu.Unlock()
-	s.record(studioTimelineEntry{Kind: "lifecycle", Peer: ingest.name, Detail: "disconnect, retry/backoff, restart, and strict Network Priority re-entry completed"})
+	s.record(studioTimelineEntry{Kind: "lifecycle", Peer: ingest.name, Detail: "disconnect, retry/backoff, restart, and strict Folder Priority re-entry completed"})
 	return nil
 }
 
-func (s *networkPriorityStudio) waitForProjectDownloadActive(ctx context.Context, project studioProject) error {
+func (s *folderPriorityStudio) waitForProjectDownloadActive(ctx context.Context, project studioProject) error {
 	edit := s.peers[studioPeerEdit]
 	return s.waitUntil(ctx, 50*time.Millisecond, func() (bool, error) {
 		status, err := s.folderStatus(ctx, edit, project.ID)
 		if err != nil {
 			return false, err
 		}
-		return status.NeedBytes > 0 && status.NetworkPriorityScheduling.Download.ActiveBytes > 0, nil
+		return status.NeedBytes > 0 && status.FolderPriorityScheduling.Download.ActiveBytes > 0, nil
 	})
 }
 
-func (s *networkPriorityStudio) aggregateAvailableProgress(ctx context.Context) (int64, error) {
+func (s *folderPriorityStudio) aggregateAvailableProgress(ctx context.Context) (int64, error) {
 	var progress int64
 	for _, class := range []studioProjectClass{studioClassHigh, studioClassNormal, studioClassDynamic} {
 		classProgress, err := s.aggregateProgress(ctx, studioPeerEdit, class)
@@ -1202,32 +1202,32 @@ func (s *networkPriorityStudio) aggregateAvailableProgress(ctx context.Context) 
 	return progress, nil
 }
 
-func (s *networkPriorityStudio) waitForReenteredStrictOrdering(ctx context.Context, reentryProject studioProject) error {
+func (s *folderPriorityStudio) waitForReenteredStrictOrdering(ctx context.Context, reentryProject studioProject) error {
 	edit := s.peers[studioPeerEdit]
 	return s.waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
-		var higherNetworkPriorityActive bool
+		var higherFolderPriorityActive bool
 		for _, project := range s.projects {
-			if s.networkPriority(edit.index, project.ID) <= reentryProject.FinalNetworkPriority {
+			if s.folderPriority(edit.index, project.ID) <= reentryProject.FinalFolderPriority {
 				continue
 			}
 			status, err := s.folderStatus(ctx, edit, project.ID)
 			if err != nil {
 				return false, err
 			}
-			higherNetworkPriorityActive = higherNetworkPriorityActive || status.NeedBytes > 0 && status.NetworkPriorityScheduling.Download.ActiveBytes > 0
+			higherFolderPriorityActive = higherFolderPriorityActive || status.NeedBytes > 0 && status.FolderPriorityScheduling.Download.ActiveBytes > 0
 		}
 
 		reentryStatus, err := s.folderStatus(ctx, edit, reentryProject.ID)
 		if err != nil {
 			return false, err
 		}
-		lowQueued := reentryStatus.NetworkPriorityScheduling.Download.QueuedBytes
-		lowActive := reentryStatus.NetworkPriorityScheduling.Download.ActiveBytes
-		if higherNetworkPriorityActive && reentryStatus.GlobalBytes == reentryProject.Size && reentryStatus.NeedBytes > 0 && lowQueued > 0 {
+		lowQueued := reentryStatus.FolderPriorityScheduling.Download.QueuedBytes
+		lowActive := reentryStatus.FolderPriorityScheduling.Download.ActiveBytes
+		if higherFolderPriorityActive && reentryStatus.GlobalBytes == reentryProject.Size && reentryStatus.NeedBytes > 0 && lowQueued > 0 {
 			s.record(studioTimelineEntry{
 				Kind: "assertion", Peer: edit.name, Folder: reentryProject.ID, Direction: "download",
 				QueuedBytes: lowQueued, ActiveBytes: lowActive,
-				Detail: "re-entered Low work retained a queued remainder behind active higher Network Priority work; any previously admitted Low Block Transfers remained non-preemptive",
+				Detail: "re-entered Low work retained a queued remainder behind active higher Folder Priority work; any previously admitted Low Block Transfers remained non-preemptive",
 			})
 			return true, nil
 		}
@@ -1235,16 +1235,16 @@ func (s *networkPriorityStudio) waitForReenteredStrictOrdering(ctx context.Conte
 	})
 }
 
-func (s *networkPriorityStudio) verifyNoDaemonRestartForNetworkPriorityChanges() error {
+func (s *folderPriorityStudio) verifyNoDaemonRestartForFolderPriorityChanges() error {
 	for _, index := range []int{studioPeerHub, studioPeerEdit} {
 		if s.peers[index].starts != 1 {
-			return fmt.Errorf("%s restarted during live Network Priority changes", s.peers[index].name)
+			return fmt.Errorf("%s restarted during live Folder Priority changes", s.peers[index].name)
 		}
 	}
 	return nil
 }
 
-func (s *networkPriorityStudio) waitForHighPrecedence(ctx context.Context) error {
+func (s *folderPriorityStudio) waitForHighPrecedence(ctx context.Context) error {
 	high := s.projectsByClass(studioClassHigh)
 	comparison := append(s.projectsByClass(studioClassNormal), s.projectsByClass(studioClassLow)...)
 	if err := s.waitForCompletionEvents(ctx, high); err != nil {
@@ -1267,7 +1267,7 @@ func (s *networkPriorityStudio) waitForHighPrecedence(ctx context.Context) error
 	return nil
 }
 
-func (s *networkPriorityStudio) verifyCompletionPrecedence() error {
+func (s *folderPriorityStudio) verifyCompletionPrecedence() error {
 	highFirst, highLast, err := s.completionBounds(s.projectsByClass(studioClassHigh))
 	if err != nil {
 		return err
@@ -1296,9 +1296,9 @@ func (s *networkPriorityStudio) verifyCompletionPrecedence() error {
 	var promoted, demoted []studioProject
 	for _, project := range s.projectsByClass(studioClassDynamic) {
 		switch {
-		case project.FinalNetworkPriority > project.InitialNetworkPriority:
+		case project.FinalFolderPriority > project.InitialFolderPriority:
 			promoted = append(promoted, project)
-		case project.FinalNetworkPriority < project.InitialNetworkPriority && project.ID != s.nonPreemptiveDemotionProjectID:
+		case project.FinalFolderPriority < project.InitialFolderPriority && project.ID != s.nonPreemptiveDemotionProjectID:
 			demoted = append(demoted, project)
 		}
 	}
@@ -1324,7 +1324,7 @@ func (s *networkPriorityStudio) verifyCompletionPrecedence() error {
 	return nil
 }
 
-func (s *networkPriorityStudio) completionBounds(projects []studioProject) (time.Time, time.Time, error) {
+func (s *folderPriorityStudio) completionBounds(projects []studioProject) (time.Time, time.Time, error) {
 	s.completionMu.RLock()
 	defer s.completionMu.RUnlock()
 	var first, last time.Time
@@ -1343,7 +1343,7 @@ func (s *networkPriorityStudio) completionBounds(projects []studioProject) (time
 	return first, last, nil
 }
 
-func (s *networkPriorityStudio) verifyLowResumes(ctx context.Context) error {
+func (s *folderPriorityStudio) verifyLowResumes(ctx context.Context) error {
 	before, err := s.aggregateProgress(ctx, studioPeerEdit, studioClassLow)
 	if err != nil {
 		return err
@@ -1358,11 +1358,11 @@ func (s *networkPriorityStudio) verifyLowResumes(ctx context.Context) error {
 	return nil
 }
 
-func (s *networkPriorityStudio) measureNormalFairness(ctx context.Context) error {
+func (s *folderPriorityStudio) measureNormalFairness(ctx context.Context) error {
 	dynamic := s.projectsByClass(studioClassDynamic)
 	var promoted []studioProject
 	for _, project := range dynamic {
-		if project.FinalNetworkPriority >= 50 {
+		if project.FinalFolderPriority >= 50 {
 			promoted = append(promoted, project)
 		}
 	}
@@ -1413,7 +1413,7 @@ func (s *networkPriorityStudio) measureNormalFairness(ctx context.Context) error
 	return nil
 }
 
-func (s *networkPriorityStudio) exerciseFolderPause(ctx context.Context) error {
+func (s *folderPriorityStudio) exerciseFolderPause(ctx context.Context) error {
 	peer := s.peers[studioPeerEdit]
 	project := s.projectsByClass(studioClassNormal)[studioNormalProjects-1]
 	before, err := s.folderStatus(ctx, peer, project.ID)
@@ -1444,7 +1444,7 @@ func (s *networkPriorityStudio) exerciseFolderPause(ctx context.Context) error {
 	return nil
 }
 
-func (s *networkPriorityStudio) waitForConvergence(ctx context.Context) error {
+func (s *folderPriorityStudio) waitForConvergence(ctx context.Context) error {
 	return s.waitUntil(ctx, 500*time.Millisecond, func() (bool, error) {
 		for _, project := range s.projects {
 			for _, peer := range s.peers {
@@ -1455,10 +1455,10 @@ func (s *networkPriorityStudio) waitForConvergence(ctx context.Context) error {
 				if status.NeedBytes != 0 || status.NeedTotalItems != 0 || status.GlobalBytes != project.Size {
 					return false, nil
 				}
-				if status.NetworkPriorityScheduling.Upload.QueuedBytes != 0 || status.NetworkPriorityScheduling.Download.QueuedBytes != 0 ||
-					status.NetworkPriorityScheduling.Upload.ActiveBytes != 0 || status.NetworkPriorityScheduling.Download.ActiveBytes != 0 ||
-					status.NetworkPriorityScheduling.Upload.OldestSchedulingWaitSeconds != 0 ||
-					status.NetworkPriorityScheduling.Download.OldestSchedulingWaitSeconds != 0 {
+				if status.FolderPriorityScheduling.Upload.QueuedBytes != 0 || status.FolderPriorityScheduling.Download.QueuedBytes != 0 ||
+					status.FolderPriorityScheduling.Upload.ActiveBytes != 0 || status.FolderPriorityScheduling.Download.ActiveBytes != 0 ||
+					status.FolderPriorityScheduling.Upload.OldestSchedulingWaitSeconds != 0 ||
+					status.FolderPriorityScheduling.Download.OldestSchedulingWaitSeconds != 0 {
 					return false, nil
 				}
 			}
@@ -1467,7 +1467,7 @@ func (s *networkPriorityStudio) waitForConvergence(ctx context.Context) error {
 	})
 }
 
-func (s *networkPriorityStudio) verifyDirectories() error {
+func (s *folderPriorityStudio) verifyDirectories() error {
 	for _, project := range s.projects {
 		dirs := make([]string, 0, studioPeerCount)
 		for _, peer := range s.peers {
@@ -1491,7 +1491,7 @@ func (s *networkPriorityStudio) verifyDirectories() error {
 	return nil
 }
 
-func (s *networkPriorityStudio) startObserver(ctx context.Context) {
+func (s *folderPriorityStudio) startObserver(ctx context.Context) {
 	observerCtx, cancel := context.WithCancel(ctx)
 	s.observerCancel = cancel
 	go func() {
@@ -1553,7 +1553,7 @@ func (s *networkPriorityStudio) startObserver(ctx context.Context) {
 	}()
 }
 
-func (s *networkPriorityStudio) expectedProjectFileCount(folder string) int {
+func (s *folderPriorityStudio) expectedProjectFileCount(folder string) int {
 	for _, project := range s.projects {
 		if project.ID == folder {
 			count := 1
@@ -1575,7 +1575,7 @@ func (s *networkPriorityStudio) expectedProjectFileCount(folder string) int {
 	return 1
 }
 
-func (s *networkPriorityStudio) events(ctx context.Context, peer *studioPeer, since int) ([]rc.Event, error) {
+func (s *folderPriorityStudio) events(ctx context.Context, peer *studioPeer, since int) ([]rc.Event, error) {
 	path := fmt.Sprintf("/rest/events?since=%d&limit=256&timeout=0&events=ItemFinished,DeviceConnected,DeviceDisconnected,FolderPaused,FolderResumed,ConfigSaved", since)
 	bs, err := s.requestJSON(ctx, peer, http.MethodGet, path, nil)
 	if err != nil {
@@ -1590,7 +1590,7 @@ func (s *networkPriorityStudio) events(ctx context.Context, peer *studioPeer, si
 	return result, nil
 }
 
-func (s *networkPriorityStudio) captureTimeline(ctx context.Context, detail string) error {
+func (s *folderPriorityStudio) captureTimeline(ctx context.Context, detail string) error {
 	for _, peer := range s.peers {
 		connections, err := peer.process.Connections()
 		if err != nil {
@@ -1608,19 +1608,19 @@ func (s *networkPriorityStudio) captureTimeline(ctx context.Context, detail stri
 			if err != nil {
 				return err
 			}
-			networkPriority := s.networkPriority(peer.index, project.ID)
+			folderPriority := s.folderPriority(peer.index, project.ID)
 			for _, direction := range []struct {
 				name  string
 				state studioDirectionStatus
 				rate  int
 				limit int
 			}{
-				{"upload", status.NetworkPriorityScheduling.Upload, s.profile.SendRateKiB, s.profile.UploadInFlightKiB},
-				{"download", status.NetworkPriorityScheduling.Download, s.profile.ReceiveRateKiB, s.profile.DownloadInFlightKiB},
+				{"upload", status.FolderPriorityScheduling.Upload, s.profile.SendRateKiB, s.profile.UploadInFlightKiB},
+				{"download", status.FolderPriorityScheduling.Download, s.profile.ReceiveRateKiB, s.profile.DownloadInFlightKiB},
 			} {
 				s.record(studioTimelineEntry{
 					Kind: "status", Peer: peer.name, Folder: project.ID, Direction: direction.name,
-					NetworkPriority: networkPriority, GlobalBytes: status.GlobalBytes, InSyncBytes: status.InSyncBytes, NeedBytes: status.NeedBytes,
+					FolderPriority: folderPriority, GlobalBytes: status.GlobalBytes, InSyncBytes: status.InSyncBytes, NeedBytes: status.NeedBytes,
 					QueuedBytes: direction.state.QueuedBytes, ActiveBytes: direction.state.ActiveBytes,
 					OldestSchedulingWaitSeconds: direction.state.OldestSchedulingWaitSeconds,
 					ConfiguredRateKiB:           direction.rate, InFlightLimitKiB: direction.limit,
@@ -1632,7 +1632,7 @@ func (s *networkPriorityStudio) captureTimeline(ctx context.Context, detail stri
 	return nil
 }
 
-func (s *networkPriorityStudio) folderStatus(ctx context.Context, peer *studioPeer, folder string) (studioFolderStatus, error) {
+func (s *folderPriorityStudio) folderStatus(ctx context.Context, peer *studioPeer, folder string) (studioFolderStatus, error) {
 	bs, err := s.requestJSON(ctx, peer, http.MethodGet, "/rest/db/status?folder="+url.QueryEscape(folder), nil)
 	if err != nil {
 		return studioFolderStatus{}, err
@@ -1641,13 +1641,13 @@ func (s *networkPriorityStudio) folderStatus(ctx context.Context, peer *studioPe
 	if err := json.Unmarshal(bs, &status); err != nil {
 		return status, err
 	}
-	if !status.NetworkPrioritySchedulingActive {
-		return status, fmt.Errorf("Network Priority scheduling inactive on %s/%s", peer.name, folder)
+	if !status.FolderPrioritySchedulingActive {
+		return status, fmt.Errorf("Folder Priority scheduling inactive on %s/%s", peer.name, folder)
 	}
 	return status, nil
 }
 
-func (s *networkPriorityStudio) aggregateProgress(ctx context.Context, peerIndex int, class studioProjectClass) (int64, error) {
+func (s *folderPriorityStudio) aggregateProgress(ctx context.Context, peerIndex int, class studioProjectClass) (int64, error) {
 	var result int64
 	for _, project := range s.projectsByClass(class) {
 		status, err := s.folderStatus(ctx, s.peers[peerIndex], project.ID)
@@ -1659,7 +1659,7 @@ func (s *networkPriorityStudio) aggregateProgress(ctx context.Context, peerIndex
 	return result, nil
 }
 
-func (s *networkPriorityStudio) waitForCompletionEvents(ctx context.Context, projects []studioProject) error {
+func (s *folderPriorityStudio) waitForCompletionEvents(ctx context.Context, projects []studioProject) error {
 	return s.waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
 		s.completionMu.RLock()
 		defer s.completionMu.RUnlock()
@@ -1672,7 +1672,7 @@ func (s *networkPriorityStudio) waitForCompletionEvents(ctx context.Context, pro
 	})
 }
 
-func (s *networkPriorityStudio) waitForConnection(ctx context.Context, peer *studioPeer, device protocol.DeviceID, connected bool) error {
+func (s *folderPriorityStudio) waitForConnection(ctx context.Context, peer *studioPeer, device protocol.DeviceID, connected bool) error {
 	return s.waitUntil(ctx, 100*time.Millisecond, func() (bool, error) {
 		connections, err := peer.process.Connections()
 		if err != nil {
@@ -1686,7 +1686,7 @@ func (s *networkPriorityStudio) waitForConnection(ctx context.Context, peer *stu
 	})
 }
 
-func (s *networkPriorityStudio) waitUntil(ctx context.Context, interval time.Duration, condition func() (bool, error)) error {
+func (s *folderPriorityStudio) waitUntil(ctx context.Context, interval time.Duration, condition func() (bool, error)) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1705,7 +1705,7 @@ func (s *networkPriorityStudio) waitUntil(ctx context.Context, interval time.Dur
 	}
 }
 
-func (s *networkPriorityStudio) stopPeer(peer *studioPeer) error {
+func (s *folderPriorityStudio) stopPeer(peer *studioPeer) error {
 	if peer.process == nil {
 		return nil
 	}
@@ -1728,7 +1728,7 @@ func (s *networkPriorityStudio) stopPeer(peer *studioPeer) error {
 	return err
 }
 
-func (s *networkPriorityStudio) close() {
+func (s *folderPriorityStudio) close() {
 	if s.closed {
 		return
 	}
@@ -1768,7 +1768,7 @@ func (s *networkPriorityStudio) close() {
 		s.t.Errorf("write studio summary: %v", err)
 	}
 	userCPU, systemCPU, peakRSS := studioUsageTotals(report.PeerUsage)
-	s.t.Logf("Network Priority studio result: seed=%d sourceBytes=%d duration=%s completionOrder=%v fairness=%d/%d throughput=%.0fB/s rateLimit=%s inFlightLimit=%s configuredRate=%d/%dKiB/s configuredInFlight=%d/%dKiB cpu=%.2fu/%.2fs peakRSS=%dKiB restarts=%d errors=%d checksums=%s artifacts=%s",
+	s.t.Logf("Folder Priority studio result: seed=%d sourceBytes=%d duration=%s completionOrder=%v fairness=%d/%d throughput=%.0fB/s rateLimit=%s inFlightLimit=%s configuredRate=%d/%dKiB/s configuredInFlight=%d/%dKiB cpu=%.2fu/%.2fs peakRSS=%dKiB restarts=%d errors=%d checksums=%s artifacts=%s",
 		report.Seed, report.LogicalSourceBytes, time.Duration(report.DurationSeconds*float64(time.Second)), report.CompletionOrder,
 		report.NormalFairnessSpread, report.NormalFairnessLimit, float64(report.TransferredBytes)/max(report.DurationSeconds, 1),
 		report.RateLimitCompliance, report.InFlightLimitCompliance, s.profile.SendRateKiB, s.profile.ReceiveRateKiB,
@@ -1796,7 +1796,7 @@ func studioUsageTotals(peerUsage map[string][]studioProcessUsage) (float64, floa
 	return userCPU, systemCPU, peakRSS
 }
 
-func (s *networkPriorityStudio) must(err error, action string) {
+func (s *folderPriorityStudio) must(err error, action string) {
 	s.t.Helper()
 	if err != nil {
 		s.record(studioTimelineEntry{Kind: "failure", Detail: action + ": " + err.Error()})
@@ -1804,26 +1804,26 @@ func (s *networkPriorityStudio) must(err error, action string) {
 	}
 }
 
-func (s *networkPriorityStudio) setPhase(phase string) {
+func (s *folderPriorityStudio) setPhase(phase string) {
 	s.phaseMu.Lock()
 	s.phase = phase
 	s.phaseMu.Unlock()
 	s.record(studioTimelineEntry{Kind: "phase", Detail: phase})
 }
 
-func (s *networkPriorityStudio) currentPhase() string {
+func (s *folderPriorityStudio) currentPhase() string {
 	s.phaseMu.RLock()
 	defer s.phaseMu.RUnlock()
 	return s.phase
 }
 
-func (s *networkPriorityStudio) networkPriority(peer int, folder string) int {
-	s.networkPriorityMu.RLock()
-	defer s.networkPriorityMu.RUnlock()
-	return s.networkPriorities[peer][folder]
+func (s *folderPriorityStudio) folderPriority(peer int, folder string) int {
+	s.folderPriorityMu.RLock()
+	defer s.folderPriorityMu.RUnlock()
+	return s.folderPriorities[peer][folder]
 }
 
-func (s *networkPriorityStudio) record(entry studioTimelineEntry) {
+func (s *folderPriorityStudio) record(entry studioTimelineEntry) {
 	entry.At = time.Now().UTC()
 	entry.ElapsedMilliseconds = entry.At.Sub(s.started).Milliseconds()
 	entry.Seed = s.profile.Seed
@@ -1840,13 +1840,13 @@ func (s *networkPriorityStudio) record(entry studioTimelineEntry) {
 	}
 }
 
-func (s *networkPriorityStudio) observationError(err error) {
+func (s *folderPriorityStudio) observationError(err error) {
 	s.reportMu.Lock()
 	s.report.Errors++
 	s.reportMu.Unlock()
 }
 
-func (s *networkPriorityStudio) projectsByClass(class studioProjectClass) []studioProject {
+func (s *folderPriorityStudio) projectsByClass(class studioProjectClass) []studioProject {
 	result := make([]studioProject, 0)
 	for _, project := range s.projects {
 		if project.Class == class {
@@ -1856,7 +1856,7 @@ func (s *networkPriorityStudio) projectsByClass(class studioProjectClass) []stud
 	return result
 }
 
-func (s *networkPriorityStudio) folderPath(peer *studioPeer, folder string) string {
+func (s *folderPriorityStudio) folderPath(peer *studioPeer, folder string) string {
 	return filepath.Join(s.runDir, "projects", peer.name, folder)
 }
 

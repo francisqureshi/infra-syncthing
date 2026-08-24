@@ -14,7 +14,7 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-func TestNetworkPrioritySchedulerControlledLoad(t *testing.T) {
+func TestFolderPrioritySchedulerControlledLoad(t *testing.T) {
 	const (
 		transfersPerFolder = 256
 		smallBlock         = 1 << 20

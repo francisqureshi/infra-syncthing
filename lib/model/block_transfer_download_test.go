@@ -64,7 +64,7 @@ func TestModelRequestGlobalPrioritizesQueuedDownloadBlockTransfers(t *testing.T)
 	awaitOutgoingBlockTransferResult(t, lowResult)
 }
 
-func TestNetworkPriorityLiveReprioritizationThroughModelRequestGlobal(t *testing.T) {
+func TestFolderPriorityLiveReprioritizationThroughModelRequestGlobal(t *testing.T) {
 	const activeSize = protocol.MaxRequestSize
 	wrapper, _ := newBlockTransferRequestConfigWithLimits(t, map[string]int{
 		"active": 0,
@@ -104,7 +104,7 @@ func TestNetworkPriorityLiveReprioritizationThroughModelRequestGlobal(t *testing
 			return
 		}
 		found = true
-		folder.NetworkPriority = 100
+		folder.FolderPriority = 100
 		cfg.Folders[index] = folder
 	})
 	if err != nil {
@@ -149,7 +149,7 @@ func TestNetworkPriorityLiveReprioritizationThroughModelRequestGlobal(t *testing
 	awaitOutgoingBlockTransferResult(t, bulkResult)
 }
 
-func TestNetworkPriorityRateLimitIndependenceThroughModelRequestGlobal(t *testing.T) {
+func TestFolderPriorityRateLimitIndependenceThroughModelRequestGlobal(t *testing.T) {
 	m := newDownloadBlockTransferModel(t, map[string]int{
 		"high": 100,
 		"low":  0,
@@ -550,7 +550,7 @@ func TestModelRequestGlobalUsesRemainingCompatibleConnectionAfterConnectionClose
 	awaitOutgoingBlockTransferResult(t, queuedResult)
 }
 
-func TestDefaultNetworkPriorityLimitsConcurrentDownloads(t *testing.T) {
+func TestDefaultFolderPriorityLimitsConcurrentDownloads(t *testing.T) {
 	m := newDownloadBlockTransferModel(t, map[string]int{"folder": 0})
 	started := make(chan outgoingBlockTransferStart, 2)
 	addOutgoingBlockTransferConnection(m.model, device1, "connection", started)
@@ -730,7 +730,7 @@ func newDownloadBlockTransferModel(t *testing.T, priorities map[string]int) *tes
 	for folderID, priority := range priorities {
 		folder := cfg.Defaults.Folder.Copy()
 		folder.ID = folderID
-		folder.NetworkPriority = priority
+		folder.FolderPriority = priority
 		folder.Devices = []config.FolderDeviceConfiguration{{DeviceID: device1}, {DeviceID: device2}}
 		cfg.SetFolder(folder)
 	}

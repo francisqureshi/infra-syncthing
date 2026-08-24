@@ -38,7 +38,7 @@ func TestFolderWorkSchedulerKeepsMaintenanceInArrivalOrder(t *testing.T) {
 	close(highRelease)
 }
 
-func TestFolderWorkSchedulerUsesNetworkPriorityUniversally(t *testing.T) {
+func TestFolderWorkSchedulerUsesFolderPriorityUniversally(t *testing.T) {
 	scheduler := configuredFolderWorkScheduler(map[string]int{
 		"low":  -100,
 		"high": 100,
@@ -94,7 +94,7 @@ func TestFolderWorkSchedulerReprioritizesQueuedWork(t *testing.T) {
 	close(firstRelease)
 }
 
-func TestFolderWorkSchedulerMaintenanceDoesNotInvertNetworkPriority(t *testing.T) {
+func TestFolderWorkSchedulerMaintenanceDoesNotInvertFolderPriority(t *testing.T) {
 	scheduler := configuredFolderWorkScheduler(map[string]int{
 		"low":  -100,
 		"high": 100,

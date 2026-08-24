@@ -19,27 +19,27 @@ import (
 
 type schedulerStateModel struct {
 	*modelmocks.Model
-	state model.NetworkPrioritySchedulerState
+	state model.FolderPrioritySchedulerState
 }
 
-func (m *schedulerStateModel) NetworkPrioritySchedulerState(string) model.NetworkPrioritySchedulerState {
+func (m *schedulerStateModel) FolderPrioritySchedulerState(string) model.FolderPrioritySchedulerState {
 	return m.state
 }
 
-func TestFolderSummaryReportsNetworkPrioritySchedulerState(t *testing.T) {
+func TestFolderSummaryReportsFolderPrioritySchedulerState(t *testing.T) {
 	wrapper := config.Wrap(filepath.Join(t.TempDir(), "config.xml"), config.Configuration{
 		Folders: []config.FolderConfiguration{{ID: "alpha"}},
 	}, protocol.LocalDeviceID, events.NoopLogger)
 	provider := &schedulerStateModel{
 		Model: new(modelmocks.Model),
-		state: model.NetworkPrioritySchedulerState{
+		state: model.FolderPrioritySchedulerState{
 			Active: true,
-			Upload: model.NetworkPrioritySchedulerDirectionState{
+			Upload: model.FolderPrioritySchedulerDirectionState{
 				QueuedBytes:                 11,
 				ActiveBytes:                 12,
 				OldestSchedulingWaitSeconds: 13,
 			},
-			Download: model.NetworkPrioritySchedulerDirectionState{
+			Download: model.FolderPrioritySchedulerDirectionState{
 				QueuedBytes:                 21,
 				ActiveBytes:                 22,
 				OldestSchedulingWaitSeconds: 23,
@@ -52,10 +52,10 @@ func TestFolderSummaryReportsNetworkPrioritySchedulerState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.NetworkPrioritySchedulingActive {
-		t.Fatal("folder summary reports Network Priority scheduling inactive")
+	if !got.FolderPrioritySchedulingActive {
+		t.Fatal("folder summary reports Folder Priority scheduling inactive")
 	}
-	if got.NetworkPriorityScheduling != provider.state {
-		t.Fatalf("folder summary Network Priority scheduling = %#v, want %#v", got.NetworkPriorityScheduling, provider.state)
+	if got.FolderPriorityScheduling != provider.state {
+		t.Fatalf("folder summary Folder Priority scheduling = %#v, want %#v", got.FolderPriorityScheduling, provider.state)
 	}
 }

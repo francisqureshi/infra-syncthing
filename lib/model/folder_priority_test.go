@@ -22,13 +22,13 @@ import (
 	"github.com/syncthing/syncthing/lib/scanner"
 )
 
-func TestAutomaticPullsUseNetworkPriorityWithinFolderConcurrency(t *testing.T) {
-	m := newFolderNetworkPriorityModel(t, map[string]int{
+func TestAutomaticPullsUseFolderPriorityWithinFolderConcurrency(t *testing.T) {
+	m := newFolderFolderPriorityModel(t, map[string]int{
 		"active": 0,
 		"low":    -100,
 		"high":   100,
 	})
-	conn := addFolderNetworkPriorityConnection(t, m, device1, "active", "low", "high")
+	conn := addFolderFolderPriorityConnection(t, m, device1, "active", "low", "high")
 
 	started := make(chan folderPullStart, 3)
 	conn.RequestCalls(func(ctx context.Context, req *protocol.Request) ([]byte, error) {
@@ -49,7 +49,7 @@ func TestAutomaticPullsUseNetworkPriorityWithinFolderConcurrency(t *testing.T) {
 		}
 	})
 
-	sendFolderNetworkPriorityFile(t, m, conn, "active")
+	sendFolderFolderPriorityFile(t, m, conn, "active")
 	active := awaitFolderPullStart(t, started)
 	if active.folder != "active" {
 		t.Fatalf("first active pull is for folder %q, want active", active.folder)
@@ -57,9 +57,9 @@ func TestAutomaticPullsUseNetworkPriorityWithinFolderConcurrency(t *testing.T) {
 
 	// The active pull occupies the only folder-I/O slot, ensuring both queued
 	// folders are considered together when it completes.
-	sendFolderNetworkPriorityFile(t, m, conn, "low")
+	sendFolderFolderPriorityFile(t, m, conn, "low")
 	awaitFolderState(t, m, "low", FolderSyncWaiting)
-	sendFolderNetworkPriorityFile(t, m, conn, "high")
+	sendFolderFolderPriorityFile(t, m, conn, "high")
 	awaitFolderState(t, m, "high", FolderSyncWaiting)
 	assertNoFolderPullStarted(t, started)
 
@@ -80,13 +80,13 @@ func TestAutomaticPullsUseNetworkPriorityWithinFolderConcurrency(t *testing.T) {
 	close(low.release)
 }
 
-func TestPrerequisiteScansUseNetworkPriorityWithinFolderConcurrency(t *testing.T) {
-	m := newFolderNetworkPriorityModel(t, map[string]int{
+func TestPrerequisiteScansUseFolderPriorityWithinFolderConcurrency(t *testing.T) {
+	m := newFolderFolderPriorityModel(t, map[string]int{
 		"active": 0,
 		"low":    -100,
 		"high":   100,
 	})
-	conn := addFolderNetworkPriorityConnection(t, m, device1, "active", "low", "high")
+	conn := addFolderFolderPriorityConnection(t, m, device1, "active", "low", "high")
 	started := make(chan folderPullStart, 1)
 	conn.RequestCalls(func(ctx context.Context, req *protocol.Request) ([]byte, error) {
 		start := folderPullStart{folder: req.Folder, release: make(chan struct{})}
@@ -103,7 +103,7 @@ func TestPrerequisiteScansUseNetworkPriorityWithinFolderConcurrency(t *testing.T
 		}
 	})
 
-	sendFolderNetworkPriorityFile(t, m, conn, "active")
+	sendFolderFolderPriorityFile(t, m, conn, "active")
 	active := awaitFolderPullStart(t, started)
 
 	sub := m.evLogger.Subscribe(events.StateChanged)
@@ -127,15 +127,15 @@ func TestPrerequisiteScansUseNetworkPriorityWithinFolderConcurrency(t *testing.T
 }
 
 func TestExplicitScansKeepLegacyFolderConcurrencyOrder(t *testing.T) {
-	m := newFolderNetworkPriorityModel(t, map[string]int{
+	m := newFolderFolderPriorityModel(t, map[string]int{
 		"active": 0,
 		"low":    -100,
 		"high":   100,
 	})
-	conn := addFolderNetworkPriorityConnection(t, m, device1, "active", "low", "high")
+	conn := addFolderFolderPriorityConnection(t, m, device1, "active", "low", "high")
 	started := make(chan folderPullStart, 1)
 	observeFolderPullStarts(conn, started)
-	sendFolderNetworkPriorityFile(t, m, conn, "active")
+	sendFolderFolderPriorityFile(t, m, conn, "active")
 	active := awaitFolderPullStart(t, started)
 
 	sub := m.evLogger.Subscribe(events.StateChanged)
@@ -159,8 +159,8 @@ func TestExplicitScansKeepLegacyFolderConcurrencyOrder(t *testing.T) {
 	}
 }
 
-func TestUnavailablePullYieldsAndReentersNetworkPriorityOrdering(t *testing.T) {
-	m := newFolderNetworkPriorityModelForDevices(t, map[string]int{
+func TestUnavailablePullYieldsAndReentersFolderPriorityOrdering(t *testing.T) {
+	m := newFolderFolderPriorityModelForDevices(t, map[string]int{
 		"active": 0,
 		"low":    -50,
 		"lowest": -100,
@@ -172,15 +172,15 @@ func TestUnavailablePullYieldsAndReentersNetworkPriorityOrdering(t *testing.T) {
 		"high":   device2,
 	})
 	started := make(chan folderPullStart, 4)
-	lowConn := addFolderNetworkPriorityConnection(t, m, device1, "active", "low", "lowest")
+	lowConn := addFolderFolderPriorityConnection(t, m, device1, "active", "low", "lowest")
 	observeFolderPullStarts(lowConn, started)
 
-	sendFolderNetworkPriorityFile(t, m, lowConn, "active")
+	sendFolderFolderPriorityFile(t, m, lowConn, "active")
 	active := awaitFolderPullStart(t, started)
 
 	// The high-priority folder has needed source data in the index, but its
 	// only peer is not connected yet.
-	highFile := newFolderNetworkPriorityFile(t, "high", device2)
+	highFile := newFolderFolderPriorityFile(t, "high", device2)
 	if err := m.sdb.Update("high", device2, []protocol.FileInfo{highFile}); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestUnavailablePullYieldsAndReentersNetworkPriorityOrdering(t *testing.T) {
 	awaitFolderStateEvent(t, sub, "high", FolderSyncWaiting)
 	awaitFolderStateEvent(t, sub, "high", FolderIdle)
 
-	sendFolderNetworkPriorityFile(t, m, lowConn, "low")
+	sendFolderFolderPriorityFile(t, m, lowConn, "low")
 	awaitFolderState(t, m, "low", FolderSyncWaiting)
 	close(active.release)
 	low := awaitFolderPullStart(t, started)
@@ -205,13 +205,13 @@ func TestUnavailablePullYieldsAndReentersNetworkPriorityOrdering(t *testing.T) {
 
 	// A new connection makes the high-priority folder runnable while the low
 	// pull remains active. A lower-priority peer is queued at the same time.
-	highConn := addFolderNetworkPriorityConnection(t, m, device2, "high")
+	highConn := addFolderFolderPriorityConnection(t, m, device2, "high")
 	observeFolderPullStarts(highConn, started)
 	if err := m.IndexUpdate(highConn, &protocol.IndexUpdate{Folder: "high", Files: []protocol.FileInfo{highFile}}); err != nil {
 		t.Fatal(err)
 	}
 	awaitFolderState(t, m, "high", FolderSyncWaiting)
-	sendFolderNetworkPriorityFile(t, m, lowConn, "lowest")
+	sendFolderFolderPriorityFile(t, m, lowConn, "lowest")
 	awaitFolderState(t, m, "lowest", FolderSyncWaiting)
 
 	close(low.release)
@@ -230,12 +230,12 @@ func TestUnavailablePullYieldsAndReentersNetworkPriorityOrdering(t *testing.T) {
 }
 
 func TestPullRetryBackoffYieldsToRunnableWork(t *testing.T) {
-	m := newFolderNetworkPriorityModel(t, map[string]int{
+	m := newFolderFolderPriorityModel(t, map[string]int{
 		"active": 0,
 		"low":    -100,
 		"high":   100,
 	})
-	conn := addFolderNetworkPriorityConnection(t, m, device1, "active", "low", "high")
+	conn := addFolderFolderPriorityConnection(t, m, device1, "active", "low", "high")
 	started := make(chan folderPullStart, 2)
 	var highAttempts atomic.Int32
 	conn.RequestCalls(func(ctx context.Context, req *protocol.Request) ([]byte, error) {
@@ -257,14 +257,14 @@ func TestPullRetryBackoffYieldsToRunnableWork(t *testing.T) {
 		}
 	})
 
-	sendFolderNetworkPriorityFile(t, m, conn, "high")
+	sendFolderFolderPriorityFile(t, m, conn, "high")
 	awaitAtomicValue(t, &highAttempts, 1)
 	awaitFolderState(t, m, "high", FolderIdle)
 	if attempts := highAttempts.Load(); attempts != 1 {
 		t.Fatalf("initial high-priority pull attempts = %d, want 1", attempts)
 	}
 
-	sendFolderNetworkPriorityFile(t, m, conn, "active")
+	sendFolderFolderPriorityFile(t, m, conn, "active")
 	active := awaitFolderPullStart(t, started)
 	highRunner, ok := m.folderRunners.Get("high")
 	if !ok {
@@ -280,7 +280,7 @@ func TestPullRetryBackoffYieldsToRunnableWork(t *testing.T) {
 		t.Fatalf("high-priority pull retried during backoff; attempts = %d, want 1", attempts)
 	}
 
-	sendFolderNetworkPriorityFile(t, m, conn, "low")
+	sendFolderFolderPriorityFile(t, m, conn, "low")
 	awaitFolderState(t, m, "low", FolderSyncWaiting)
 	close(active.release)
 	low := awaitFolderPullStart(t, started)
@@ -291,25 +291,25 @@ func TestPullRetryBackoffYieldsToRunnableWork(t *testing.T) {
 	close(low.release)
 }
 
-func TestFilePriorityRemainsFolderLocalAfterNetworkPriorityAdmission(t *testing.T) {
-	m := newFolderNetworkPriorityModelWithOrders(t, map[string]int{
+func TestFilePriorityRemainsFolderLocalAfterFolderPriorityAdmission(t *testing.T) {
+	m := newFolderFolderPriorityModelWithOrders(t, map[string]int{
 		"active": 0,
 		"low":    -100,
 		"high":   100,
 	}, map[string]config.PullOrder{
 		"high": config.PullOrderNewestFirst,
 	})
-	conn := addFolderNetworkPriorityConnection(t, m, device1, "active", "low", "high")
+	conn := addFolderFolderPriorityConnection(t, m, device1, "active", "low", "high")
 	started := make(chan folderPullStart, 4)
 	observeFolderPullStarts(conn, started)
 
-	sendFolderNetworkPriorityFile(t, m, conn, "active")
+	sendFolderFolderPriorityFile(t, m, conn, "active")
 	active := awaitFolderPullStart(t, started)
-	sendFolderNetworkPriorityFile(t, m, conn, "low")
+	sendFolderFolderPriorityFile(t, m, conn, "low")
 	awaitFolderState(t, m, "low", FolderSyncWaiting)
 
-	old := newNamedFolderNetworkPriorityFile(t, "high", "old.txt", device1, time.Now().Add(-time.Hour))
-	newer := newNamedFolderNetworkPriorityFile(t, "high", "new.txt", device1, time.Now())
+	old := newNamedFolderFolderPriorityFile(t, "high", "old.txt", device1, time.Now().Add(-time.Hour))
+	newer := newNamedFolderFolderPriorityFile(t, "high", "new.txt", device1, time.Now())
 	if err := m.IndexUpdate(conn, &protocol.IndexUpdate{Folder: "high", Files: []protocol.FileInfo{old, newer}}); err != nil {
 		t.Fatal(err)
 	}
@@ -368,26 +368,26 @@ type folderPullStart struct {
 	release chan struct{}
 }
 
-func newFolderNetworkPriorityModel(t *testing.T, priorities map[string]int) *testModel {
+func newFolderFolderPriorityModel(t *testing.T, priorities map[string]int) *testModel {
 	t.Helper()
-	return newFolderNetworkPriorityModelWithOrders(t, priorities, nil)
+	return newFolderFolderPriorityModelWithOrders(t, priorities, nil)
 }
 
-func newFolderNetworkPriorityModelWithOrders(t *testing.T, priorities map[string]int, orders map[string]config.PullOrder) *testModel {
+func newFolderFolderPriorityModelWithOrders(t *testing.T, priorities map[string]int, orders map[string]config.PullOrder) *testModel {
 	t.Helper()
 	devices := make(map[string]protocol.DeviceID, len(priorities))
 	for folder := range priorities {
 		devices[folder] = device1
 	}
-	return newFolderNetworkPriorityModelWithConfiguration(t, priorities, devices, orders)
+	return newFolderFolderPriorityModelWithConfiguration(t, priorities, devices, orders)
 }
 
-func newFolderNetworkPriorityModelForDevices(t *testing.T, priorities map[string]int, devices map[string]protocol.DeviceID) *testModel {
+func newFolderFolderPriorityModelForDevices(t *testing.T, priorities map[string]int, devices map[string]protocol.DeviceID) *testModel {
 	t.Helper()
-	return newFolderNetworkPriorityModelWithConfiguration(t, priorities, devices, nil)
+	return newFolderFolderPriorityModelWithConfiguration(t, priorities, devices, nil)
 }
 
-func newFolderNetworkPriorityModelWithConfiguration(t *testing.T, priorities map[string]int, devices map[string]protocol.DeviceID, orders map[string]config.PullOrder) *testModel {
+func newFolderFolderPriorityModelWithConfiguration(t *testing.T, priorities map[string]int, devices map[string]protocol.DeviceID, orders map[string]config.PullOrder) *testModel {
 	t.Helper()
 	cfg := config.New(myID)
 	cfg.Options.MinHomeDiskFree.Value = 0
@@ -409,7 +409,7 @@ func newFolderNetworkPriorityModelWithConfiguration(t *testing.T, priorities map
 		folder.Path = rand.String(32) + "?content=true"
 		folder.FilesystemType = config.FilesystemTypeFake
 		folder.Devices = []config.FolderDeviceConfiguration{{DeviceID: devices[folderID]}}
-		folder.NetworkPriority = priority
+		folder.FolderPriority = priority
 		folder.Order = orders[folderID]
 		folder.FSWatcherEnabled = false
 		folder.RescanIntervalS = 0
@@ -424,7 +424,7 @@ func newFolderNetworkPriorityModelWithConfiguration(t *testing.T, priorities map
 	return m
 }
 
-func addFolderNetworkPriorityConnection(t *testing.T, m *testModel, device protocol.DeviceID, folders ...string) *fakeConnection {
+func addFolderFolderPriorityConnection(t *testing.T, m *testModel, device protocol.DeviceID, folders ...string) *fakeConnection {
 	t.Helper()
 	conn := newFakeConnection(device, m)
 	m.AddConnection(conn, protocol.Hello{})
@@ -444,20 +444,20 @@ func addFolderNetworkPriorityConnection(t *testing.T, m *testModel, device proto
 	return conn
 }
 
-func sendFolderNetworkPriorityFile(t *testing.T, m *testModel, conn *fakeConnection, folder string) {
+func sendFolderFolderPriorityFile(t *testing.T, m *testModel, conn *fakeConnection, folder string) {
 	t.Helper()
-	file := newFolderNetworkPriorityFile(t, folder, conn.id)
+	file := newFolderFolderPriorityFile(t, folder, conn.id)
 	if err := m.IndexUpdate(conn, &protocol.IndexUpdate{Folder: folder, Files: []protocol.FileInfo{file}}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func newFolderNetworkPriorityFile(t *testing.T, folder string, device protocol.DeviceID) protocol.FileInfo {
+func newFolderFolderPriorityFile(t *testing.T, folder string, device protocol.DeviceID) protocol.FileInfo {
 	t.Helper()
-	return newNamedFolderNetworkPriorityFile(t, folder, folder+".txt", device, time.Now())
+	return newNamedFolderFolderPriorityFile(t, folder, folder+".txt", device, time.Now())
 }
 
-func newNamedFolderNetworkPriorityFile(t *testing.T, folder, name string, device protocol.DeviceID, modified time.Time) protocol.FileInfo {
+func newNamedFolderFolderPriorityFile(t *testing.T, folder, name string, device protocol.DeviceID, modified time.Time) protocol.FileInfo {
 	t.Helper()
 	data := bytes.Repeat([]byte(folder), 128)
 	blockSize := protocol.BlockSize(int64(len(data)))

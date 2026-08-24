@@ -12,9 +12,9 @@ import (
 	"github.com/syncthing/syncthing/lib/config"
 )
 
-type networkPriorityMetricsCollector struct {
+type folderPriorityMetricsCollector struct {
 	cfg      config.Wrapper
-	provider NetworkPrioritySchedulerStateProvider
+	provider FolderPrioritySchedulerStateProvider
 
 	activeDesc      *prometheus.Desc
 	queuedDesc      *prometheus.Desc
@@ -22,31 +22,31 @@ type networkPriorityMetricsCollector struct {
 	waitDesc        *prometheus.Desc
 }
 
-func newNetworkPriorityMetricsCollector(cfg config.Wrapper, provider NetworkPrioritySchedulerStateProvider) *networkPriorityMetricsCollector {
+func newFolderPriorityMetricsCollector(cfg config.Wrapper, provider FolderPrioritySchedulerStateProvider) *folderPriorityMetricsCollector {
 	labels := []string{"folder", "direction"}
-	return &networkPriorityMetricsCollector{
+	return &folderPriorityMetricsCollector{
 		cfg:      cfg,
 		provider: provider,
 		activeDesc: prometheus.NewDesc(
-			"syncthing_model_network_priority_scheduler_active",
-			"Whether Network Priority scheduling is active by folder and direction.",
+			"syncthing_model_folder_priority_scheduler_active",
+			"Whether Folder Priority scheduling is active by folder and direction.",
 			labels,
 			nil,
 		),
 		queuedDesc: prometheus.NewDesc(
-			"syncthing_model_network_priority_queued_bytes",
+			"syncthing_model_folder_priority_queued_bytes",
 			"Current queued Block Transfer bytes by folder and direction.",
 			labels,
 			nil,
 		),
 		activeBytesDesc: prometheus.NewDesc(
-			"syncthing_model_network_priority_active_bytes",
+			"syncthing_model_folder_priority_active_bytes",
 			"Current active Block Transfer bytes by folder and direction.",
 			labels,
 			nil,
 		),
 		waitDesc: prometheus.NewDesc(
-			"syncthing_model_network_priority_oldest_scheduling_wait_seconds",
+			"syncthing_model_folder_priority_oldest_scheduling_wait_seconds",
 			"Current oldest Scheduling Wait in seconds among queued Block Transfers by folder and direction.",
 			labels,
 			nil,
@@ -54,33 +54,33 @@ func newNetworkPriorityMetricsCollector(cfg config.Wrapper, provider NetworkPrio
 	}
 }
 
-// RegisterNetworkPriorityMetrics registers live Network Priority scheduler
+// RegisterFolderPriorityMetrics registers live Folder Priority scheduler
 // metrics for the process model.
-func RegisterNetworkPriorityMetrics(cfg config.Wrapper, m Model) {
-	provider, ok := m.(NetworkPrioritySchedulerStateProvider)
+func RegisterFolderPriorityMetrics(cfg config.Wrapper, m Model) {
+	provider, ok := m.(FolderPrioritySchedulerStateProvider)
 	if !ok {
 		return
 	}
-	prometheus.DefaultRegisterer.MustRegister(newNetworkPriorityMetricsCollector(cfg, provider))
+	prometheus.DefaultRegisterer.MustRegister(newFolderPriorityMetricsCollector(cfg, provider))
 }
 
-func (c *networkPriorityMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
+func (c *folderPriorityMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.activeDesc
 	ch <- c.queuedDesc
 	ch <- c.activeBytesDesc
 	ch <- c.waitDesc
 }
 
-func (c *networkPriorityMetricsCollector) Collect(ch chan<- prometheus.Metric) {
+func (c *folderPriorityMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, folder := range c.cfg.FolderList() {
-		state := c.provider.NetworkPrioritySchedulerState(folder.ID)
+		state := c.provider.FolderPrioritySchedulerState(folder.ID)
 		active := 0.0
 		if state.Active {
 			active = 1
 		}
 		for _, direction := range []struct {
 			name  string
-			state NetworkPrioritySchedulerDirectionState
+			state FolderPrioritySchedulerDirectionState
 		}{
 			{name: "upload", state: state.Upload},
 			{name: "download", state: state.Download},

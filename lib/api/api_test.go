@@ -1820,7 +1820,7 @@ func TestConfigChanges(t *testing.T) {
 	}
 }
 
-func TestNetworkPriorityConfigAPI(t *testing.T) {
+func TestFolderPriorityConfigAPI(t *testing.T) {
 	t.Parallel()
 
 	const testAPIKey = "foobarbaz"
@@ -1887,7 +1887,7 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 		Path:            "priority",
 		Label:           "preserve me",
 		RescanIntervalS: 1234,
-		NetworkPriority: config.NetworkPriorityMin,
+		FolderPriority:  config.FolderPriorityMin,
 	}}, http.StatusOK)
 	resp.Body.Close()
 
@@ -1898,8 +1898,8 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if len(folders) != 1 || folders[0].NetworkPriority != config.NetworkPriorityMin {
-		t.Fatalf("folder list did not round-trip minimum Network Priority: %#v", folders)
+	if len(folders) != 1 || folders[0].FolderPriority != config.FolderPriorityMin {
+		t.Fatalf("folder list did not round-trip minimum Folder Priority: %#v", folders)
 	}
 
 	resp = doConfigRequest(http.MethodPut, folderPath, config.FolderConfiguration{
@@ -1907,18 +1907,18 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 		Path:            "priority",
 		Label:           "preserve me",
 		RescanIntervalS: 1234,
-		NetworkPriority: config.NetworkPriorityMax,
+		FolderPriority:  config.FolderPriorityMax,
 	}, http.StatusOK)
 	resp.Body.Close()
-	if priority := getFolder(folderPath).NetworkPriority; priority != config.NetworkPriorityMax {
-		t.Fatalf("PUT Network Priority is %d, expected %d", priority, config.NetworkPriorityMax)
+	if priority := getFolder(folderPath).FolderPriority; priority != config.FolderPriorityMax {
+		t.Fatalf("PUT Folder Priority is %d, expected %d", priority, config.FolderPriorityMax)
 	}
 
-	resp = doConfigRequest(http.MethodPatch, folderPath, map[string]int{"networkPriority": 50}, http.StatusOK)
+	resp = doConfigRequest(http.MethodPatch, folderPath, map[string]int{"folderPriority": 50}, http.StatusOK)
 	resp.Body.Close()
 	folder := getFolder(folderPath)
-	if folder.NetworkPriority != 50 {
-		t.Fatalf("PATCH Network Priority is %d, expected 50", folder.NetworkPriority)
+	if folder.FolderPriority != 50 {
+		t.Fatalf("PATCH Folder Priority is %d, expected 50", folder.FolderPriority)
 	}
 	if folder.Label != "preserve me" || folder.RescanIntervalS != 1234 {
 		t.Fatalf("partial PATCH reset unrelated folder fields: %#v", folder)
@@ -1928,10 +1928,10 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp = doConfigRequest(http.MethodPatch, folderPath, map[string]int{"networkPriority": config.NetworkPriorityMax + 1}, http.StatusInternalServerError)
+	resp = doConfigRequest(http.MethodPatch, folderPath, map[string]int{"folderPriority": config.FolderPriorityMax + 1}, http.StatusInternalServerError)
 	resp.Body.Close()
-	if priority := getFolder(folderPath).NetworkPriority; priority != 50 {
-		t.Fatalf("invalid PATCH changed Network Priority to %d", priority)
+	if priority := getFolder(folderPath).FolderPriority; priority != 50 {
+		t.Fatalf("invalid PATCH changed Folder Priority to %d", priority)
 	}
 	afterInvalid, err := os.ReadFile(configPath)
 	if err != nil {
@@ -1942,26 +1942,26 @@ func TestNetworkPriorityConfigAPI(t *testing.T) {
 	}
 
 	defaultFolderPath := "/rest/config/defaults/folder"
-	resp = doConfigRequest(http.MethodPut, defaultFolderPath, map[string]int{"networkPriority": config.NetworkPriorityMin}, http.StatusOK)
+	resp = doConfigRequest(http.MethodPut, defaultFolderPath, map[string]int{"folderPriority": config.FolderPriorityMin}, http.StatusOK)
 	resp.Body.Close()
-	if priority := getFolder(defaultFolderPath).NetworkPriority; priority != config.NetworkPriorityMin {
-		t.Fatalf("default folder PUT Network Priority is %d, expected %d", priority, config.NetworkPriorityMin)
+	if priority := getFolder(defaultFolderPath).FolderPriority; priority != config.FolderPriorityMin {
+		t.Fatalf("default folder PUT Folder Priority is %d, expected %d", priority, config.FolderPriorityMin)
 	}
-	resp = doConfigRequest(http.MethodPatch, defaultFolderPath, map[string]int{"networkPriority": config.NetworkPriorityMax}, http.StatusOK)
+	resp = doConfigRequest(http.MethodPatch, defaultFolderPath, map[string]int{"folderPriority": config.FolderPriorityMax}, http.StatusOK)
 	resp.Body.Close()
-	if priority := getFolder(defaultFolderPath).NetworkPriority; priority != config.NetworkPriorityMax {
-		t.Fatalf("default folder PATCH Network Priority is %d, expected %d", priority, config.NetworkPriorityMax)
+	if priority := getFolder(defaultFolderPath).FolderPriority; priority != config.FolderPriorityMax {
+		t.Fatalf("default folder PATCH Folder Priority is %d, expected %d", priority, config.FolderPriorityMax)
 	}
 }
 
-func TestNetworkPrioritySchedulerStatus(t *testing.T) {
-	wantScheduling := model.NetworkPrioritySchedulerState{
-		Upload: model.NetworkPrioritySchedulerDirectionState{
+func TestFolderPrioritySchedulerStatus(t *testing.T) {
+	wantScheduling := model.FolderPrioritySchedulerState{
+		Upload: model.FolderPrioritySchedulerDirectionState{
 			QueuedBytes:                 11,
 			ActiveBytes:                 12,
 			OldestSchedulingWaitSeconds: 13,
 		},
-		Download: model.NetworkPrioritySchedulerDirectionState{
+		Download: model.FolderPrioritySchedulerDirectionState{
 			QueuedBytes:                 21,
 			ActiveBytes:                 22,
 			OldestSchedulingWaitSeconds: 23,
@@ -1972,7 +1972,7 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 		featureFlags []string
 	}{
 		{name: "default configuration"},
-		{name: "upgraded feature flagged configuration", featureFlags: []string{"networkPriority"}},
+		{name: "configuration with an unrelated feature flag", featureFlags: []string{"unrelated"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1988,8 +1988,8 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 			wrapper := config.Wrap(filepath.Join(t.TempDir(), "config.xml"), cfg, protocol.LocalDeviceID, events.NoopLogger)
 			summary := &modelmocks.FolderSummaryService{}
 			summary.SummaryReturns(&model.FolderSummary{
-				NetworkPrioritySchedulingActive: true,
-				NetworkPriorityScheduling:       wantScheduling,
+				FolderPrioritySchedulingActive: true,
+				FolderPriorityScheduling:       wantScheduling,
 			}, nil)
 			baseURL := startHTTPWithSummary(t, wrapper, summary)
 
@@ -2008,29 +2008,29 @@ func TestNetworkPrioritySchedulerStatus(t *testing.T) {
 			}
 
 			var status struct {
-				NetworkPrioritySchedulingActive *bool                                `json:"networkPrioritySchedulingActive"`
-				NetworkPriorityScheduling       *model.NetworkPrioritySchedulerState `json:"networkPriorityScheduling"`
+				FolderPrioritySchedulingActive *bool                               `json:"folderPrioritySchedulingActive"`
+				FolderPriorityScheduling       *model.FolderPrioritySchedulerState `json:"folderPriorityScheduling"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
 				t.Fatal(err)
 			}
-			if status.NetworkPrioritySchedulingActive == nil {
-				t.Fatal("REST status does not explicitly report Network Priority scheduler state")
+			if status.FolderPrioritySchedulingActive == nil {
+				t.Fatal("REST status does not explicitly report Folder Priority scheduler state")
 			}
-			if !*status.NetworkPrioritySchedulingActive {
-				t.Fatal("Network Priority scheduler is inactive")
+			if !*status.FolderPrioritySchedulingActive {
+				t.Fatal("Folder Priority scheduler is inactive")
 			}
-			if status.NetworkPriorityScheduling == nil {
-				t.Fatal("REST status does not expose per-direction Network Priority scheduler state")
+			if status.FolderPriorityScheduling == nil {
+				t.Fatal("REST status does not expose per-direction Folder Priority scheduler state")
 			}
-			if *status.NetworkPriorityScheduling != wantScheduling {
-				t.Fatalf("REST Network Priority scheduling = %#v, want %#v", *status.NetworkPriorityScheduling, wantScheduling)
+			if *status.FolderPriorityScheduling != wantScheduling {
+				t.Fatalf("REST Folder Priority scheduling = %#v, want %#v", *status.FolderPriorityScheduling, wantScheduling)
 			}
 		})
 	}
 }
 
-func TestNetworkPriorityEditor(t *testing.T) {
+func TestFolderPriorityEditor(t *testing.T) {
 	cfg := newMockedConfig()
 	cfg.GUIReturns(config.GUIConfiguration{
 		RawAddress: "127.0.0.1:0",
@@ -2076,10 +2076,10 @@ func TestNetworkPriorityEditor(t *testing.T) {
 			for _, attr := range node.Attr {
 				attributes[attr.Key] = attr.Val
 			}
-			if node.Data == "input" && attributes["name"] == "networkPriority" {
+			if node.Data == "input" && attributes["name"] == "folderPriority" {
 				priorityInput = node
 			}
-			if node.Data == "button" && strings.HasPrefix(attributes["ng-click"], "currentFolder.networkPriority = ") {
+			if node.Data == "button" && strings.HasPrefix(attributes["ng-click"], "currentFolder.folderPriority = ") {
 				presets[attributes["ng-click"]] = strings.TrimSpace(nodeText(node))
 			}
 		}
@@ -2090,7 +2090,7 @@ func TestNetworkPriorityEditor(t *testing.T) {
 	walk(doc)
 
 	if priorityInput == nil {
-		t.Fatal("advanced folder editor has no Network Priority input")
+		t.Fatal("advanced folder editor has no Folder Priority input")
 	}
 	attributes := make(map[string]string, len(priorityInput.Attr))
 	for _, attr := range priorityInput.Attr {
@@ -2098,28 +2098,28 @@ func TestNetworkPriorityEditor(t *testing.T) {
 	}
 	for name, want := range map[string]string{
 		"type":       "number",
-		"ng-model":   "currentFolder.networkPriority",
+		"ng-model":   "currentFolder.folderPriority",
 		"min":        "-100",
 		"max":        "100",
 		"step":       "1",
 		"ng-pattern": "/^-?\\d+$/",
 	} {
 		if got := attributes[name]; got != want {
-			t.Errorf("Network Priority input %s attribute is %q, expected %q", name, got, want)
+			t.Errorf("Folder Priority input %s attribute is %q, expected %q", name, got, want)
 		}
 	}
 	if _, ok := attributes["required"]; !ok {
-		t.Error("Network Priority input is not required")
+		t.Error("Folder Priority input is not required")
 	}
 
 	for action, label := range map[string]string{
-		"currentFolder.networkPriority = -50": "Low (-50)",
-		"currentFolder.networkPriority = 0":   "Normal (0)",
-		"currentFolder.networkPriority = 50":  "High (50)",
-		"currentFolder.networkPriority = 100": "Critical (100)",
+		"currentFolder.folderPriority = -50": "Low (-50)",
+		"currentFolder.folderPriority = 0":   "Normal (0)",
+		"currentFolder.folderPriority = 50":  "High (50)",
+		"currentFolder.folderPriority = 100": "Critical (100)",
 	} {
 		if got := presets[action]; got != label {
-			t.Errorf("Network Priority preset %q has label %q, expected %q", action, got, label)
+			t.Errorf("Folder Priority preset %q has label %q, expected %q", action, got, label)
 		}
 	}
 }

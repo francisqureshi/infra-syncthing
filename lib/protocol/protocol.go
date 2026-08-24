@@ -96,16 +96,16 @@ type Model interface {
 	DownloadProgress(conn Connection, p *DownloadProgress) error
 }
 
-// NetworkPriorityProvider supplies device-local scheduling policy to a
+// FolderPriorityProvider supplies device-local scheduling policy to a
 // connection. Protocol users without a provider use the universal scheduler
 // with the default priority of zero.
-type NetworkPriorityProvider interface {
-	NetworkPriority(folder string) NetworkPriorityPolicy
+type FolderPriorityProvider interface {
+	FolderPriority(folder string) FolderPriorityPolicy
 }
 
-// NetworkPriorityPolicy describes the current output scheduling policy for a
+// FolderPriorityPolicy describes the current output scheduling policy for a
 // folder.
-type NetworkPriorityPolicy struct {
+type FolderPriorityPolicy struct {
 	Priority int
 }
 
@@ -217,13 +217,13 @@ type rawConnection struct {
 
 	loopWG sync.WaitGroup // Need to ensure no leftover routines in testing
 
-	networkPriority func(string) NetworkPriorityPolicy
-	outputMut       sync.Mutex
-	outputQueue     []*queuedOutput
-	outputWake      chan struct{}
-	outputSequence  uint64
-	outputTurns     map[int]outputTurn
-	outputActive    map[int]int
+	folderPriority func(string) FolderPriorityPolicy
+	outputMut      sync.Mutex
+	outputQueue    []*queuedOutput
+	outputWake     chan struct{}
+	outputSequence uint64
+	outputTurns    map[int]outputTurn
+	outputActive   map[int]int
 }
 
 type asyncResult struct {
@@ -288,11 +288,11 @@ func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer
 
 	// We do the wire format conversion first (outermost) so that the
 	// metadata is in wire format when it reaches the encryption step.
-	var networkPriority func(string) NetworkPriorityPolicy
-	if provider, ok := model.(NetworkPriorityProvider); ok {
-		networkPriority = provider.NetworkPriority
+	var folderPriority func(string) FolderPriorityPolicy
+	if provider, ok := model.(FolderPriorityProvider); ok {
+		folderPriority = provider.FolderPriority
 	}
-	rc := newRawConnection(deviceID, reader, writer, closer, em, connInfo, compress, networkPriority)
+	rc := newRawConnection(deviceID, reader, writer, closer, em, connInfo, compress, folderPriority)
 	ec := newEncryptedConnection(rc, rc, em.folderKeys, keyGen)
 	wc := wireFormatConnection{ec}
 
@@ -300,7 +300,7 @@ func NewConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer
 	return wc
 }
 
-func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, receiver rawModel, connInfo ConnectionInfo, compress Compression, networkPriority func(string) NetworkPriorityPolicy) *rawConnection {
+func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, closer io.Closer, receiver rawModel, connInfo ConnectionInfo, compress Compression, folderPriority func(string) FolderPriorityPolicy) *rawConnection {
 	idString := deviceID.String()
 	cr := &countingReader{Reader: reader, idString: idString}
 	cw := &countingWriter{Writer: writer, idString: idString}
@@ -322,7 +322,7 @@ func newRawConnection(deviceID DeviceID, reader io.Reader, writer io.Writer, clo
 		closed:                make(chan struct{}),
 		compression:           compress,
 		loopWG:                sync.WaitGroup{},
-		networkPriority:       networkPriority,
+		folderPriority:        folderPriority,
 		outputWake:            make(chan struct{}, 1),
 		outputTurns:           make(map[int]outputTurn),
 		outputActive:          make(map[int]int),
@@ -803,9 +803,9 @@ func (c *rawConnection) sendFolder(ctx context.Context, msg proto.Message, done 
 }
 
 func (c *rawConnection) queueOutput(msg proto.Message, done chan struct{}, folder string, class outputClass) *queuedOutput {
-	policy := NetworkPriorityPolicy{}
-	if c.networkPriority != nil {
-		policy = c.networkPriority(folder)
+	policy := FolderPriorityPolicy{}
+	if c.folderPriority != nil {
+		policy = c.folderPriority(folder)
 	}
 	output := &queuedOutput{
 		asyncMessage: asyncMessage{msg: msg, done: done},
@@ -973,7 +973,7 @@ func (c *rawConnection) selectOutputLocked(initialClusterConfigOnly bool) int {
 }
 
 func (c *rawConnection) refreshOutputPoliciesLocked() {
-	if c.networkPriority == nil {
+	if c.folderPriority == nil {
 		return
 	}
 	affectedPriorities := make(map[int]struct{})
@@ -981,7 +981,7 @@ func (c *rawConnection) refreshOutputPoliciesLocked() {
 		if output.participatesInMetadataTurns() {
 			affectedPriorities[output.priority] = struct{}{}
 		}
-		policy := c.networkPriority(output.folder)
+		policy := c.folderPriority(output.folder)
 		output.priority = policy.Priority
 		if output.participatesInMetadataTurns() {
 			affectedPriorities[output.priority] = struct{}{}
