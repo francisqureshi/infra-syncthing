@@ -146,7 +146,6 @@ func TestSourceHashCoordinatorUsesSpareCapacityAroundFolderCeiling(t *testing.T)
 func TestSourceHashCoordinatorSharesUnequalQuantaByActualBytes(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
 	started := make(chan string, 8)
-	gateRelease := make(chan struct{})
 	aFirst := make(chan struct{})
 	aSecond := make(chan struct{})
 	bFirst := make(chan struct{})
@@ -154,12 +153,7 @@ func TestSourceHashCoordinatorSharesUnequalQuantaByActualBytes(t *testing.T) {
 	bThird := make(chan struct{})
 	bFourth := make(chan struct{})
 
-	gateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate", gateRelease, 1),
-	)).Completion
-	if got := awaitCoordinatorStart(t, started); got != "gate" {
-		t.Fatalf("gate admission = %q, want gate", got)
-	}
+	releaseGate := occupyCoordinatorSlot(t, coordinator, started, "gate")
 
 	aResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
 		&controlledCoordinatorWork{
@@ -182,10 +176,7 @@ func TestSourceHashCoordinatorSharesUnequalQuantaByActualBytes(t *testing.T) {
 		},
 	)).Completion
 
-	close(gateRelease)
-	if completed := awaitCoordinatorResult(t, gateResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseGate()
 	if got := awaitCoordinatorStart(t, started); got != "a-1" {
 		t.Fatalf("first equal-priority admission = %q, want a-1", got)
 	}
@@ -223,25 +214,12 @@ func TestSourceHashCoordinatorSharesUnequalQuantaByActualBytes(t *testing.T) {
 func TestSourceHashCoordinatorIncludesActiveBytesInEqualPriorityShare(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(2)
 	started := make(chan string, 8)
-	gateFirst := make(chan struct{})
-	gateSecond := make(chan struct{})
 	aFirst := make(chan struct{})
 	aSecond := make(chan struct{})
 	bOnly := make(chan struct{})
 
-	gateFirstResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate-1", gateFirst, 1),
-	)).Completion
-	gateSecondResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate-2", gateSecond, 1),
-	)).Completion
-	gateAdmissions := map[string]bool{
-		awaitCoordinatorStart(t, started): true,
-		awaitCoordinatorStart(t, started): true,
-	}
-	if !gateAdmissions["gate-1"] || !gateAdmissions["gate-2"] {
-		t.Fatalf("gate admissions = %v, want gate-1 and gate-2", gateAdmissions)
-	}
+	releaseFirstGate := occupyCoordinatorSlot(t, coordinator, started, "gate-1")
+	releaseSecondGate := occupyCoordinatorSlot(t, coordinator, started, "gate-2")
 
 	aFirstResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
 		newSingleQuantumCoordinatorWork(started, "a-1", aFirst, 8),
@@ -253,18 +231,12 @@ func TestSourceHashCoordinatorIncludesActiveBytesInEqualPriorityShare(t *testing
 		newSingleQuantumCoordinatorWork(started, "b-1", bOnly, 3),
 	)).Completion
 
-	close(gateFirst)
-	if completed := awaitCoordinatorResult(t, gateFirstResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseFirstGate()
 	if got := awaitCoordinatorStart(t, started); got != "a-1" {
 		t.Fatalf("first equal-priority admission = %q, want a-1", got)
 	}
 
-	close(gateSecond)
-	if completed := awaitCoordinatorResult(t, gateSecondResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseSecondGate()
 	if got := awaitCoordinatorStart(t, started); got != "b-1" {
 		t.Fatalf("admission while A had 8 active bytes = %q, want b-1", got)
 	}
@@ -291,18 +263,12 @@ func TestSourceHashCoordinatorIncludesActiveBytesInEqualPriorityShare(t *testing
 func TestSourceHashCoordinatorResetsFairnessOnlyAfterEpochDrain(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
 	started := make(chan string, 10)
-	gateRelease := make(chan struct{})
 	aFirst := make(chan struct{})
 	aSecond := make(chan struct{})
 	bFirst := make(chan struct{})
 	bSecond := make(chan struct{})
 
-	gateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate-1", gateRelease, 1),
-	)).Completion
-	if got := awaitCoordinatorStart(t, started); got != "gate-1" {
-		t.Fatalf("gate admission = %q, want gate-1", got)
-	}
+	releaseGate := occupyCoordinatorSlot(t, coordinator, started, "gate-1")
 
 	aEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "a", Priority: 0})
 	bEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "b", Priority: 0})
@@ -319,10 +285,7 @@ func TestSourceHashCoordinatorResetsFairnessOnlyAfterEpochDrain(t *testing.T) {
 		},
 	)).Completion
 
-	close(gateRelease)
-	if completed := awaitCoordinatorResult(t, gateResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseGate()
 	if got := awaitCoordinatorStart(t, started); got != "a-1" {
 		t.Fatalf("first epoch admission = %q, want a-1", got)
 	}
@@ -355,13 +318,7 @@ func TestSourceHashCoordinatorResetsFairnessOnlyAfterEpochDrain(t *testing.T) {
 	aEpoch.Close()
 	bEpoch.Close()
 
-	secondGateRelease := make(chan struct{})
-	secondGateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate-2", secondGateRelease, 1),
-	)).Completion
-	if got := awaitCoordinatorStart(t, started); got != "gate-2" {
-		t.Fatalf("second gate admission = %q, want gate-2", got)
-	}
+	releaseSecondGate := occupyCoordinatorSlot(t, coordinator, started, "gate-2")
 	aEpoch = coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "a", Priority: 0})
 	cEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "c", Priority: 0})
 	t.Cleanup(aEpoch.Close)
@@ -375,10 +332,7 @@ func TestSourceHashCoordinatorResetsFairnessOnlyAfterEpochDrain(t *testing.T) {
 		newSingleQuantumCoordinatorWork(started, "c-1", cRelease, 2),
 	)).Completion
 
-	close(secondGateRelease)
-	if completed := awaitCoordinatorResult(t, secondGateResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseSecondGate()
 	if got := awaitCoordinatorStart(t, started); got != "a-fresh" {
 		t.Fatalf("first admission after drained epoch = %q, want fresh A without inherited debt", got)
 	}
@@ -398,18 +352,12 @@ func TestSourceHashCoordinatorResetsFairnessOnlyAfterEpochDrain(t *testing.T) {
 func TestSourceHashCoordinatorChargesActualShortReadBytes(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
 	started := make(chan string, 8)
-	gateRelease := make(chan struct{})
 	aFirst := make(chan struct{})
 	aSecond := make(chan struct{})
 	bFirst := make(chan struct{})
 	bSecond := make(chan struct{})
 
-	gateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate", gateRelease, 1),
-	)).Completion
-	if got := awaitCoordinatorStart(t, started); got != "gate" {
-		t.Fatalf("gate admission = %q, want gate", got)
-	}
+	releaseGate := occupyCoordinatorSlot(t, coordinator, started, "gate")
 	aResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
 		&controlledCoordinatorWork{
 			started: started,
@@ -429,10 +377,7 @@ func TestSourceHashCoordinatorChargesActualShortReadBytes(t *testing.T) {
 		},
 	)).Completion
 
-	close(gateRelease)
-	if completed := awaitCoordinatorResult(t, gateResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseGate()
 	if got := awaitCoordinatorStart(t, started); got != "a-short" {
 		t.Fatalf("first admission = %q, want a-short", got)
 	}
@@ -460,19 +405,13 @@ func TestSourceHashCoordinatorChargesActualShortReadBytes(t *testing.T) {
 func TestSourceHashCoordinatorChargesDiscardedWork(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
 	started := make(chan string, 8)
-	gateRelease := make(chan struct{})
 	discardRelease := make(chan struct{})
 	aNextRelease := make(chan struct{})
 	bFirst := make(chan struct{})
 	bSecond := make(chan struct{})
 	errDiscarded := errors.New("discard Source Hash Work")
 
-	gateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate", gateRelease, 1),
-	)).Completion
-	if got := awaitCoordinatorStart(t, started); got != "gate" {
-		t.Fatalf("gate admission = %q, want gate", got)
-	}
+	releaseGate := occupyCoordinatorSlot(t, coordinator, started, "gate")
 	discardedResult := coordinator.Submit(t.Context(), coordinatorRequest("a", 0, 0,
 		&controlledCoordinatorWork{
 			started: started,
@@ -494,10 +433,7 @@ func TestSourceHashCoordinatorChargesDiscardedWork(t *testing.T) {
 		},
 	)).Completion
 
-	close(gateRelease)
-	if completed := awaitCoordinatorResult(t, gateResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseGate()
 	if got := awaitCoordinatorStart(t, started); got != "a-discarded" {
 		t.Fatalf("first admission = %q, want a-discarded", got)
 	}
@@ -532,19 +468,12 @@ func TestSourceHashCoordinatorNewParticipantJoinsItsPriorityShare(t *testing.T) 
 	incumbentEpoch := coordinator.BeginSourceHashEpoch(SourceHashFolder{ID: "incumbent", Priority: 0})
 	t.Cleanup(highEpoch.Close)
 	t.Cleanup(incumbentEpoch.Close)
-	gateRelease := make(chan struct{})
 	highRelease := make(chan struct{})
 	incumbentFirst := make(chan struct{})
-	secondGateRelease := make(chan struct{})
 	incumbentNext := make(chan struct{})
 	newcomerRelease := make(chan struct{})
 
-	gateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate-1", gateRelease, 1),
-	)).Completion
-	if got := awaitCoordinatorStart(t, started); got != "gate-1" {
-		t.Fatalf("gate admission = %q, want gate-1", got)
-	}
+	releaseGate := occupyCoordinatorSlot(t, coordinator, started, "gate-1")
 	highResult := coordinator.Submit(t.Context(), coordinatorRequest("high-account", 50, 0,
 		newSingleQuantumCoordinatorWork(started, "high-account-1", highRelease, 1),
 	)).Completion
@@ -552,10 +481,7 @@ func TestSourceHashCoordinatorNewParticipantJoinsItsPriorityShare(t *testing.T) 
 		newSingleQuantumCoordinatorWork(started, "incumbent-1", incumbentFirst, 8),
 	)).Completion
 
-	close(gateRelease)
-	if completed := awaitCoordinatorResult(t, gateResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseGate()
 	if got := awaitCoordinatorStart(t, started); got != "high-account-1" {
 		t.Fatalf("higher-priority account admission = %q, want high-account-1", got)
 	}
@@ -567,16 +493,11 @@ func TestSourceHashCoordinatorNewParticipantJoinsItsPriorityShare(t *testing.T) 
 		t.Fatalf("incumbent admission = %q, want incumbent-1", got)
 	}
 
-	secondGateResult := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
-		newSingleQuantumCoordinatorWork(started, "gate-2", secondGateRelease, 1),
-	)).Completion
 	close(incumbentFirst)
 	if completed := awaitCoordinatorResult(t, incumbentFirstResult); completed.Err != nil {
 		t.Fatal(completed.Err)
 	}
-	if got := awaitCoordinatorStart(t, started); got != "gate-2" {
-		t.Fatalf("second gate admission = %q, want gate-2", got)
-	}
+	releaseSecondGate := occupyCoordinatorSlot(t, coordinator, started, "gate-2")
 	incumbentNextResult := coordinator.Submit(t.Context(), coordinatorRequest("incumbent", 0, 0,
 		newSingleQuantumCoordinatorWork(started, "incumbent-2", incumbentNext, 2),
 	)).Completion
@@ -586,10 +507,7 @@ func TestSourceHashCoordinatorNewParticipantJoinsItsPriorityShare(t *testing.T) 
 		newSingleQuantumCoordinatorWork(started, "newcomer-1", newcomerRelease, 2),
 	)).Completion
 
-	close(secondGateRelease)
-	if completed := awaitCoordinatorResult(t, secondGateResult); completed.Err != nil {
-		t.Fatal(completed.Err)
-	}
+	releaseSecondGate()
 	if got := awaitCoordinatorStart(t, started); got != "incumbent-2" {
 		t.Fatalf("first same-priority admission = %q, want incumbent without newcomer windfall", got)
 	}
@@ -638,6 +556,24 @@ func newSingleQuantumCoordinatorWork(started chan<- string, label string, releas
 		quanta: []controlledCoordinatorQuantum{
 			{label: label, release: release, bytes: bytes, done: true},
 		},
+	}
+}
+
+func occupyCoordinatorSlot(t *testing.T, coordinator SourceHashCoordinator, started chan string, label string) func() {
+	t.Helper()
+	release := make(chan struct{})
+	result := coordinator.Submit(t.Context(), coordinatorRequest("gate", 100, 0,
+		newSingleQuantumCoordinatorWork(started, label, release, 1),
+	)).Completion
+	if got := awaitCoordinatorStart(t, started); got != label {
+		t.Fatalf("gate admission = %q, want %q", got, label)
+	}
+	return func() {
+		t.Helper()
+		close(release)
+		if completed := awaitCoordinatorResult(t, result); completed.Err != nil {
+			t.Fatal(completed.Err)
+		}
 	}
 }
 

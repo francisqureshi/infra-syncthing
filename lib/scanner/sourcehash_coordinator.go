@@ -70,24 +70,24 @@ type SourceHashCoordinator interface {
 type sourceHashCoordinator struct {
 	mut sync.Mutex
 
-	capacity    int
-	active      int
-	byFolder    map[string]int
-	charged     map[sourceHashAccount]int64
-	activeBytes map[sourceHashAccount]int64
-	byAccount   map[sourceHashAccount]int
-	epochs      map[sourceHashAccount]int
-	queued      []*coordinatedSourceHashWork
+	capacity      int
+	active        int
+	byFolder      map[string]int
+	charged       map[equalPriorityShareKey]int64
+	activeBytes   map[equalPriorityShareKey]int64
+	activeByShare map[equalPriorityShareKey]int
+	epochs        map[equalPriorityShareKey]int
+	queued        []*coordinatedSourceHashWork
 }
 
-type sourceHashAccount struct {
+type equalPriorityShareKey struct {
 	priority int
 	folder   string
 }
 
 type sourceHashEpoch struct {
 	coordinator *sourceHashCoordinator
-	account     sourceHashAccount
+	account     equalPriorityShareKey
 	once        sync.Once
 }
 
@@ -108,17 +108,17 @@ func NewSourceHashCoordinator(capacity int) SourceHashCoordinator {
 		panic("Hash Capacity must be positive")
 	}
 	return &sourceHashCoordinator{
-		capacity:    capacity,
-		byFolder:    make(map[string]int),
-		charged:     make(map[sourceHashAccount]int64),
-		activeBytes: make(map[sourceHashAccount]int64),
-		byAccount:   make(map[sourceHashAccount]int),
-		epochs:      make(map[sourceHashAccount]int),
+		capacity:      capacity,
+		byFolder:      make(map[string]int),
+		charged:       make(map[equalPriorityShareKey]int64),
+		activeBytes:   make(map[equalPriorityShareKey]int64),
+		activeByShare: make(map[equalPriorityShareKey]int),
+		epochs:        make(map[equalPriorityShareKey]int),
 	}
 }
 
 func (c *sourceHashCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) SourceHashEpoch {
-	account := sourceHashAccount{priority: folder.Priority, folder: folder.ID}
+	account := equalPriorityShareKey{priority: folder.Priority, folder: folder.ID}
 	c.mut.Lock()
 	c.initializeFairnessLocked(account)
 	c.epochs[account]++
@@ -168,7 +168,7 @@ func (c *sourceHashCoordinator) scheduleLocked() {
 		c.queued = append(c.queued[:next], c.queued[next+1:]...)
 		c.active++
 		c.byFolder[work.request.Folder.ID]++
-		c.byAccount[work.account()]++
+		c.activeByShare[work.account()]++
 		work.activeBytes = max(work.request.Work.NextHashingQuantumBytes(), 0)
 		c.activeBytes[work.account()] += work.activeBytes
 		if !work.wasAdmitted {
@@ -195,7 +195,7 @@ func (c *sourceHashCoordinator) nextLocked() int {
 	return next
 }
 
-func (c *sourceHashCoordinator) initializeFairnessLocked(account sourceHashAccount) {
+func (c *sourceHashCoordinator) initializeFairnessLocked(account equalPriorityShareKey) {
 	if c.participatingLocked(account) {
 		return
 	}
@@ -214,12 +214,12 @@ func (c *sourceHashCoordinator) initializeFairnessLocked(account sourceHashAccou
 	c.charged[account] = minimum
 }
 
-func (c *sourceHashCoordinator) fairnessScoreLocked(account sourceHashAccount) int64 {
+func (c *sourceHashCoordinator) fairnessScoreLocked(account equalPriorityShareKey) int64 {
 	return c.charged[account] + c.activeBytes[account]
 }
 
-func (c *sourceHashCoordinator) participatingLocked(account sourceHashAccount) bool {
-	if c.epochs[account] > 0 || c.byAccount[account] > 0 {
+func (c *sourceHashCoordinator) participatingLocked(account equalPriorityShareKey) bool {
+	if c.epochs[account] > 0 || c.activeByShare[account] > 0 {
 		return true
 	}
 	for _, work := range c.queued {
@@ -240,7 +240,7 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 	work.activeBytes = 0
 	c.active--
 	c.byFolder[work.request.Folder.ID]--
-	c.byAccount[work.account()]--
+	c.activeByShare[work.account()]--
 	if err == nil && !result.Done {
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
@@ -259,8 +259,8 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 	close(work.completion)
 }
 
-func (w *coordinatedSourceHashWork) account() sourceHashAccount {
-	return sourceHashAccount{
+func (w *coordinatedSourceHashWork) account() equalPriorityShareKey {
+	return equalPriorityShareKey{
 		priority: w.request.Folder.Priority,
 		folder:   w.request.Folder.ID,
 	}
