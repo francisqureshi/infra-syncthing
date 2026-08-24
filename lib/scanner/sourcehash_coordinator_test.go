@@ -241,6 +241,122 @@ func TestSourceHashCoordinatorAdmitsNewHigherPriorityWorkAtQuantumBoundary(t *te
 	}
 }
 
+func TestSourceHashCoordinatorUsesEveryCompatibleSlotByFolderPriority(t *testing.T) {
+	t.Run("saturated pool replaces Low with High at every boundary", func(t *testing.T) {
+		coordinator := NewSourceHashCoordinator(3)
+		started := make(chan string, 12)
+		lowFirst := []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
+		lowSecond := []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
+		highOnly := []chan struct{}{make(chan struct{}), make(chan struct{}), make(chan struct{})}
+		lowResults := make([]<-chan SourceHashCompletion, 3)
+		highResults := make([]<-chan SourceHashCompletion, 3)
+
+		for index := range lowResults {
+			lowResults[index] = coordinator.Submit(t.Context(), coordinatorRequest("low", 0, 0,
+				&controlledCoordinatorWork{
+					started: started,
+					quanta: []controlledCoordinatorQuantum{
+						{label: fmt.Sprintf("low-%d-first", index), release: lowFirst[index], bytes: 4},
+						{label: fmt.Sprintf("low-%d-second", index), release: lowSecond[index], bytes: 4, done: true},
+					},
+				},
+			)).Completion
+			if got, want := awaitCoordinatorStart(t, started), fmt.Sprintf("low-%d-first", index); got != want {
+				t.Fatalf("initial saturated admission %d = %q, want %q", index, got, want)
+			}
+		}
+		for index := range highResults {
+			highResults[index] = coordinator.Submit(t.Context(), coordinatorRequest("high", 100, 0,
+				newSingleQuantumCoordinatorWork(started, fmt.Sprintf("high-%d", index), highOnly[index], 2),
+			)).Completion
+		}
+
+		for index := range lowFirst {
+			close(lowFirst[index])
+			if got, want := awaitCoordinatorStart(t, started), fmt.Sprintf("high-%d", index); got != want {
+				t.Fatalf("replacement admission %d = %q, want %q", index, got, want)
+			}
+		}
+		for index := range highOnly {
+			close(highOnly[index])
+			if completed := awaitCoordinatorResult(t, highResults[index]); completed.Err != nil {
+				t.Fatalf("High completion %d: %v", index, completed.Err)
+			}
+		}
+
+		remainingLow := make(map[string]chan struct{}, len(lowSecond))
+		for index, release := range lowSecond {
+			remainingLow[fmt.Sprintf("low-%d-second", index)] = release
+		}
+		for range lowSecond {
+			label := awaitCoordinatorStart(t, started)
+			release, ok := remainingLow[label]
+			if !ok {
+				t.Fatalf("unexpected post-High admission %q", label)
+			}
+			close(release)
+			delete(remainingLow, label)
+		}
+		for index, result := range lowResults {
+			if completed := awaitCoordinatorResult(t, result); completed.Err != nil || completed.Bytes != 8 {
+				t.Fatalf("Low completion %d = %+v, want eight consumed bytes and no error", index, completed)
+			}
+		}
+	})
+
+	t.Run("one sequential High file leaves spare slots to Low", func(t *testing.T) {
+		coordinator := NewSourceHashCoordinator(3)
+		started := make(chan string, 4)
+		highFirst := make(chan struct{})
+		highSecond := make(chan struct{})
+		lowFirst := make(chan struct{})
+		lowSecond := make(chan struct{})
+
+		highResult := coordinator.Submit(t.Context(), coordinatorRequest("high", 100, 0,
+			&controlledCoordinatorWork{
+				started: started,
+				quanta: []controlledCoordinatorQuantum{
+					{label: "high-first", release: highFirst, bytes: 4},
+					{label: "high-second", release: highSecond, bytes: 4, done: true},
+				},
+			},
+		)).Completion
+		if got := awaitCoordinatorStart(t, started); got != "high-first" {
+			t.Fatalf("first admission = %q, want high-first", got)
+		}
+		lowFirstResult := coordinator.Submit(t.Context(), coordinatorRequest("low", 0, 0,
+			newSingleQuantumCoordinatorWork(started, "low-first", lowFirst, 2),
+		)).Completion
+		if got := awaitCoordinatorStart(t, started); got != "low-first" {
+			t.Fatalf("first spare-slot admission = %q, want low-first", got)
+		}
+		lowSecondResult := coordinator.Submit(t.Context(), coordinatorRequest("low", 0, 0,
+			newSingleQuantumCoordinatorWork(started, "low-second", lowSecond, 2),
+		)).Completion
+		if got := awaitCoordinatorStart(t, started); got != "low-second" {
+			t.Fatalf("second spare-slot admission = %q, want low-second", got)
+		}
+
+		close(highFirst)
+		if got := awaitCoordinatorStart(t, started); got != "high-second" {
+			t.Fatalf("High continuation admission = %q, want high-second", got)
+		}
+		close(highSecond)
+		close(lowFirst)
+		close(lowSecond)
+
+		for description, result := range map[string]<-chan SourceHashCompletion{
+			"high":       highResult,
+			"first Low":  lowFirstResult,
+			"second Low": lowSecondResult,
+		} {
+			if completed := awaitCoordinatorResult(t, result); completed.Err != nil {
+				t.Fatalf("%s completion: %v", description, completed.Err)
+			}
+		}
+	})
+}
+
 func TestSourceHashCoordinatorDisplacesRetainedLowerPriorityWorkForHighPriorityAdmission(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
 	started := make(chan string, 6)

@@ -930,36 +930,54 @@ func TestBufferedWalkRemovesDiscoverySpoolAfterHashingFailure(t *testing.T) {
 	}
 }
 
-func TestBufferedWalkBoundsSyntheticMultiTerabyteDiscovery(t *testing.T) {
+func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPriorityDiscovery(t *testing.T) {
 	const (
-		files            = 32 << 10
-		logicalFileSize  = int64(64 << 30)
+		lowFiles         = 32 << 10
+		highFiles        = 320
+		logicalFileSize  = int64(160 << 20)
 		maxRetainedBytes = 8 << 20
 		window           = 2
 	)
-	filesystem := &logicalInventoryFilesystem{
-		Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
-		files:      files,
-		fileSize:   logicalFileSize,
+	filesystems := map[string]*logicalInventoryFilesystem{
+		"low": {
+			Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
+			files:      lowFiles,
+			fileSize:   logicalFileSize,
+		},
+		"high": {
+			Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
+			files:      highFiles,
+			fileSize:   logicalFileSize,
+		},
 	}
 	coordinator := &inventorySourceHashCoordinator{
-		submitted: make(chan struct{}, window),
+		submitted: make(chan struct{}, 2*window),
 	}
-	cfg, cfgCancel := testConfig()
-	defer cfgCancel()
-	cfg.Folder = "buffered-spool-logical-inventory"
-	cfg.Filesystem = filesystem
-	cfg.Hashers = window
-	cfg.SourceHashCoordinator = coordinator
 
 	runtime.GC()
 	var before runtime.MemStats
 	runtime.ReadMemStats(&before)
-	ctx, cancel := context.WithCancel(t.Context())
-	walkResult := Walk(ctx, cfg)
-	awaitScannerSignal(t, walkResult.TraversalDone, "synthetic logical inventory traversal")
-	for range window {
-		awaitScannerSignal(t, coordinator.submitted, "bounded Source Hash Work submission")
+	walkResults := make(map[string]WalkResult, len(filesystems))
+	cancels := make(map[string]context.CancelFunc, len(filesystems))
+	for _, folder := range []string{"low", "high"} {
+		cfg, cfgCancel := testConfig()
+		t.Cleanup(cfgCancel)
+		cfg.Folder = "buffered-spool-logical-inventory-" + folder
+		cfg.Filesystem = filesystems[folder]
+		cfg.Hashers = window
+		cfg.SourceHashFolder = SourceHashFolder{
+			ID:       folder,
+			Priority: map[string]int{"low": -100, "high": 100}[folder],
+		}
+		cfg.SourceHashCoordinator = coordinator
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancels[folder] = cancel
+		walkResults[folder] = Walk(ctx, cfg)
+		awaitScannerSignal(t, walkResults[folder].TraversalDone, folder+" synthetic logical inventory traversal")
+		for range window {
+			awaitScannerSignal(t, coordinator.submitted, folder+" bounded Source Hash Work submission")
+		}
 	}
 
 	runtime.GC()
@@ -970,20 +988,29 @@ func TestBufferedWalkBoundsSyntheticMultiTerabyteDiscovery(t *testing.T) {
 		retained = after.HeapAlloc - before.HeapAlloc
 	}
 	if retained > maxRetainedBytes {
-		t.Fatalf("buffered discovery retained %d bytes for %d files, want at most %d", retained, files, maxRetainedBytes)
+		t.Fatalf("buffered discovery retained %d bytes for %d files, want at most %d", retained, lowFiles+highFiles, maxRetainedBytes)
 	}
-	if got := coordinator.enrolled.Load(); got != window {
-		t.Fatalf("Source Hash Work materialized %d files, want bounded window %d", got, window)
+	if got := coordinator.enrolled.Load(); got != 2*window {
+		t.Fatalf("Source Hash Work materialized %d files, want fixed multi-Folder window %d", got, 2*window)
 	}
-	if got := filesystem.opens.Load(); got != 0 {
-		t.Fatalf("buffered discovery opened %d source handles before admission, want zero", got)
+	for folder, filesystem := range filesystems {
+		if got := filesystem.opens.Load(); got != 0 {
+			t.Fatalf("%s buffered discovery opened %d source handles before admission, want zero", folder, got)
+		}
 	}
-	if logicalBytes := int64(files) * logicalFileSize; logicalBytes < 1<<40 {
-		t.Fatalf("synthetic inventory is only %d bytes", logicalBytes)
+	if logicalBytes := int64(lowFiles) * logicalFileSize; logicalBytes != 5<<40 {
+		t.Fatalf("Low synthetic inventory = %d bytes, want 5 TiB", logicalBytes)
+	}
+	if logicalBytes := int64(highFiles) * logicalFileSize; logicalBytes != 50<<30 {
+		t.Fatalf("High synthetic workload = %d bytes, want 50 GiB", logicalBytes)
 	}
 
-	cancel()
-	for range walkResult.Results {
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, walkResult := range walkResults {
+		for range walkResult.Results {
+		}
 	}
 }
 

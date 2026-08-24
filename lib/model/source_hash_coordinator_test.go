@@ -7,8 +7,10 @@
 package model
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -180,6 +182,20 @@ func (c sourceHashCoordinatorObserver) Submit(ctx context.Context, request scann
 }
 
 func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		scanProgressInterval int
+	}{
+		{name: "buffered", scanProgressInterval: 0},
+		{name: "streaming", scanProgressInterval: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testModelSchedulesSourceHashWorkAfterTraversalRelease(t, tc.scanProgressInterval)
+		})
+	}
+}
+
+func testModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T, scanProgressInterval int) {
 	started := make(chan string, 3)
 	blockerRelease := make(chan struct{})
 	lowRelease := make(chan struct{})
@@ -226,7 +242,7 @@ func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
 		folder.Hashers = 1
 		folder.FSWatcherEnabled = false
 		folder.RescanIntervalS = 0
-		folder.ScanProgressIntervalS = 0
+		folder.ScanProgressIntervalS = scanProgressInterval
 		cfg.SetFolder(folder)
 	}
 
@@ -326,6 +342,71 @@ func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
 		file, ok := m.testCurrentFolderFile(folder, "payload")
 		if !ok || len(file.Blocks) != 1 || len(file.BlocksHash) == 0 {
 			t.Fatalf("%s complete publication = %+v, present=%v", folder, file, ok)
+		}
+	}
+}
+
+func TestModelScheduledSourceHashWorkMatchesWholeFileBaseline(t *testing.T) {
+	harness := newSourceHashModelTestHarness(t, 2, map[string]sourceHashModelTestFolder{
+		"low":  {priority: -100},
+		"high": {priority: 100},
+	})
+	for _, release := range harness.releases {
+		close(release)
+	}
+
+	files := map[string]map[string][]byte{
+		"low": {
+			"empty":       nil,
+			"final-short": []byte("final short block"),
+		},
+		"high": {
+			"exact-block": make([]byte, protocol.MinBlockSize),
+			"multi-block": make([]byte, 2*protocol.MinBlockSize+17),
+		},
+	}
+	for folder, folderFiles := range files {
+		control := harness.controls[folder]
+		if err := control.filesystem.Remove("payload"); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range folderFiles {
+			writeFile(t, control.filesystem, name, data)
+		}
+	}
+
+	submissionsDone := make(chan struct{})
+	go func() {
+		for range 4 {
+			<-harness.submitted
+		}
+		close(submissionsDone)
+	}()
+	for _, folder := range []string{"low", "high"} {
+		if err := harness.model.ScanFolder(folder); err != nil {
+			t.Fatalf("scan %s: %v", folder, err)
+		}
+	}
+	awaitSourceHashCoordinatorSignal(t, submissionsDone, "scheduled Source Hash Work submissions")
+
+	for folder, folderFiles := range files {
+		for name, data := range folderFiles {
+			got, ok := harness.model.testCurrentFolderFile(folder, name)
+			if !ok {
+				t.Fatalf("scheduled file %s/%s was not published", folder, name)
+			}
+			blockSize := protocol.FileInfo{Size: int64(len(data))}.BlockSize()
+			wantBlocks, err := scanner.Blocks(t.Context(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got.Blocks, wantBlocks) {
+				t.Errorf("scheduled blocks for %s/%s = %v, want whole-file baseline %v", folder, name, got.Blocks, wantBlocks)
+			}
+			wantBlocksHash := protocol.BlocksHash(wantBlocks)
+			if !bytes.Equal(got.BlocksHash, wantBlocksHash) {
+				t.Errorf("scheduled BlocksHash for %s/%s = %x, want whole-file baseline %x", folder, name, got.BlocksHash, wantBlocksHash)
+			}
 		}
 	}
 }
