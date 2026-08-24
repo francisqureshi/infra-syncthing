@@ -574,14 +574,11 @@ func (f *folder) scanSubdirsWithClass(ctx context.Context, subDirs []string, cla
 	if err := f.ioLimiter.takeWithContext(ctx, f.ID, class); err != nil {
 		return err
 	}
-	traversalLeaseHeld := true
-	releaseTraversalLease := func() {
-		if traversalLeaseHeld {
-			f.ioLimiter.give()
-			traversalLeaseHeld = false
-		}
+	var releaseScanAdmissionOnce sync.Once
+	releaseScanAdmission := func() {
+		releaseScanAdmissionOnce.Do(f.ioLimiter.give)
 	}
-	defer releaseTraversalLease()
+	defer releaseScanAdmission()
 
 	metricFolderScans.WithLabelValues(f.ID).Inc()
 	scanCtx, cancel := context.WithCancel(ctx)
@@ -624,7 +621,7 @@ func (f *folder) scanSubdirsWithClass(ctx context.Context, subDirs []string, cla
 		}
 	}()
 
-	changesHere, err := f.scanSubdirsChangedAndNew(ctx, subDirs, batch, releaseTraversalLease)
+	changesHere, err := f.scanSubdirsChangedAndNew(ctx, subDirs, batch, releaseScanAdmission)
 	changes += changesHere
 	if err != nil {
 		return err
@@ -756,7 +753,7 @@ func (b *scanBatch) Update(fi protocol.FileInfo) (bool, error) {
 	return true, nil
 }
 
-func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string, batch *scanBatch, traversalComplete func()) (int, error) {
+func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string, batch *scanBatch, releaseScanAdmission func()) (int, error) {
 	changes := 0
 
 	// If we return early e.g. due to a folder health error, the scan needs
@@ -794,14 +791,26 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 		scanCancel()
 		if traversalDone != nil {
 			<-traversalDone
-			traversalComplete()
+			releaseScanAdmission()
 		}
 	}()
 
 	for fchan != nil {
+		// When traversal completion and a scan result are both ready, release
+		// admission before doing any more result-consumer work. The blocking
+		// select below still handles completion that arrives while waiting.
+		if traversalDone != nil {
+			select {
+			case <-traversalDone:
+				releaseScanAdmission()
+				traversalDone = nil
+				continue
+			default:
+			}
+		}
 		select {
 		case <-traversalDone:
-			traversalComplete()
+			releaseScanAdmission()
 			traversalDone = nil
 			continue
 		case res, ok := <-fchan:
