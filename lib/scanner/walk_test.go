@@ -1087,9 +1087,9 @@ func TestBufferedWalkReportsSpooledSourceHashWorkDuringTraversal(t *testing.T) {
 	if err := fs.WriteFile(underlying, "payload", make([]byte, protocol.MinBlockSize), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	spooled := make(chan struct{})
 	traversalBlocked := make(chan struct{})
 	traversalRelease := make(chan struct{})
+	spooled := make(chan struct{})
 	t.Cleanup(func() {
 		select {
 		case <-traversalRelease:
@@ -1101,21 +1101,24 @@ func TestBufferedWalkReportsSpooledSourceHashWorkDuringTraversal(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
 	concrete := coordinator.(*sourceHashCoordinator)
 	concrete.now = func() time.Time { return now }
-	concrete.discoverySpoolWorkChanged = sync.OnceFunc(func() { close(spooled) })
 	provider := coordinator.(SourceHashWorkStateProvider)
+	observedCoordinator := &discoverySpoolObservationCoordinator{
+		SourceHashCoordinator: coordinator,
+		spooled:               spooled,
+	}
 	cfg, cfgCancel := testConfig()
 	defer cfgCancel()
 	cfg.Folder = "alpha"
 	cfg.Filesystem = &discoverySpoolObservationFilesystem{
 		Filesystem: underlying,
 		path:       "payload",
-		observed:   spooled,
+		spooled:    spooled,
 		blocked:    traversalBlocked,
 		release:    traversalRelease,
 	}
 	cfg.Hashers = 1
 	cfg.SourceHashFolder = SourceHashFolder{ID: "alpha"}
-	cfg.SourceHashCoordinator = coordinator
+	cfg.SourceHashCoordinator = observedCoordinator
 	cfg.ProgressTickIntervalS = 1
 	ctx, cancel := context.WithCancel(t.Context())
 	walkResult := Walk(ctx, cfg)
@@ -1284,6 +1287,7 @@ type readBarrierFilesystem struct {
 	fs.Filesystem
 	started chan struct{}
 	release chan struct{}
+	once    sync.Once
 }
 
 type sourceHashStateBarrierFilesystem struct {
@@ -1295,11 +1299,22 @@ type sourceHashStateBarrierFilesystem struct {
 
 type discoverySpoolObservationFilesystem struct {
 	fs.Filesystem
-	path     string
-	observed <-chan struct{}
-	blocked  chan struct{}
-	release  <-chan struct{}
-	once     sync.Once
+	path    string
+	spooled <-chan struct{}
+	blocked chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+type discoverySpoolObservationCoordinator struct {
+	SourceHashCoordinator
+	spooled chan struct{}
+	once    sync.Once
+}
+
+type discoverySpoolObservationEpoch struct {
+	SourceHashEpoch
+	owner *discoverySpoolObservationCoordinator
 }
 
 type walkBarrierFilesystem struct {
@@ -1402,10 +1417,10 @@ func (f *walkBarrierFilesystem) Walk(root string, walkFn fs.WalkFunc) error {
 
 func (f *readBarrierFilesystem) Open(name string) (fs.File, error) {
 	file, err := f.Filesystem.Open(name)
-	if err != nil || name != "payload" {
+	if err != nil {
 		return file, err
 	}
-	return &readBarrierFile{File: file, started: f.started, release: f.release}, nil
+	return &readBarrierFile{File: file, owner: f}, nil
 }
 
 func (f *sourceHashStateBarrierFilesystem) Open(name string) (fs.File, error) {
@@ -1421,13 +1436,34 @@ func (f *discoverySpoolObservationFilesystem) Walk(root string, walkFn fs.WalkFu
 		walkErr := walkFn(path, info, err)
 		if path == f.path {
 			f.once.Do(func() {
-				<-f.observed
+				<-f.spooled
 				close(f.blocked)
 				<-f.release
 			})
 		}
 		return walkErr
 	})
+}
+
+func (c *discoverySpoolObservationCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) SourceHashEpoch {
+	return &discoverySpoolObservationEpoch{
+		SourceHashEpoch: c.SourceHashCoordinator.BeginSourceHashEpoch(folder),
+		owner:           c,
+	}
+}
+
+func (c *discoverySpoolObservationCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
+	if epoch, ok := request.DiscoverySpoolEpoch.(*discoverySpoolObservationEpoch); ok {
+		request.DiscoverySpoolEpoch = epoch.SourceHashEpoch
+	}
+	return c.SourceHashCoordinator.Submit(ctx, request)
+}
+
+func (e *discoverySpoolObservationEpoch) SetDiscoverySpoolSourceHashWork(count int) {
+	e.SourceHashEpoch.(interface{ SetDiscoverySpoolSourceHashWork(int) }).SetDiscoverySpoolSourceHashWork(count)
+	if count > 0 {
+		e.owner.once.Do(func() { close(e.owner.spooled) })
+	}
 }
 
 type sourceHashStateBarrierFile struct {
@@ -1445,15 +1481,13 @@ func (f *sourceHashStateBarrierFile) Read(buf []byte) (int, error) {
 
 type readBarrierFile struct {
 	fs.File
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
+	owner *readBarrierFilesystem
 }
 
 func (f *readBarrierFile) Read(buf []byte) (int, error) {
-	f.once.Do(func() {
-		close(f.started)
-		<-f.release
+	f.owner.once.Do(func() {
+		close(f.owner.started)
+		<-f.owner.release
 	})
 	return f.File.Read(buf)
 }

@@ -123,8 +123,6 @@ type sourceHashCoordinator struct {
 	enrollmentChanged chan struct{}
 	cleanupInProgress int
 	now               func() time.Time
-	// discoverySpoolWorkChanged is a test-only synchronization hook.
-	discoverySpoolWorkChanged func()
 }
 
 type equalPriorityShareKey struct {
@@ -394,7 +392,6 @@ func (e *sourceHashEpoch) SetDiscoverySpoolSourceHashWork(count int) {
 	if e.closed || count <= 0 {
 		e.discoverySpoolWork = 0
 		e.discoverySpoolWaitStartedAt = time.Time{}
-		e.coordinator.notifyDiscoverySpoolWorkChangedLocked()
 		return
 	}
 	if e.coordinator.configured {
@@ -406,7 +403,6 @@ func (e *sourceHashEpoch) SetDiscoverySpoolSourceHashWork(count int) {
 		e.discoverySpoolWaitStartedAt = e.coordinator.now()
 	}
 	e.discoverySpoolWork = count
-	e.coordinator.notifyDiscoverySpoolWorkChangedLocked()
 }
 
 func (c *sourceHashCoordinator) consumeDiscoverySpoolSourceHashWorkLocked(epoch SourceHashEpoch) time.Time {
@@ -419,14 +415,7 @@ func (c *sourceHashCoordinator) consumeDiscoverySpoolSourceHashWorkLocked(epoch 
 	if discoverySpoolEpoch.discoverySpoolWork == 0 {
 		discoverySpoolEpoch.discoverySpoolWaitStartedAt = time.Time{}
 	}
-	c.notifyDiscoverySpoolWorkChangedLocked()
 	return queuedAt
-}
-
-func (c *sourceHashCoordinator) notifyDiscoverySpoolWorkChangedLocked() {
-	if c.discoverySpoolWorkChanged != nil {
-		c.discoverySpoolWorkChanged()
-	}
 }
 
 func setDiscoverySpoolSourceHashWork(epoch SourceHashEpoch, count int) {
