@@ -18,7 +18,9 @@ import (
 	rdebug "runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/d4l3k/messagediff"
 	"golang.org/x/text/unicode/norm"
@@ -101,7 +103,7 @@ func TestWalkSub(t *testing.T) {
 	defer cancel()
 	cfg.Subs = []string{"dir2"}
 	cfg.Matcher = ignores
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 	var files []protocol.FileInfo
 	for f := range fchan {
 		if f.Err != nil {
@@ -136,7 +138,7 @@ func TestWalk(t *testing.T) {
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Matcher = ignores
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 
 	var tmp []protocol.FileInfo
 	for f := range fchan {
@@ -576,7 +578,7 @@ func walkDir(fs fs.Filesystem, dir string, cfiler CurrentFiler, matcher *ignore.
 	cfg.Matcher = matcher
 	cfg.LocalFlags = localFlags
 	cfg.ScanOwnership = true
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 
 	var tmp []protocol.FileInfo
 	for f := range fchan {
@@ -676,7 +678,8 @@ func TestStopWalk(t *testing.T) {
 	cfg.Filesystem = fs
 	cfg.Hashers = numHashers
 	cfg.ProgressTickIntervalS = -1 // Don't attempt to build the full list of files before starting to scan...
-	fchan := Walk(ctx, cfg)
+	walkResult := Walk(ctx, cfg)
+	fchan := walkResult.Results
 
 	// Receive a few entries to make sure the walker is up and running,
 	// scanning both files and dirs. Do some quick sanity tests on the
@@ -720,9 +723,161 @@ func TestStopWalk(t *testing.T) {
 	for range fchan {
 		extra++
 	}
+	awaitScannerSignal(t, walkResult.TraversalDone, "cancelled traversal completion")
 	t.Log("Extra entries:", extra)
 	if extra > numHashers+1 {
 		t.Error("unexpected extra entries received after cancel")
+	}
+}
+
+func TestBufferedWalkSignalsTraversalBeforeHashingCompletes(t *testing.T) {
+	testWalkSignalsTraversalBeforeHashingCompletes(t, 0)
+}
+
+func TestStreamingWalkSignalsTraversalBeforeHashingCompletes(t *testing.T) {
+	testWalkSignalsTraversalBeforeHashingCompletes(t, -1)
+}
+
+func TestWalkWithoutHashingCancellationClosesResultsWhenConsumerStops(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Filesystem = underlying
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := WalkWithoutHashing(ctx, cfg)
+
+	// Traversal completion proves the forwarding routine has accepted the only
+	// discovered file and is waiting for a result consumer.
+	awaitScannerSignal(t, walkResult.TraversalDone, "traversal completion")
+	cancel()
+	resultsAfterCancel := 0
+	for {
+		select {
+		case _, ok := <-walkResult.Results:
+			if !ok {
+				if resultsAfterCancel > 1 {
+					t.Fatalf("got %d results after cancellation, want at most the in-flight result", resultsAfterCancel)
+				}
+				return
+			}
+			resultsAfterCancel++
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for cancelled scan results to close")
+		}
+	}
+}
+
+func TestEmptyWalkClosesTraversalAndResults(t *testing.T) {
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Filesystem = fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "empty traversal completion")
+	if result, ok := <-walkResult.Results; ok {
+		t.Fatalf("empty scan returned a result: %v", result)
+	}
+}
+
+func TestFailedWalkClosesTraversalAndResults(t *testing.T) {
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Filesystem = fs.NewFilesystem(fs.FilesystemType("error"), ".")
+	walkResult := Walk(t.Context(), cfg)
+	resultsDone := make(chan struct{})
+	go func() {
+		for range walkResult.Results {
+		}
+		close(resultsDone)
+	}()
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "failed traversal completion")
+	awaitScannerSignal(t, resultsDone, "failed scan result closure")
+}
+
+func testWalkSignalsTraversalBeforeHashingCompletes(t *testing.T, progressTickInterval int) {
+	t.Helper()
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", make([]byte, 128<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-readRelease:
+		default:
+			close(readRelease)
+		}
+	})
+
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Filesystem = &readBarrierFilesystem{
+		Filesystem: underlying,
+		started:    readStarted,
+		release:    readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.ProgressTickIntervalS = progressTickInterval
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, readStarted, "hashing to start")
+	awaitScannerSignal(t, walkResult.TraversalDone, "traversal completion")
+	select {
+	case result, ok := <-walkResult.Results:
+		t.Fatalf("scan result arrived while hashing was paused: %v, open=%v", result, ok)
+	default:
+	}
+
+	close(readRelease)
+	var results []ScanResult
+	for result := range walkResult.Results {
+		results = append(results, result)
+	}
+	if len(results) != 1 || results[0].Err != nil || results[0].File.Name != "payload" {
+		t.Fatalf("scan results = %v, want one completed payload", results)
+	}
+}
+
+type readBarrierFilesystem struct {
+	fs.Filesystem
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *readBarrierFilesystem) Open(name string) (fs.File, error) {
+	file, err := f.Filesystem.Open(name)
+	if err != nil || name != "payload" {
+		return file, err
+	}
+	return &readBarrierFile{File: file, started: f.started, release: f.release}, nil
+}
+
+type readBarrierFile struct {
+	fs.File
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *readBarrierFile) Read(buf []byte) (int, error) {
+	f.once.Do(func() {
+		close(f.started)
+		<-f.release
+	})
+	return f.File.Read(buf)
+}
+
+func awaitScannerSignal(t *testing.T, done <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
 	}
 }
 
@@ -807,7 +962,7 @@ func TestIssue4841(t *testing.T) {
 		Version:    protocol.Vector{}.Update(1),
 	}}
 	cfg.ShortID = protocol.LocalDeviceID.Short()
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 
 	var files []protocol.FileInfo
 	for f := range fchan {
@@ -837,7 +992,7 @@ func TestNotExistingError(t *testing.T) {
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Subs = []string{sub}
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 	for f := range fchan {
 		t.Fatalf("Expected no result from scan, got %v", f)
 	}
@@ -906,7 +1061,7 @@ func TestIncludedSubdir(t *testing.T) {
 		CurrentFiler: make(fakeCurrentFiler),
 		Filesystem:   fss,
 		Matcher:      pats,
-	})
+	}).Results
 
 	found := false
 	for f := range fchan {
