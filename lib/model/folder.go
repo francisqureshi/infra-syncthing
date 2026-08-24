@@ -794,19 +794,26 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 			releaseScanAdmission()
 		}
 	}()
+	releaseScanAdmissionIfTraversalDone := func() bool {
+		if traversalDone == nil {
+			return false
+		}
+		select {
+		case <-traversalDone:
+			releaseScanAdmission()
+			traversalDone = nil
+			return true
+		default:
+			return false
+		}
+	}
 
 	for fchan != nil {
 		// When traversal completion and a scan result are both ready, release
 		// admission before doing any more result-consumer work. The blocking
 		// select below still handles completion that arrives while waiting.
-		if traversalDone != nil {
-			select {
-			case <-traversalDone:
-				releaseScanAdmission()
-				traversalDone = nil
-				continue
-			default:
-			}
+		if releaseScanAdmissionIfTraversalDone() {
+			continue
 		}
 		select {
 		case <-traversalDone:
@@ -820,14 +827,7 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 			}
 			// Traversal can finish after the pre-check but before this case is
 			// selected. Latch it again before doing any result-consumer work.
-			if traversalDone != nil {
-				select {
-				case <-traversalDone:
-					releaseScanAdmission()
-					traversalDone = nil
-				default:
-				}
-			}
+			releaseScanAdmissionIfTraversalDone()
 			if res.Err != nil {
 				f.newScanError(res.Path, res.Err)
 				continue
