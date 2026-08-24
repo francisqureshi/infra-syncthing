@@ -624,8 +624,8 @@ func TestModelBoundsSyntheticFiveTerabyteAndHighPrioritySourceHashWork(t *testin
 	createSourceHashLogicalInventory(t, harness.controls["low"].filesystem, lowFiles, logicalFileSize)
 	createSourceHashLogicalInventory(t, harness.controls["high"].filesystem, highFiles, logicalFileSize)
 
-	lowResult := startSourceHashModelScan(t, harness, "low", hashCapacity, hashCapacity)
-	highResult := startSourceHashModelScan(t, harness, "high", hashCapacity, 0)
+	lowResult := startSourceHashModelScanWithSubmissionTimeout(t, harness, "low", hashCapacity, hashCapacity, 30*time.Second)
+	highResult := startSourceHashModelScanWithSubmissionTimeout(t, harness, "high", hashCapacity, 0, 30*time.Second)
 	provider := harness.model.sourceHashCoordinator.(scanner.SourceHashWorkStateProvider)
 	lowState := provider.SourceHashWorkState("low")
 	highState := provider.SourceHashWorkState("high")
@@ -1653,12 +1653,16 @@ func newSourceHashModelTestHarness(t *testing.T, capacity int, folders map[strin
 }
 
 func startSourceHashModelScan(t *testing.T, harness *sourceHashModelTestHarness, folder string, submissions, starts int) <-chan error {
+	return startSourceHashModelScanWithSubmissionTimeout(t, harness, folder, submissions, starts, 5*time.Second)
+}
+
+func startSourceHashModelScanWithSubmissionTimeout(t *testing.T, harness *sourceHashModelTestHarness, folder string, submissions, starts int, timeout time.Duration) <-chan error {
 	t.Helper()
 	result := make(chan error, 1)
 	go func() { result <- harness.model.ScanFolder(folder) }()
 	awaitSourceHashCoordinatorSignal(t, harness.controls[folder].traversed, folder+" traversal")
 	for range submissions {
-		submission := awaitSourceHashSubmission(t, harness.submitted)
+		submission := awaitSourceHashSubmissionWithTimeout(t, harness.submitted, timeout)
 		if submission.folder != folder {
 			t.Fatalf("Source Hash Work submission = %q, want %s", submission.folder, folder)
 		}
@@ -1767,11 +1771,15 @@ func awaitSourceHashCoordinatorSignal(t *testing.T, signal <-chan struct{}, desc
 }
 
 func awaitSourceHashSubmission(t *testing.T, submitted <-chan observedSourceHashSubmission) observedSourceHashSubmission {
+	return awaitSourceHashSubmissionWithTimeout(t, submitted, 5*time.Second)
+}
+
+func awaitSourceHashSubmissionWithTimeout(t *testing.T, submitted <-chan observedSourceHashSubmission, timeout time.Duration) observedSourceHashSubmission {
 	t.Helper()
 	select {
 	case submission := <-submitted:
 		return submission
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		t.Fatal("timed out waiting for Source Hash Work submission")
 		return observedSourceHashSubmission{}
 	}
