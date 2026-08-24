@@ -56,6 +56,7 @@ type parallelHasher struct {
 	inbox       <-chan protocol.FileInfo
 	counter     Counter
 	done        chan<- struct{}
+	buffered    bool
 	wg          sync.WaitGroup
 }
 
@@ -68,6 +69,7 @@ type parallelHasherConfig struct {
 	inbox       <-chan protocol.FileInfo
 	counter     Counter
 	done        chan<- struct{}
+	buffered    bool
 }
 
 func newParallelHasher(ctx context.Context, cfg parallelHasherConfig, workers int) {
@@ -80,6 +82,7 @@ func newParallelHasher(ctx context.Context, cfg parallelHasherConfig, workers in
 		inbox:       cfg.inbox,
 		counter:     cfg.counter,
 		done:        cfg.done,
+		buffered:    cfg.buffered,
 	}
 
 	ph.wg.Add(workers)
@@ -108,11 +111,17 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 
 			work := newRetainedSourceHashWork(ph.folder.ID, ph.fs, f, ph.counter)
 			var completion SourceHashCompletion
+			var bufferedEpoch SourceHashEpoch
+			if ph.buffered {
+				bufferedEpoch = ph.epoch
+			}
 			for {
 				submission := ph.coordinator.Submit(ctx, SourceHashRequest{
-					Folder: ph.folder,
-					Work:   work,
+					Folder:        ph.folder,
+					Work:          work,
+					BufferedEpoch: bufferedEpoch,
 				})
+				bufferedEpoch = nil
 				completion = <-submission.Completion
 				if !errors.Is(completion.Err, errSourceHashWorkDisplaced) {
 					break

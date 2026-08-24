@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,138 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
 )
+
+func TestSourceHashCoordinatorReportsCurrentState(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.(*sourceHashCoordinator).now = func() time.Time { return now }
+	provider, ok := coordinator.(SourceHashWorkStateProvider)
+	if !ok {
+		t.Fatal("Source Hash Work coordinator does not expose stable current state")
+	}
+	started := make(chan string, 2)
+	activeRelease := make(chan struct{})
+	queuedRelease := make(chan struct{})
+	activeWork := newRetainedCoordinatorWork(newSingleQuantumCoordinatorWork(started, "active", activeRelease, 1))
+	queuedWork := newRetainedCoordinatorWork(newSingleQuantumCoordinatorWork(started, "queued", queuedRelease, 1))
+
+	activeResult := coordinator.Submit(t.Context(), coordinatorRequest("alpha", 0, 0, activeWork)).Completion
+	if got := awaitCoordinatorStart(t, started); got != "active" {
+		t.Fatalf("first admission = %q, want active", got)
+	}
+	queuedResult := coordinator.Submit(t.Context(), coordinatorRequest("alpha", 0, 0, queuedWork)).Completion
+	now = now.Add(9 * time.Second)
+
+	if got, want := provider.SourceHashWorkState("alpha"), (SourceHashWorkState{
+		Queued:                      1,
+		Active:                      1,
+		OldestSchedulingWaitSeconds: 9,
+		HashCapacity:                1,
+		RetainedHandles:             1,
+		RetainedHandleBudget:        4,
+	}); got != want {
+		t.Fatalf("active Source Hash Work state = %#v, want %#v", got, want)
+	}
+
+	close(activeRelease)
+	if completed := awaitCoordinatorResult(t, activeResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	if got := awaitCoordinatorStart(t, started); got != "queued" {
+		t.Fatalf("second admission = %q, want queued", got)
+	}
+	if got := provider.SourceHashWorkState("alpha"); got.Queued != 0 || got.Active != 1 || got.OldestSchedulingWaitSeconds != 0 || got.RetainedHandles != 1 {
+		t.Fatalf("Source Hash Work state retained historical wait after admission: %#v", got)
+	}
+
+	close(queuedRelease)
+	if completed := awaitCoordinatorResult(t, queuedResult); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+	if got := provider.SourceHashWorkState("alpha"); got.Queued != 0 || got.Active != 0 || got.OldestSchedulingWaitSeconds != 0 || got.RetainedHandles != 0 {
+		t.Fatalf("Source Hash Work state retained completed state: %#v", got)
+	}
+
+	coordinator.Configure(3, map[string]int{"alpha": 0})
+	if got := provider.SourceHashWorkState("alpha"); got.HashCapacity != 3 || got.RetainedHandleBudget != 6 {
+		t.Fatalf("Source Hash Work state did not apply live Hash Capacity: %#v", got)
+	}
+}
+
+func TestSourceHashCoordinatorReportsActualRetainedHandleUsage(t *testing.T) {
+	coordinator := NewSourceHashCoordinator(1)
+	provider := coordinator.(SourceHashWorkStateProvider)
+	started := make(chan string, 1)
+	firstRelease := make(chan struct{})
+	results, _ := startBoundedSourceHashWalk(t, coordinator, new(sourceHashHandleObserver), "alpha", 0, 2*protocol.MinBlockSize, started,
+		[]string{"source"}, []<-chan struct{}{firstRelease})
+
+	if got := awaitCoordinatorStart(t, started); got != "source" {
+		t.Fatalf("source open = %q, want source", got)
+	}
+	if got := provider.SourceHashWorkState("alpha").RetainedHandles; got != 1 {
+		t.Fatalf("retained handles during first quantum = %d, want 1", got)
+	}
+
+	close(firstRelease)
+	for result := range results {
+		if result.Err != nil {
+			t.Fatal(result.Err)
+		}
+	}
+	if got := provider.SourceHashWorkState("alpha"); got.RetainedHandles != 0 || got.Active != 0 || got.Queued != 0 {
+		t.Fatalf("Source Hash Work retained state after drain: %#v", got)
+	}
+}
+
+func TestSourceHashCoordinatorReportsBoundedEnrollmentBackpressure(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.(*sourceHashCoordinator).now = func() time.Time { return now }
+	provider := coordinator.(SourceHashWorkStateProvider)
+	started := make(chan string, 4)
+	releases := make([]chan struct{}, 4)
+	results := make([]<-chan SourceHashCompletion, 4)
+	for i := range 4 {
+		releases[i] = make(chan struct{})
+		results[i] = coordinator.Submit(t.Context(), coordinatorRequest("alpha", 0, 0,
+			newSingleQuantumCoordinatorWork(started, string(rune('a'+i)), releases[i], 1),
+		)).Completion
+	}
+	_ = awaitCoordinatorStart(t, started)
+
+	blockedContext, cancelBlocked := context.WithCancel(t.Context())
+	waiting := make(chan struct{})
+	observedContext := &observedDoneContext{Context: blockedContext, waiting: waiting}
+	returned := make(chan SourceHashSubmission, 1)
+	go func() {
+		returned <- coordinator.Submit(observedContext, coordinatorRequest("alpha", 0, 0,
+			newSingleQuantumCoordinatorWork(started, "blocked", make(chan struct{}), 1),
+		))
+	}()
+	awaitCoordinatorSignal(t, waiting, "bounded enrollment backpressure")
+	now = now.Add(5 * time.Second)
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 1 || got.Queued != 4 || got.OldestSchedulingWaitSeconds != 5 {
+		t.Fatalf("backpressured Source Hash Work state = %#v, want one active and four waiting for five seconds", got)
+	}
+
+	cancelBlocked()
+	blocked := <-returned
+	if completed := awaitCoordinatorResult(t, blocked.Completion); !errors.Is(completed.Err, context.Canceled) {
+		t.Fatalf("backpressured completion = %+v, want cancellation", completed)
+	}
+	for _, release := range releases {
+		close(release)
+	}
+	for _, result := range results {
+		if completed := awaitCoordinatorResult(t, result); completed.Err != nil {
+			t.Fatal(completed.Err)
+		}
+	}
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 0 || got.Queued != 0 || got.OldestSchedulingWaitSeconds != 0 {
+		t.Fatalf("Source Hash Work state after backpressure cleanup = %#v", got)
+	}
+}
 
 func TestSourceHashCoordinatorSerializesContinuationWithSlotReplacement(t *testing.T) {
 	coordinator := NewSourceHashCoordinator(1)
@@ -119,14 +252,14 @@ func TestSourceHashCoordinatorDisplacesRetainedLowerPriorityWorkForHighPriorityA
 	highRelease := make(chan struct{})
 	lowReleased := make(chan struct{})
 
-	lowWork := &controlledCoordinatorWork{
+	lowWork := newRetainedCoordinatorWork(&controlledCoordinatorWork{
 		started:  started,
 		released: lowReleased,
 		quanta: []controlledCoordinatorQuantum{
 			{label: "low-1", release: lowFirst, bytes: 4},
 			{label: "low-2", release: lowSecond, bytes: 3, done: true},
 		},
-	}
+	})
 	lowResult := coordinator.Submit(t.Context(), coordinatorRequest("low", -100, 0, lowWork)).Completion
 	if got := awaitCoordinatorStart(t, started); got != "low-1" {
 		t.Fatalf("first admission = %q, want low-1", got)
@@ -138,6 +271,10 @@ func TestSourceHashCoordinatorDisplacesRetainedLowerPriorityWorkForHighPriorityA
 	close(lowFirst)
 	if got := awaitCoordinatorStart(t, started); got != "gate-1" {
 		t.Fatalf("boundary admission = %q, want gate-1", got)
+	}
+	provider := coordinator.(SourceHashWorkStateProvider)
+	if got := provider.SourceHashWorkState("low").RetainedHandles; got != 1 {
+		t.Fatalf("retained handles before eviction = %d, want 1", got)
 	}
 
 	fillerResult := coordinator.Submit(t.Context(), coordinatorRequest("filler", 0, 0,
@@ -162,6 +299,9 @@ func TestSourceHashCoordinatorDisplacesRetainedLowerPriorityWorkForHighPriorityA
 	case <-lowReleased:
 	default:
 		t.Fatal("higher-priority admission did not release Low's retained source state")
+	}
+	if got := provider.SourceHashWorkState("low"); got.Queued != 0 || got.Active != 0 || got.RetainedHandles != 0 {
+		t.Fatalf("evicted Source Hash Work retained observable state: %#v", got)
 	}
 
 	close(gateRelease)
@@ -677,6 +817,10 @@ func TestSourceHashCoordinatorCancelsQueuedSourceHashWorkForUnavailableFolder(t 
 	victimWork := newSingleQuantumCoordinatorWork(started, "victim-1", victimRelease, 2)
 	victimWork.closed = victimClosed
 	victimSubmission := coordinator.Submit(t.Context(), coordinatorRequest("victim", 0, 0, victimWork))
+	provider := coordinator.(SourceHashWorkStateProvider)
+	if got := provider.SourceHashWorkState("victim"); got.Queued != 1 || got.Active != 0 {
+		t.Fatalf("queued Source Hash Work state before lifecycle change = %#v", got)
+	}
 
 	coordinator.Configure(1, map[string]int{"gate": 100})
 	select {
@@ -696,6 +840,9 @@ func TestSourceHashCoordinatorCancelsQueuedSourceHashWorkForUnavailableFolder(t 
 	case <-victimClosed:
 	default:
 		t.Fatal("queued cancellation did not close its source owner")
+	}
+	if got := provider.SourceHashWorkState("victim"); got.Queued != 0 || got.Active != 0 || got.OldestSchedulingWaitSeconds != 0 {
+		t.Fatalf("queued Source Hash Work state after lifecycle cleanup = %#v", got)
 	}
 
 	close(gateRelease)
@@ -755,11 +902,15 @@ func TestSourceHashCoordinatorCleansUpActiveSourceHashWorkAtHashingQuantumBounda
 		closed: closed,
 	}
 	submission := coordinator.Submit(t.Context(), coordinatorRequest("victim", 0, 0, work))
+	provider := coordinator.(SourceHashWorkStateProvider)
 	if got := awaitCoordinatorStart(t, started); got != "victim-1" {
 		t.Fatalf("active admission = %q, want victim-1", got)
 	}
 
 	coordinator.Configure(1, map[string]int{})
+	if got := provider.SourceHashWorkState("victim"); got.Active != 1 || got.Queued != 0 || got.OldestSchedulingWaitSeconds != 0 {
+		t.Fatalf("active Source Hash Work state during lifecycle drain = %#v", got)
+	}
 	select {
 	case completed := <-submission.Completion:
 		t.Fatalf("active quantum was preempted by lifecycle change: %+v", completed)
@@ -786,6 +937,9 @@ func TestSourceHashCoordinatorCleansUpActiveSourceHashWorkAtHashingQuantumBounda
 	case <-closed:
 	default:
 		t.Fatal("active cancellation did not close its source owner")
+	}
+	if got := provider.SourceHashWorkState("victim"); got.Active != 0 || got.Queued != 0 || got.OldestSchedulingWaitSeconds != 0 {
+		t.Fatalf("active Source Hash Work state after lifecycle cleanup = %#v", got)
 	}
 }
 
@@ -1331,6 +1485,34 @@ type controlledCoordinatorWork struct {
 	closeStarted chan struct{}
 	closeRelease <-chan struct{}
 	close        sync.Once
+}
+
+type retainedCoordinatorWork struct {
+	*controlledCoordinatorWork
+	retained atomic.Bool
+}
+
+func newRetainedCoordinatorWork(work *controlledCoordinatorWork) *retainedCoordinatorWork {
+	return &retainedCoordinatorWork{controlledCoordinatorWork: work}
+}
+
+func (w *retainedCoordinatorWork) HashNext(ctx context.Context) (HashingQuantumResult, error) {
+	w.retained.Store(true)
+	return w.controlledCoordinatorWork.HashNext(ctx)
+}
+
+func (w *retainedCoordinatorWork) RetainedHandle() bool {
+	return w.retained.Load()
+}
+
+func (w *retainedCoordinatorWork) ReleaseRetainedHandle() {
+	w.retained.Store(false)
+	w.controlledCoordinatorWork.ReleaseRetainedHandle()
+}
+
+func (w *retainedCoordinatorWork) Close() {
+	w.retained.Store(false)
+	w.controlledCoordinatorWork.Close()
 }
 
 type sourceHashEnrollmentObserver struct {

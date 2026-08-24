@@ -12,6 +12,7 @@ import (
 	"hash"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/fs"
@@ -68,6 +69,7 @@ type retainedSourceHashWork struct {
 	counter    Counter
 	current    *SourceHashWork
 	closed     bool
+	retained   atomic.Bool
 }
 
 func newRetainedSourceHashWork(folderID string, filesystem fs.Filesystem, file protocol.FileInfo, counter Counter) *retainedSourceHashWork {
@@ -91,13 +93,19 @@ func (w *retainedSourceHashWork) HashNext(ctx context.Context) (HashingQuantumRe
 			return HashingQuantumResult{}, err
 		}
 		w.current = current
+		w.retained.Store(true)
 	}
 
 	result, err := w.current.HashNext(ctx)
 	if err != nil || result.Done {
 		w.current = nil
+		w.retained.Store(false)
 	}
 	return result, err
+}
+
+func (w *retainedSourceHashWork) RetainedHandle() bool {
+	return w.retained.Load()
 }
 
 func (w *retainedSourceHashWork) NextHashingQuantumBytes() int64 {
@@ -118,6 +126,7 @@ func (w *retainedSourceHashWork) ReleaseRetainedHandle() {
 	if w.current != nil {
 		w.current.Close()
 		w.current = nil
+		w.retained.Store(false)
 	}
 }
 
@@ -131,6 +140,7 @@ func (w *retainedSourceHashWork) Close() {
 	if w.current != nil {
 		w.current.Close()
 		w.current = nil
+		w.retained.Store(false)
 	}
 }
 

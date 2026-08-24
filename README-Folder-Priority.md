@@ -71,7 +71,7 @@ tokens, or guarantee bandwidth.
 ## Observe current scheduler state
 
 `GET /rest/db/status?folder=:id` reports whether scheduling is active and the
-current state for each direction:
+current Block Transfer and Source Hash Work state:
 
 ```json
 {
@@ -86,6 +86,14 @@ current state for each direction:
       "queuedBytes": 0,
       "activeBytes": 0,
       "oldestSchedulingWaitSeconds": 0
+    },
+    "sourceHashWork": {
+      "queued": 3,
+      "active": 2,
+      "oldestSchedulingWaitSeconds": 8.25,
+      "hashCapacity": 4,
+      "retainedHandles": 5,
+      "retainedHandleBudget": 7
     }
   }
 }
@@ -97,13 +105,28 @@ It keeps increasing while work starves and returns to zero when the queue is
 empty. The REST response exposes stable behavior only; it does not expose
 internal queue records.
 
-Prometheus exposes equivalent gauges with only the bounded `folder` and
-`direction` labels:
+`sourceHashWork.queued` includes work waiting in the coordinator, work under
+bounded enrollment backpressure, and changed-file metadata still waiting in a
+buffered discovery spool. `active` counts current Hashing Quanta. Hash Capacity
+and retained-handle usage and budget are node-wide current values repeated in
+each Folder status so an operator can explain local work in the context of the
+shared resource. Successful drain, cancellation, Folder pause/removal, handle
+eviction, and discovery-spool cleanup remove their work and handle usage from
+the next status response.
+
+Prometheus exposes equivalent gauges. Per-work-class metrics use only current
+configured `folder` values and the bounded `work_class` values `upload`,
+`download`, and `source_hash`; no file name or queue identifier is a label:
 
 - `syncthing_model_folder_priority_scheduler_active`
 - `syncthing_model_folder_priority_queued_bytes`
 - `syncthing_model_folder_priority_active_bytes`
 - `syncthing_model_folder_priority_oldest_scheduling_wait_seconds`
+- `syncthing_model_folder_priority_source_hash_work_queued`
+- `syncthing_model_folder_priority_source_hash_work_active`
+- `syncthing_model_folder_priority_hash_capacity`
+- `syncthing_model_folder_priority_retained_handles`
+- `syncthing_model_folder_priority_retained_handle_budget`
 
 ## Validate a three-peer studio workload
 

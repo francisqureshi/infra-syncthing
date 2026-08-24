@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/syncthing/syncthing/lib/protocol"
 )
@@ -41,8 +42,9 @@ type SourceHashFolder struct {
 // SourceHashRequest transfers ownership of one file's Source Hash Work to the
 // coordinator.
 type SourceHashRequest struct {
-	Folder SourceHashFolder
-	Work   HashingQuantumWork
+	Folder        SourceHashFolder
+	Work          HashingQuantumWork
+	BufferedEpoch SourceHashEpoch
 }
 
 // SourceHashCompletion reports terminal Source Hash Work. Bytes includes all
@@ -80,6 +82,27 @@ type SourceHashCoordinator interface {
 	Submit(context.Context, SourceHashRequest) SourceHashSubmission
 }
 
+// SourceHashWorkState is the stable current aggregate for one Folder's Source
+// Hash Work and the node-wide resources it consumes.
+type SourceHashWorkState struct {
+	Queued                      int
+	Active                      int
+	OldestSchedulingWaitSeconds float64
+	HashCapacity                int
+	RetainedHandles             int
+	RetainedHandleBudget        int
+}
+
+// SourceHashWorkStateProvider exposes current aggregate state without exposing
+// file names, queue records, or coordinator internals.
+type SourceHashWorkStateProvider interface {
+	SourceHashWorkState(folder string) SourceHashWorkState
+}
+
+type retainedHandleReporter interface {
+	RetainedHandle() bool
+}
+
 type sourceHashCoordinator struct {
 	mut sync.Mutex
 
@@ -94,9 +117,12 @@ type sourceHashCoordinator struct {
 	activeByShare     map[equalPriorityShareKey]int
 	epochs            map[string]int
 	epochPriority     map[string]int
+	sourceHashEpochs  map[*sourceHashEpoch]struct{}
 	queued            []*coordinatedSourceHashWork
+	pending           map[*coordinatedSourceHashWork]struct{}
 	enrollmentChanged chan struct{}
 	cleanupInProgress int
+	now               func() time.Time
 }
 
 type equalPriorityShareKey struct {
@@ -108,6 +134,9 @@ type sourceHashEpoch struct {
 	coordinator *sourceHashCoordinator
 	folder      string
 	once        sync.Once
+	buffered    int
+	bufferedAt  time.Time
+	closed      bool
 }
 
 type coordinatedSourceHashWork struct {
@@ -119,6 +148,7 @@ type coordinatedSourceHashWork struct {
 	bytes       int64
 	activeBytes int64
 	activeShare equalPriorityShareKey
+	queuedAt    time.Time
 	canceled    bool
 }
 
@@ -138,8 +168,73 @@ func NewSourceHashCoordinator(capacity int) SourceHashCoordinator {
 		activeByShare:     make(map[equalPriorityShareKey]int),
 		epochs:            make(map[string]int),
 		epochPriority:     make(map[string]int),
+		sourceHashEpochs:  make(map[*sourceHashEpoch]struct{}),
+		pending:           make(map[*coordinatedSourceHashWork]struct{}),
 		enrollmentChanged: make(chan struct{}),
+		now:               time.Now,
 	}
+}
+
+// SourceHashWorkState reports current work for one Folder together with the
+// current node-wide Hash Capacity and retained-handle usage. It derives every
+// value directly from live coordinator ownership and retains no scrape state.
+func (c *sourceHashCoordinator) SourceHashWorkState(folder string) SourceHashWorkState {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
+	state := SourceHashWorkState{
+		HashCapacity:         c.capacity,
+		RetainedHandleBudget: c.capacity + sourceHashLookahead,
+	}
+	now := c.now()
+	for work := range c.activeWorks {
+		if work.request.Folder.ID == folder {
+			state.Active++
+		}
+		if retainedHandle(work.request.Work) {
+			state.RetainedHandles++
+		}
+	}
+	for _, work := range c.queued {
+		if work.request.Folder.ID == folder {
+			state.Queued++
+			wait := now.Sub(work.queuedAt).Seconds()
+			if wait > state.OldestSchedulingWaitSeconds {
+				state.OldestSchedulingWaitSeconds = wait
+			}
+		}
+		if retainedHandle(work.request.Work) {
+			state.RetainedHandles++
+		}
+	}
+	for work := range c.pending {
+		if work.request.Folder.ID == folder {
+			state.Queued++
+			wait := now.Sub(work.queuedAt).Seconds()
+			if wait > state.OldestSchedulingWaitSeconds {
+				state.OldestSchedulingWaitSeconds = wait
+			}
+		}
+		if retainedHandle(work.request.Work) {
+			state.RetainedHandles++
+		}
+	}
+	for epoch := range c.sourceHashEpochs {
+		if epoch.folder != folder || epoch.buffered == 0 {
+			continue
+		}
+		state.Queued += epoch.buffered
+		wait := now.Sub(epoch.bufferedAt).Seconds()
+		if wait > state.OldestSchedulingWaitSeconds {
+			state.OldestSchedulingWaitSeconds = wait
+		}
+	}
+	return state
+}
+
+func retainedHandle(work HashingQuantumWork) bool {
+	reporter, ok := work.(retainedHandleReporter)
+	return ok && reporter.RetainedHandle()
 }
 
 // Configure applies live node-wide Hash Capacity and Folder Priority policy.
@@ -182,6 +277,12 @@ func (c *sourceHashCoordinator) Configure(capacity int, priorities map[string]in
 			c.epochPriority[folder] = priority
 		} else {
 			delete(c.epochPriority, folder)
+		}
+	}
+	for epoch := range c.sourceHashEpochs {
+		if _, ok := c.priorities[epoch.folder]; !ok {
+			epoch.buffered = 0
+			epoch.bufferedAt = time.Time{}
 		}
 	}
 	c.configured = true
@@ -260,16 +361,22 @@ func (c *sourceHashCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) So
 	c.initializeFairnessLocked(shareKey)
 	c.epochs[folder.ID]++
 	c.epochPriority[folder.ID] = folder.Priority
-	c.mut.Unlock()
-	return &sourceHashEpoch{
+	epoch := &sourceHashEpoch{
 		coordinator: c,
 		folder:      folder.ID,
 	}
+	c.sourceHashEpochs[epoch] = struct{}{}
+	c.mut.Unlock()
+	return epoch
 }
 
 func (e *sourceHashEpoch) Close() {
 	e.once.Do(func() {
 		e.coordinator.mut.Lock()
+		e.closed = true
+		e.buffered = 0
+		e.bufferedAt = time.Time{}
+		delete(e.coordinator.sourceHashEpochs, e)
 		e.coordinator.epochs[e.folder]--
 		if e.coordinator.epochs[e.folder] == 0 {
 			delete(e.coordinator.epochs, e.folder)
@@ -277,6 +384,44 @@ func (e *sourceHashEpoch) Close() {
 		}
 		e.coordinator.mut.Unlock()
 	})
+}
+
+func (e *sourceHashEpoch) SetBufferedSourceHashWork(count int) {
+	e.coordinator.mut.Lock()
+	defer e.coordinator.mut.Unlock()
+	if e.closed || count <= 0 {
+		e.buffered = 0
+		e.bufferedAt = time.Time{}
+		return
+	}
+	if e.coordinator.configured {
+		if _, ok := e.coordinator.priorities[e.folder]; !ok {
+			return
+		}
+	}
+	if e.buffered == 0 {
+		e.bufferedAt = e.coordinator.now()
+	}
+	e.buffered = count
+}
+
+func (c *sourceHashCoordinator) consumeBufferedSourceHashWorkLocked(epoch SourceHashEpoch) time.Time {
+	bufferedEpoch, ok := epoch.(*sourceHashEpoch)
+	if !ok || bufferedEpoch.coordinator != c || bufferedEpoch.buffered == 0 {
+		return time.Time{}
+	}
+	queuedAt := bufferedEpoch.bufferedAt
+	bufferedEpoch.buffered--
+	if bufferedEpoch.buffered == 0 {
+		bufferedEpoch.bufferedAt = time.Time{}
+	}
+	return queuedAt
+}
+
+func setBufferedSourceHashWork(epoch SourceHashEpoch, count int) {
+	if reporter, ok := epoch.(interface{ SetBufferedSourceHashWork(int) }); ok {
+		reporter.SetBufferedSourceHashWork(count)
+	}
 }
 
 func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
@@ -287,8 +432,15 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 		admitted:   make(chan struct{}),
 	}
 
+	buffered := request.BufferedEpoch != nil
+	pending := false
 	for {
 		if err := ctx.Err(); err != nil {
+			if pending {
+				c.mut.Lock()
+				delete(c.pending, work)
+				c.mut.Unlock()
+			}
 			c.cancel(work)
 			return SourceHashSubmission{
 				Admitted:   work.admitted,
@@ -296,9 +448,21 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 			}
 		}
 		c.mut.Lock()
+		if !pending {
+			work.queuedAt = c.now()
+			c.pending[work] = struct{}{}
+			pending = true
+		}
+		if buffered {
+			if queuedAt := c.consumeBufferedSourceHashWorkLocked(request.BufferedEpoch); !queuedAt.IsZero() {
+				work.queuedAt = queuedAt
+			}
+			buffered = false
+		}
 		if c.configured {
 			priority, ok := c.priorities[request.Folder.ID]
 			if !ok {
+				delete(c.pending, work)
 				c.mut.Unlock()
 				c.cancel(work)
 				return SourceHashSubmission{
@@ -317,6 +481,9 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 				case <-changed:
 					continue
 				case <-ctx.Done():
+					c.mut.Lock()
+					delete(c.pending, work)
+					c.mut.Unlock()
 					c.cancel(work)
 					return SourceHashSubmission{
 						Admitted:   work.admitted,
@@ -328,6 +495,7 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 			displaced := c.queued[victim]
 			c.queued = append(c.queued[:victim], c.queued[victim+1:]...)
 			c.initializeFairnessLocked(work.shareKey())
+			delete(c.pending, work)
 			c.queued = append(c.queued, work)
 			c.cleanupAndScheduleLocked(func() {
 				displaced.request.Work.ReleaseRetainedHandle()
@@ -340,6 +508,7 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 			}
 		}
 		c.initializeFairnessLocked(work.shareKey())
+		delete(c.pending, work)
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
 		c.mut.Unlock()
@@ -385,6 +554,7 @@ func (c *sourceHashCoordinator) scheduleLocked() {
 		}
 		work := c.queued[next]
 		c.queued = append(c.queued[:next], c.queued[next+1:]...)
+		work.queuedAt = time.Time{}
 		c.active++
 		c.activeWorks[work] = struct{}{}
 		c.byFolder[work.request.Folder.ID]++
@@ -496,6 +666,7 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 			completeDisplacedSourceHashWork(work)
 			return
 		}
+		work.queuedAt = c.now()
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
 		c.mut.Unlock()
@@ -536,6 +707,9 @@ func (c *sourceHashCoordinator) releaseActiveLocked(work *coordinatedSourceHashW
 	c.active--
 	delete(c.activeWorks, work)
 	c.byFolder[work.request.Folder.ID]--
+	if c.byFolder[work.request.Folder.ID] == 0 {
+		delete(c.byFolder, work.request.Folder.ID)
+	}
 	c.activeByShare[work.activeShare]--
 	work.activeShare = equalPriorityShareKey{}
 }

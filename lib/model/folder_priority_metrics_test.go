@@ -41,6 +41,14 @@ func TestFolderPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 			ActiveBytes:                 22,
 			OldestSchedulingWaitSeconds: 23,
 		},
+		SourceHashWork: FolderPrioritySourceHashWorkState{
+			Queued:                      31,
+			Active:                      32,
+			OldestSchedulingWaitSeconds: 33,
+			HashCapacity:                34,
+			RetainedHandles:             35,
+			RetainedHandleBudget:        36,
+		},
 	}}
 	registry := prometheus.NewPedanticRegistry()
 	registry.MustRegister(newFolderPriorityMetricsCollector(wrapper, &provider))
@@ -53,14 +61,23 @@ func TestFolderPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 	for _, family := range families {
 		values := make(map[string]float64)
 		for _, metric := range family.Metric {
-			if len(metric.Label) != 2 {
-				t.Fatalf("metric %q has %d labels, expected only folder and direction", family.GetName(), len(metric.Label))
-			}
 			labels := make(map[string]string)
 			for _, label := range metric.Label {
 				labels[label.GetName()] = label.GetValue()
 			}
-			values[labels["direction"]+"/"+labels["folder"]] = metric.GetGauge().GetValue()
+			for label := range labels {
+				if label != "folder" && label != "work_class" {
+					t.Fatalf("metric %q exposes unbounded label %q", family.GetName(), label)
+				}
+			}
+			key := "node"
+			if folder := labels["folder"]; folder != "" {
+				key = folder
+			}
+			if workClass := labels["work_class"]; workClass != "" {
+				key = workClass + "/" + key
+			}
+			values[key] = metric.GetGauge().GetValue()
 		}
 		got[family.GetName()] = values
 	}
@@ -69,17 +86,34 @@ func TestFolderPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 			"download/alpha": 22,
 			"upload/alpha":   12,
 		},
+		"syncthing_model_folder_priority_hash_capacity": {
+			"node": 34,
+		},
 		"syncthing_model_folder_priority_oldest_scheduling_wait_seconds": {
-			"download/alpha": 23,
-			"upload/alpha":   13,
+			"download/alpha":    23,
+			"source_hash/alpha": 33,
+			"upload/alpha":      13,
 		},
 		"syncthing_model_folder_priority_queued_bytes": {
 			"download/alpha": 21,
 			"upload/alpha":   11,
 		},
+		"syncthing_model_folder_priority_retained_handle_budget": {
+			"node": 36,
+		},
+		"syncthing_model_folder_priority_retained_handles": {
+			"node": 35,
+		},
 		"syncthing_model_folder_priority_scheduler_active": {
-			"download/alpha": 1,
-			"upload/alpha":   1,
+			"download/alpha":    1,
+			"source_hash/alpha": 1,
+			"upload/alpha":      1,
+		},
+		"syncthing_model_folder_priority_source_hash_work_active": {
+			"alpha": 32,
+		},
+		"syncthing_model_folder_priority_source_hash_work_queued": {
+			"alpha": 31,
 		},
 	}
 	if len(got) != len(want) {
@@ -97,20 +131,26 @@ func TestFolderPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 		}
 	}
 
-	provider.state.Upload.OldestSchedulingWaitSeconds = 99
+	provider.state.SourceHashWork.Queued = 0
+	provider.state.SourceHashWork.Active = 0
+	provider.state.SourceHashWork.OldestSchedulingWaitSeconds = 0
+	provider.state.SourceHashWork.RetainedHandles = 0
 	families, err = registry.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, family := range families {
-		if family.GetName() != "syncthing_model_folder_priority_oldest_scheduling_wait_seconds" {
-			continue
-		}
 		for _, metric := range family.Metric {
+			sourceHashMetric := family.GetName() == "syncthing_model_folder_priority_source_hash_work_queued" ||
+				family.GetName() == "syncthing_model_folder_priority_source_hash_work_active" ||
+				family.GetName() == "syncthing_model_folder_priority_retained_handles"
 			for _, label := range metric.Label {
-				if label.GetName() == "direction" && label.GetValue() == "upload" && metric.GetGauge().GetValue() != 99 {
-					t.Fatalf("second scrape reported stale Scheduling Wait %v, want 99", metric.GetGauge().GetValue())
+				if family.GetName() == "syncthing_model_folder_priority_oldest_scheduling_wait_seconds" && label.GetName() == "work_class" && label.GetValue() == "source_hash" {
+					sourceHashMetric = true
 				}
+			}
+			if sourceHashMetric && metric.GetGauge().GetValue() != 0 {
+				t.Fatalf("second scrape retained completed Source Hash Work in %q: %v", family.GetName(), metric.GetGauge().GetValue())
 			}
 		}
 	}

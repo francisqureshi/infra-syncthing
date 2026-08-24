@@ -44,6 +44,14 @@ func TestFolderSummaryReportsFolderPrioritySchedulerState(t *testing.T) {
 				ActiveBytes:                 22,
 				OldestSchedulingWaitSeconds: 23,
 			},
+			SourceHashWork: model.FolderPrioritySourceHashWorkState{
+				Queued:                      31,
+				Active:                      32,
+				OldestSchedulingWaitSeconds: 33,
+				HashCapacity:                34,
+				RetainedHandles:             35,
+				RetainedHandleBudget:        36,
+			},
 		},
 	}
 	service := model.NewFolderSummaryService(wrapper, provider, protocol.LocalDeviceID, events.NoopLogger)

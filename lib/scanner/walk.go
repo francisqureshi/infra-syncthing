@@ -197,6 +197,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 	go func() {
 		var total int64 = 1
 		var spoolErr error
+		defer setBufferedSourceHashWork(sourceHashEpoch, 0)
 
 		for file := range toHashChan {
 			if spoolErr == nil {
@@ -207,6 +208,9 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 
 		if spoolErr == nil {
 			spoolErr = discoverySpool.Rewind()
+			if spoolErr == nil {
+				setBufferedSourceHashWork(sourceHashEpoch, discoverySpool.Len())
+			}
 		}
 		if spoolErr != nil {
 			spoolErr = errors.Join(spoolErr, discoverySpool.Close())
@@ -239,6 +243,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 			inbox:       realToHashChan,
 			counter:     progress,
 			done:        done,
+			buffered:    true,
 		}, w.Hashers)
 		go func() {
 			<-done

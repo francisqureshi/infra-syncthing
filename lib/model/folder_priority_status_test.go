@@ -11,7 +11,17 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/scanner"
 )
+
+type staticSourceHashStateCoordinator struct {
+	scanner.SourceHashCoordinator
+	state scanner.SourceHashWorkState
+}
+
+func (c staticSourceHashStateCoordinator) SourceHashWorkState(string) scanner.SourceHashWorkState {
+	return c.state
+}
 
 func TestFolderPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 	now := time.Unix(1_000, 0)
@@ -53,7 +63,15 @@ func TestFolderPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 	})
 
 	now = now.Add(9 * time.Second)
-	m := &model{uploadScheduler: upload, downloadScheduler: download}
+	sourceHash := staticSourceHashStateCoordinator{state: scanner.SourceHashWorkState{
+		Queued:                      3,
+		Active:                      2,
+		OldestSchedulingWaitSeconds: 8,
+		HashCapacity:                4,
+		RetainedHandles:             5,
+		RetainedHandleBudget:        7,
+	}}
+	m := &model{uploadScheduler: upload, downloadScheduler: download, sourceHashCoordinator: sourceHash}
 	got := m.FolderPrioritySchedulerState("alpha")
 	want := FolderPrioritySchedulerState{
 		Active: true,
@@ -61,6 +79,14 @@ func TestFolderPrioritySchedulerStateReportsCurrentWork(t *testing.T) {
 			QueuedBytes:                 7,
 			ActiveBytes:                 10,
 			OldestSchedulingWaitSeconds: 9,
+		},
+		SourceHashWork: FolderPrioritySourceHashWorkState{
+			Queued:                      3,
+			Active:                      2,
+			OldestSchedulingWaitSeconds: 8,
+			HashCapacity:                4,
+			RetainedHandles:             5,
+			RetainedHandleBudget:        7,
 		},
 	}
 	if got != want {

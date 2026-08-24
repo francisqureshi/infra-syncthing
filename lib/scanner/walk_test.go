@@ -1031,6 +1031,57 @@ func TestBufferedWalkPreservesFinalScanProgressTotals(t *testing.T) {
 	}
 }
 
+func TestBufferedWalkReportsSpooledSourceHashWorkAndCleansUpState(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"payload", "waiting"} {
+		if err := fs.WriteFile(underlying, name, make([]byte, protocol.MinBlockSize), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-readRelease:
+		default:
+			close(readRelease)
+		}
+	})
+	now := time.Unix(1_000, 0)
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.(*sourceHashCoordinator).now = func() time.Time { return now }
+	provider := coordinator.(SourceHashWorkStateProvider)
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "alpha"
+	cfg.Filesystem = &sourceHashStateBarrierFilesystem{
+		Filesystem: underlying,
+		started:    readStarted,
+		release:    readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.SourceHashFolder = SourceHashFolder{ID: "alpha"}
+	cfg.SourceHashCoordinator = coordinator
+	cfg.ProgressTickIntervalS = 1
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "buffered traversal completion")
+	awaitScannerSignal(t, readStarted, "buffered Source Hash Work admission")
+	now = now.Add(7 * time.Second)
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 1 || got.Queued != 1 || got.OldestSchedulingWaitSeconds != 7 || got.RetainedHandles != 1 {
+		t.Fatalf("buffered Source Hash Work state = %#v, want one active, one waiting, seven seconds wait, and one handle", got)
+	}
+
+	cancel()
+	close(readRelease)
+	for range walkResult.Results {
+	}
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 0 || got.Queued != 0 || got.OldestSchedulingWaitSeconds != 0 || got.RetainedHandles != 0 {
+		t.Fatalf("buffered Source Hash Work state after cleanup = %#v", got)
+	}
+}
+
 func TestStreamingWalkSignalsTraversalBeforeHashingCompletes(t *testing.T) {
 	testWalkSignalsTraversalBeforeHashingCompletes(t, -1)
 }
@@ -1182,6 +1233,13 @@ type readBarrierFilesystem struct {
 	release chan struct{}
 }
 
+type sourceHashStateBarrierFilesystem struct {
+	fs.Filesystem
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
 type walkBarrierFilesystem struct {
 	fs.Filesystem
 	path    string
@@ -1286,6 +1344,27 @@ func (f *readBarrierFilesystem) Open(name string) (fs.File, error) {
 		return file, err
 	}
 	return &readBarrierFile{File: file, started: f.started, release: f.release}, nil
+}
+
+func (f *sourceHashStateBarrierFilesystem) Open(name string) (fs.File, error) {
+	file, err := f.Filesystem.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &sourceHashStateBarrierFile{File: file, owner: f}, nil
+}
+
+type sourceHashStateBarrierFile struct {
+	fs.File
+	owner *sourceHashStateBarrierFilesystem
+}
+
+func (f *sourceHashStateBarrierFile) Read(buf []byte) (int, error) {
+	f.owner.once.Do(func() {
+		close(f.owner.started)
+		<-f.owner.release
+	})
+	return f.File.Read(buf)
 }
 
 type readBarrierFile struct {
