@@ -42,9 +42,9 @@ type SourceHashFolder struct {
 // SourceHashRequest transfers ownership of one file's Source Hash Work to the
 // coordinator.
 type SourceHashRequest struct {
-	Folder        SourceHashFolder
-	Work          HashingQuantumWork
-	BufferedEpoch SourceHashEpoch
+	Folder              SourceHashFolder
+	Work                HashingQuantumWork
+	DiscoverySpoolEpoch SourceHashEpoch
 }
 
 // SourceHashCompletion reports terminal Source Hash Work. Bytes includes all
@@ -123,6 +123,8 @@ type sourceHashCoordinator struct {
 	enrollmentChanged chan struct{}
 	cleanupInProgress int
 	now               func() time.Time
+	// discoverySpoolWorkChanged is a test-only synchronization hook.
+	discoverySpoolWorkChanged func()
 }
 
 type equalPriorityShareKey struct {
@@ -131,12 +133,12 @@ type equalPriorityShareKey struct {
 }
 
 type sourceHashEpoch struct {
-	coordinator *sourceHashCoordinator
-	folder      string
-	once        sync.Once
-	buffered    int
-	bufferedAt  time.Time
-	closed      bool
+	coordinator                 *sourceHashCoordinator
+	folder                      string
+	once                        sync.Once
+	discoverySpoolWork          int
+	discoverySpoolWaitStartedAt time.Time
+	closed                      bool
 }
 
 type coordinatedSourceHashWork struct {
@@ -220,11 +222,11 @@ func (c *sourceHashCoordinator) SourceHashWorkState(folder string) SourceHashWor
 		}
 	}
 	for epoch := range c.sourceHashEpochs {
-		if epoch.folder != folder || epoch.buffered == 0 {
+		if epoch.folder != folder || epoch.discoverySpoolWork == 0 {
 			continue
 		}
-		state.Queued += epoch.buffered
-		wait := now.Sub(epoch.bufferedAt).Seconds()
+		state.Queued += epoch.discoverySpoolWork
+		wait := now.Sub(epoch.discoverySpoolWaitStartedAt).Seconds()
 		if wait > state.OldestSchedulingWaitSeconds {
 			state.OldestSchedulingWaitSeconds = wait
 		}
@@ -281,8 +283,8 @@ func (c *sourceHashCoordinator) Configure(capacity int, priorities map[string]in
 	}
 	for epoch := range c.sourceHashEpochs {
 		if _, ok := c.priorities[epoch.folder]; !ok {
-			epoch.buffered = 0
-			epoch.bufferedAt = time.Time{}
+			epoch.discoverySpoolWork = 0
+			epoch.discoverySpoolWaitStartedAt = time.Time{}
 		}
 	}
 	c.configured = true
@@ -374,8 +376,8 @@ func (e *sourceHashEpoch) Close() {
 	e.once.Do(func() {
 		e.coordinator.mut.Lock()
 		e.closed = true
-		e.buffered = 0
-		e.bufferedAt = time.Time{}
+		e.discoverySpoolWork = 0
+		e.discoverySpoolWaitStartedAt = time.Time{}
 		delete(e.coordinator.sourceHashEpochs, e)
 		e.coordinator.epochs[e.folder]--
 		if e.coordinator.epochs[e.folder] == 0 {
@@ -386,12 +388,13 @@ func (e *sourceHashEpoch) Close() {
 	})
 }
 
-func (e *sourceHashEpoch) SetBufferedSourceHashWork(count int) {
+func (e *sourceHashEpoch) SetDiscoverySpoolSourceHashWork(count int) {
 	e.coordinator.mut.Lock()
 	defer e.coordinator.mut.Unlock()
 	if e.closed || count <= 0 {
-		e.buffered = 0
-		e.bufferedAt = time.Time{}
+		e.discoverySpoolWork = 0
+		e.discoverySpoolWaitStartedAt = time.Time{}
+		e.coordinator.notifyDiscoverySpoolWorkChangedLocked()
 		return
 	}
 	if e.coordinator.configured {
@@ -399,28 +402,36 @@ func (e *sourceHashEpoch) SetBufferedSourceHashWork(count int) {
 			return
 		}
 	}
-	if e.buffered == 0 {
-		e.bufferedAt = e.coordinator.now()
+	if e.discoverySpoolWork == 0 {
+		e.discoverySpoolWaitStartedAt = e.coordinator.now()
 	}
-	e.buffered = count
+	e.discoverySpoolWork = count
+	e.coordinator.notifyDiscoverySpoolWorkChangedLocked()
 }
 
-func (c *sourceHashCoordinator) consumeBufferedSourceHashWorkLocked(epoch SourceHashEpoch) time.Time {
-	bufferedEpoch, ok := epoch.(*sourceHashEpoch)
-	if !ok || bufferedEpoch.coordinator != c || bufferedEpoch.buffered == 0 {
+func (c *sourceHashCoordinator) consumeDiscoverySpoolSourceHashWorkLocked(epoch SourceHashEpoch) time.Time {
+	discoverySpoolEpoch, ok := epoch.(*sourceHashEpoch)
+	if !ok || discoverySpoolEpoch.coordinator != c || discoverySpoolEpoch.discoverySpoolWork == 0 {
 		return time.Time{}
 	}
-	queuedAt := bufferedEpoch.bufferedAt
-	bufferedEpoch.buffered--
-	if bufferedEpoch.buffered == 0 {
-		bufferedEpoch.bufferedAt = time.Time{}
+	queuedAt := discoverySpoolEpoch.discoverySpoolWaitStartedAt
+	discoverySpoolEpoch.discoverySpoolWork--
+	if discoverySpoolEpoch.discoverySpoolWork == 0 {
+		discoverySpoolEpoch.discoverySpoolWaitStartedAt = time.Time{}
 	}
+	c.notifyDiscoverySpoolWorkChangedLocked()
 	return queuedAt
 }
 
-func setBufferedSourceHashWork(epoch SourceHashEpoch, count int) {
-	if reporter, ok := epoch.(interface{ SetBufferedSourceHashWork(int) }); ok {
-		reporter.SetBufferedSourceHashWork(count)
+func (c *sourceHashCoordinator) notifyDiscoverySpoolWorkChangedLocked() {
+	if c.discoverySpoolWorkChanged != nil {
+		c.discoverySpoolWorkChanged()
+	}
+}
+
+func setDiscoverySpoolSourceHashWork(epoch SourceHashEpoch, count int) {
+	if reporter, ok := epoch.(interface{ SetDiscoverySpoolSourceHashWork(int) }); ok {
+		reporter.SetDiscoverySpoolSourceHashWork(count)
 	}
 }
 
@@ -432,7 +443,7 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 		admitted:   make(chan struct{}),
 	}
 
-	buffered := request.BufferedEpoch != nil
+	fromDiscoverySpool := request.DiscoverySpoolEpoch != nil
 	pending := false
 	for {
 		if err := ctx.Err(); err != nil {
@@ -453,11 +464,11 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 			c.pending[work] = struct{}{}
 			pending = true
 		}
-		if buffered {
-			if queuedAt := c.consumeBufferedSourceHashWorkLocked(request.BufferedEpoch); !queuedAt.IsZero() {
+		if fromDiscoverySpool {
+			if queuedAt := c.consumeDiscoverySpoolSourceHashWorkLocked(request.DiscoverySpoolEpoch); !queuedAt.IsZero() {
 				work.queuedAt = queuedAt
 			}
-			buffered = false
+			fromDiscoverySpool = false
 		}
 		if c.configured {
 			priority, ok := c.priorities[request.Folder.ID]

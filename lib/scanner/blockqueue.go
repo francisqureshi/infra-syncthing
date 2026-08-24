@@ -48,41 +48,41 @@ func hashFileInfo(ctx context.Context, folderID string, filesystem fs.Filesystem
 // workers are used in parallel. The outbox will become closed when the inbox
 // is closed and all items handled.
 type parallelHasher struct {
-	folder      SourceHashFolder
-	fs          fs.Filesystem
-	coordinator SourceHashCoordinator
-	epoch       SourceHashEpoch
-	outbox      chan<- ScanResult
-	inbox       <-chan protocol.FileInfo
-	counter     Counter
-	done        chan<- struct{}
-	buffered    bool
-	wg          sync.WaitGroup
+	folder             SourceHashFolder
+	fs                 fs.Filesystem
+	coordinator        SourceHashCoordinator
+	epoch              SourceHashEpoch
+	outbox             chan<- ScanResult
+	inbox              <-chan protocol.FileInfo
+	counter            Counter
+	done               chan<- struct{}
+	fromDiscoverySpool bool
+	wg                 sync.WaitGroup
 }
 
 type parallelHasherConfig struct {
-	folder      SourceHashFolder
-	filesystem  fs.Filesystem
-	coordinator SourceHashCoordinator
-	epoch       SourceHashEpoch
-	outbox      chan<- ScanResult
-	inbox       <-chan protocol.FileInfo
-	counter     Counter
-	done        chan<- struct{}
-	buffered    bool
+	folder             SourceHashFolder
+	filesystem         fs.Filesystem
+	coordinator        SourceHashCoordinator
+	epoch              SourceHashEpoch
+	outbox             chan<- ScanResult
+	inbox              <-chan protocol.FileInfo
+	counter            Counter
+	done               chan<- struct{}
+	fromDiscoverySpool bool
 }
 
 func newParallelHasher(ctx context.Context, cfg parallelHasherConfig, workers int) {
 	ph := &parallelHasher{
-		folder:      cfg.folder,
-		fs:          cfg.filesystem,
-		coordinator: cfg.coordinator,
-		epoch:       cfg.epoch,
-		outbox:      cfg.outbox,
-		inbox:       cfg.inbox,
-		counter:     cfg.counter,
-		done:        cfg.done,
-		buffered:    cfg.buffered,
+		folder:             cfg.folder,
+		fs:                 cfg.filesystem,
+		coordinator:        cfg.coordinator,
+		epoch:              cfg.epoch,
+		outbox:             cfg.outbox,
+		inbox:              cfg.inbox,
+		counter:            cfg.counter,
+		done:               cfg.done,
+		fromDiscoverySpool: cfg.fromDiscoverySpool,
 	}
 
 	ph.wg.Add(workers)
@@ -111,17 +111,17 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 
 			work := newRetainedSourceHashWork(ph.folder.ID, ph.fs, f, ph.counter)
 			var completion SourceHashCompletion
-			var bufferedEpoch SourceHashEpoch
-			if ph.buffered {
-				bufferedEpoch = ph.epoch
+			var discoverySpoolEpoch SourceHashEpoch
+			if ph.fromDiscoverySpool {
+				discoverySpoolEpoch = ph.epoch
 			}
 			for {
 				submission := ph.coordinator.Submit(ctx, SourceHashRequest{
-					Folder:        ph.folder,
-					Work:          work,
-					BufferedEpoch: bufferedEpoch,
+					Folder:              ph.folder,
+					Work:                work,
+					DiscoverySpoolEpoch: discoverySpoolEpoch,
 				})
-				bufferedEpoch = nil
+				discoverySpoolEpoch = nil
 				completion = <-submission.Completion
 				if !errors.Is(completion.Err, errSourceHashWorkDisplaced) {
 					break

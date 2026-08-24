@@ -197,11 +197,14 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 	go func() {
 		var total int64 = 1
 		var spoolErr error
-		defer setBufferedSourceHashWork(sourceHashEpoch, 0)
+		defer setDiscoverySpoolSourceHashWork(sourceHashEpoch, 0)
 
 		for file := range toHashChan {
 			if spoolErr == nil {
 				spoolErr = discoverySpool.Append(file)
+				if spoolErr == nil {
+					setDiscoverySpoolSourceHashWork(sourceHashEpoch, discoverySpool.Len())
+				}
 			}
 			total += file.Size
 		}
@@ -209,7 +212,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		if spoolErr == nil {
 			spoolErr = discoverySpool.Rewind()
 			if spoolErr == nil {
-				setBufferedSourceHashWork(sourceHashEpoch, discoverySpool.Len())
+				setDiscoverySpoolSourceHashWork(sourceHashEpoch, discoverySpool.Len())
 			}
 		}
 		if spoolErr != nil {
@@ -235,15 +238,15 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		hasherCtx, cancelHasher := context.WithCancel(ctx)
 
 		newParallelHasher(hasherCtx, parallelHasherConfig{
-			folder:      w.SourceHashFolder,
-			filesystem:  w.Filesystem,
-			coordinator: w.SourceHashCoordinator,
-			epoch:       sourceHashEpoch,
-			outbox:      finishedChan,
-			inbox:       realToHashChan,
-			counter:     progress,
-			done:        done,
-			buffered:    true,
+			folder:             w.SourceHashFolder,
+			filesystem:         w.Filesystem,
+			coordinator:        w.SourceHashCoordinator,
+			epoch:              sourceHashEpoch,
+			outbox:             finishedChan,
+			inbox:              realToHashChan,
+			counter:            progress,
+			done:               done,
+			fromDiscoverySpool: true,
 		}, w.Hashers)
 		go func() {
 			<-done

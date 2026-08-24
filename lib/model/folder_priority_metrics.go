@@ -34,7 +34,7 @@ func newFolderPriorityMetricsCollector(cfg config.Wrapper, provider FolderPriori
 		provider: provider,
 		activeDesc: prometheus.NewDesc(
 			"syncthing_model_folder_priority_scheduler_active",
-			"Whether Folder Priority scheduling is active by folder and direction.",
+			"Whether Folder Priority scheduling is active by Folder and work class.",
 			labels,
 			nil,
 		),

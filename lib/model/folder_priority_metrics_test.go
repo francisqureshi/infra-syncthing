@@ -8,6 +8,7 @@ package model
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -59,6 +60,9 @@ func TestFolderPriorityMetricsExposeBoundedCurrentState(t *testing.T) {
 	}
 	got := make(map[string]map[string]float64)
 	for _, family := range families {
+		if family.GetName() == "syncthing_model_folder_priority_scheduler_active" && strings.Contains(strings.ToLower(family.GetHelp()), "direction") {
+			t.Fatalf("scheduler active help uses direction instead of bounded work-class terminology: %q", family.GetHelp())
+		}
 		values := make(map[string]float64)
 		for _, metric := range family.Metric {
 			labels := make(map[string]string)
