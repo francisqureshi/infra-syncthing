@@ -107,3 +107,20 @@ func TestReplaceCommit(t *testing.T) {
 		t.Fatal("Config should not have changed")
 	}
 }
+
+func TestNegativeHashCapacityDoesNotChangeStoredConfiguration(t *testing.T) {
+	cfg := New(device1)
+	cfg.Options.RawHashCapacity = 2
+	w := wrap("/dev/null", cfg, device1)
+	defer w.stop()
+
+	_, err := w.Modify(func(cfg *Configuration) {
+		cfg.Options.RawHashCapacity = -1
+	})
+	if err == nil {
+		t.Fatal("negative Hash Capacity was accepted")
+	}
+	if got := w.Options().RawHashCapacity; got != 2 {
+		t.Fatalf("stored Hash Capacity = %d after rejected change, want 2", got)
+	}
+}

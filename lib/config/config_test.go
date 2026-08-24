@@ -1429,6 +1429,26 @@ func TestMaxConcurrentFolders(t *testing.T) {
 	}
 }
 
+func TestHashCapacity(t *testing.T) {
+	automatic := OptionsConfiguration{}
+	if got, want := automatic.HashCapacity(), runtime.GOMAXPROCS(0); got != want || got < 1 {
+		t.Fatalf("automatic Hash Capacity = %d, want positive GOMAXPROCS %d", got, want)
+	}
+
+	explicit := OptionsConfiguration{RawHashCapacity: 3}
+	if got := explicit.HashCapacity(); got != 3 {
+		t.Fatalf("explicit Hash Capacity = %d, want 3", got)
+	}
+	if got := explicit.RequiresRestartOnly().RawHashCapacity; got != 3 {
+		t.Fatalf("restart-only Hash Capacity = %d, want 3", got)
+	}
+
+	folder := FolderConfiguration{Hashers: 2}
+	if got := folder.RequiresRestartOnly().Hashers; got != 2 {
+		t.Fatalf("restart-only per-Folder hasher ceiling = %d, want 2", got)
+	}
+}
+
 func adjustDeviceConfiguration(cfg *DeviceConfiguration, id protocol.DeviceID, name string) {
 	cfg.DeviceID = id
 	cfg.Name = name

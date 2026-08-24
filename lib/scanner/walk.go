@@ -50,6 +50,13 @@ type Config struct {
 	AutoNormalize bool
 	// Number of routines to use for hashing
 	Hashers int
+	// Positive per-Folder Hashing Quantum ceiling, or zero to inherit the
+	// node-wide Hash Capacity.
+	HasherCeiling int
+	// Current device-local Folder Priority.
+	FolderPriority int
+	// Coordinator shared by every Folder on this node.
+	SourceHashCoordinator *SourceHashCoordinator
 	// Our vector clock id
 	ShortID protocol.ShortID
 	// Optional progress tick interval which defines how often FolderScanProgress
@@ -115,6 +122,12 @@ func newWalker(cfg Config) *walker {
 	if w.Matcher == nil {
 		w.Matcher = ignore.New(w.Filesystem)
 	}
+	if w.Hashers < 1 {
+		w.Hashers = 1
+	}
+	if w.SourceHashCoordinator == nil {
+		w.SourceHashCoordinator = NewSourceHashCoordinator(w.Hashers)
+	}
 
 	registerFolderMetrics(w.Folder)
 	return w
@@ -146,7 +159,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 	// We're not required to emit scan progress events, just kick off hashers,
 	// and feed inputs directly from the walker.
 	if w.ProgressTickIntervalS < 0 {
-		newParallelHasher(ctx, w.Folder, w.Filesystem, w.Hashers, finishedChan, toHashChan, nil, nil)
+		newParallelHasher(ctx, w.Folder, w.FolderPriority, w.HasherCeiling, w.Filesystem, w.SourceHashCoordinator, w.Hashers, finishedChan, toHashChan, nil, nil)
 		return WalkResult{Results: finishedChan, TraversalDone: traversalDone}
 	}
 
@@ -180,7 +193,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		done := make(chan struct{})
 		progress := newByteCounter()
 
-		newParallelHasher(ctx, w.Folder, w.Filesystem, w.Hashers, finishedChan, realToHashChan, progress, done)
+		newParallelHasher(ctx, w.Folder, w.FolderPriority, w.HasherCeiling, w.Filesystem, w.SourceHashCoordinator, w.Hashers, finishedChan, realToHashChan, progress, done)
 
 		// A routine which actually emits the FolderScanProgress events
 		// every w.ProgressTicker ticks, until the hasher routines terminate.

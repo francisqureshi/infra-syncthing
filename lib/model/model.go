@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -33,7 +32,6 @@ import (
 	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/internal/itererr"
 	"github.com/syncthing/syncthing/internal/slogutil"
-	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/events"
@@ -156,11 +154,14 @@ type model struct {
 	// folderIOLimiter limits the number of concurrent I/O heavy operations,
 	// such as scans and pulls.
 	folderIOLimiter *folderWorkScheduler
-	fatalChan       chan error
-	started         chan struct{}
-	keyGen          *protocol.KeyGenerator
-	promotionTimer  *time.Timer
-	observed        *db.ObservedDB
+	// sourceHashCoordinator admits every Folder's Source Hash Work against one
+	// node-wide Hash Capacity pool.
+	sourceHashCoordinator *scanner.SourceHashCoordinator
+	fatalChan             chan error
+	started               chan struct{}
+	keyGen                *protocol.KeyGenerator
+	promotionTimer        *time.Timer
+	observed              *db.ObservedDB
 
 	// fields protected by mut
 	mut                            sync.RWMutex
@@ -226,6 +227,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 	configureDownloadBlockTransferScheduler(downloadScheduler, cfg.RawCopy())
 	folderIOLimiter := newFolderWorkScheduler()
 	configureFolderWorkScheduler(folderIOLimiter, cfg.RawCopy())
+	sourceHashCoordinator := scanner.NewSourceHashCoordinator(cfg.Options().HashCapacity())
 	m := &model{
 		Supervisor: suture.New("model", spec),
 
@@ -237,17 +239,18 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		evLogger:       evLogger,
 
 		// constant or concurrency safe fields
-		progressEmitter:      NewProgressEmitter(cfg, evLogger),
-		shortID:              id.Short(),
-		globalRequestLimiter: semaphore.New(1024 * cfg.Options().MaxConcurrentIncomingRequestKiB()),
-		uploadScheduler:      uploadScheduler,
-		downloadScheduler:    downloadScheduler,
-		folderIOLimiter:      folderIOLimiter,
-		fatalChan:            make(chan error),
-		started:              make(chan struct{}),
-		keyGen:               keyGen,
-		promotionTimer:       time.NewTimer(0),
-		observed:             db.NewObservedDB(sdb),
+		progressEmitter:       NewProgressEmitter(cfg, evLogger),
+		shortID:               id.Short(),
+		globalRequestLimiter:  semaphore.New(1024 * cfg.Options().MaxConcurrentIncomingRequestKiB()),
+		uploadScheduler:       uploadScheduler,
+		downloadScheduler:     downloadScheduler,
+		folderIOLimiter:       folderIOLimiter,
+		sourceHashCoordinator: sourceHashCoordinator,
+		fatalChan:             make(chan error),
+		started:               make(chan struct{}),
+		keyGen:                keyGen,
+		promotionTimer:        time.NewTimer(0),
+		observed:              db.NewObservedDB(sdb),
 
 		// fields protected by mut
 		folderCfgs:                     make(map[string]config.FolderConfiguration),
@@ -2740,27 +2743,18 @@ func (m *model) DelayScan(folder string, next time.Duration) {
 	runner.DelayScan(next)
 }
 
-// numHashers returns the number of hasher routines to use for a given folder,
-// taking into account configuration and available CPU cores.
+// numHashers returns the number of files a Folder may enroll concurrently in
+// Source Hash Work.
 func (m *model) numHashers(folder string) int {
 	m.mut.RLock()
 	folderCfg := m.folderCfgs[folder]
 	m.mut.RUnlock()
 
+	capacity := m.cfg.Options().HashCapacity()
 	if folderCfg.Hashers > 0 {
-		// Specific value set in the config, use that.
-		return folderCfg.Hashers
+		return min(folderCfg.Hashers, capacity)
 	}
-
-	numCPUs := runtime.GOMAXPROCS(-1)
-	switch {
-	case build.IsWindows || build.IsIOS || build.IsAndroid:
-		// Use a quarter of the CPU cores on interactive or constrained OSes
-		return max(1, numCPUs/4)
-	default:
-		// Otherwise use up to half
-		return max(1, numCPUs/2)
-	}
+	return capacity
 }
 
 // generateClusterConfig returns a ClusterConfigMessage that is correct and the

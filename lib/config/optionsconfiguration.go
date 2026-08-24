@@ -57,6 +57,7 @@ type OptionsConfiguration struct {
 	DeprecatedDefaultFolderPath        string   `json:"-" xml:"defaultFolderPath,omitempty"` // Deprecated: Do not use.
 	SetLowPriority                     bool     `json:"setLowPriority" xml:"setLowPriority" default:"true"`
 	RawMaxFolderConcurrency            int      `json:"maxFolderConcurrency" xml:"maxFolderConcurrency"`
+	RawHashCapacity                    int      `json:"hashCapacity" xml:"hashCapacity" restart:"true"`
 	CRURL                              string   `json:"crURL" xml:"crashReportingURL" default:"https://crash.syncthing.net/newcrash"`
 	CREnabled                          bool     `json:"crashReportingEnabled" xml:"crashReportingEnabled" default:"true"`
 	StunKeepaliveStartS                int      `json:"stunKeepaliveStartS" xml:"stunKeepaliveStartS" default:"180"`
@@ -105,8 +106,11 @@ func (opts OptionsConfiguration) Copy() OptionsConfiguration {
 	return optsCopy
 }
 
-func (opts *OptionsConfiguration) prepare(guiPWIsSet bool) {
+func (opts *OptionsConfiguration) prepare(guiPWIsSet bool) error {
 	structutil.FillNilSlices(opts)
+	if opts.RawHashCapacity < 0 {
+		return fmt.Errorf("Hash Capacity %d must not be negative", opts.RawHashCapacity)
+	}
 
 	opts.RawListenAddresses = stringutil.UniqueTrimmedStrings(opts.RawListenAddresses)
 	opts.RawGlobalAnnServers = stringutil.UniqueTrimmedStrings(opts.RawGlobalAnnServers)
@@ -144,6 +148,7 @@ func (opts *OptionsConfiguration) prepare(guiPWIsSet bool) {
 	if opts.URAccepted > 0 && opts.URUniqueID == "" {
 		opts.URUniqueID = rand.String(8)
 	}
+	return nil
 }
 
 // RequiresRestartOnly returns a copy with only the attributes that require
@@ -244,6 +249,15 @@ func (opts OptionsConfiguration) MaxFolderConcurrency() int {
 	// getting nothing done... (Median number of folders out there at time
 	// of writing is two, 95-percentile at 12 folders.)
 	return 4 // https://xkcd.com/221/
+}
+
+// HashCapacity returns the effective positive node-wide Hash Capacity. Zero
+// selects the automatic capacity derived from the current GOMAXPROCS value.
+func (opts OptionsConfiguration) HashCapacity() int {
+	if opts.RawHashCapacity > 0 {
+		return opts.RawHashCapacity
+	}
+	return max(1, runtime.GOMAXPROCS(0))
 }
 
 func (opts OptionsConfiguration) MaxConcurrentIncomingRequestKiB() int {

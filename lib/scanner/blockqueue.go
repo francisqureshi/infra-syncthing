@@ -47,23 +47,29 @@ func hashFileInfo(ctx context.Context, folderID string, filesystem fs.Filesystem
 // workers are used in parallel. The outbox will become closed when the inbox
 // is closed and all items handled.
 type parallelHasher struct {
-	folderID string
-	fs       fs.Filesystem
-	outbox   chan<- ScanResult
-	inbox    <-chan protocol.FileInfo
-	counter  Counter
-	done     chan<- struct{}
-	wg       sync.WaitGroup
+	folderID    string
+	priority    int
+	ceiling     int
+	fs          fs.Filesystem
+	coordinator *SourceHashCoordinator
+	outbox      chan<- ScanResult
+	inbox       <-chan protocol.FileInfo
+	counter     Counter
+	done        chan<- struct{}
+	wg          sync.WaitGroup
 }
 
-func newParallelHasher(ctx context.Context, folderID string, fs fs.Filesystem, workers int, outbox chan<- ScanResult, inbox <-chan protocol.FileInfo, counter Counter, done chan<- struct{}) {
+func newParallelHasher(ctx context.Context, folderID string, priority, ceiling int, fs fs.Filesystem, coordinator *SourceHashCoordinator, workers int, outbox chan<- ScanResult, inbox <-chan protocol.FileInfo, counter Counter, done chan<- struct{}) {
 	ph := &parallelHasher{
-		folderID: folderID,
-		fs:       fs,
-		outbox:   outbox,
-		inbox:    inbox,
-		counter:  counter,
-		done:     done,
+		folderID:    folderID,
+		priority:    priority,
+		ceiling:     ceiling,
+		fs:          fs,
+		coordinator: coordinator,
+		outbox:      outbox,
+		inbox:       inbox,
+		counter:     counter,
+		done:        done,
 	}
 
 	ph.wg.Add(workers)
@@ -90,12 +96,22 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 				panic("Bug. Asked to hash a directory or a deleted file.")
 			}
 
-			completedFile, err := hashFileInfo(ctx, ph.folderID, ph.fs, f, f.BlockSize(), ph.counter)
+			work, err := NewSourceHashWork(ph.folderID, ph.fs, f, ph.counter)
 			if err != nil {
 				handleError(ctx, "hashing", f.Name, err, ph.outbox)
 				continue
 			}
-			f = completedFile
+			completion := <-ph.coordinator.submit(ctx, sourceHashRequest{
+				folder:   ph.folderID,
+				priority: ph.priority,
+				ceiling:  ph.ceiling,
+				work:     work,
+			})
+			if completion.err != nil {
+				handleError(ctx, "hashing", f.Name, completion.err, ph.outbox)
+				continue
+			}
+			f = completion.file
 
 			l.Debugln("completed hashing:", f)
 			select {
