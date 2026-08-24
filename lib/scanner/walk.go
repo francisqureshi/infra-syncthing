@@ -154,11 +154,11 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 	traversalDone := make(chan struct{})
 	sourceHashEpoch := w.SourceHashCoordinator.BeginSourceHashEpoch(w.SourceHashFolder)
 
-	// We're not required to emit scan progress events, just kick off hashers,
-	// and feed inputs directly from the walker.
+	// Without scan progress events, discovery can submit Source Hash Work
+	// directly through the bounded feed.
 	if w.ProgressTickIntervalS < 0 {
-		// A routine which walks the filesystem tree, and sends files which have
-		// been modified directly to the hashers.
+		// Walk the filesystem tree and submit changed-file metadata as it is
+		// discovered.
 		go w.scan(ctx, toHashChan, finishedChan, traversalDone)
 		newParallelHasher(ctx, parallelHasherConfig{
 			folder:      w.SourceHashFolder,
@@ -191,9 +191,9 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		w.ProgressTickIntervalS = 2
 	}
 
-	// We need to emit progress events, hence we spool the metadata for files to
-	// be hashed and count the total number of bytes. Once discovery finishes,
-	// the spool feeds the bounded hasher window while progress is emitted.
+	// Progress totals require discovery to finish first. Spool the changed-file
+	// metadata and total bytes, then submit Source Hash Work through the bounded
+	// feed while progress is emitted.
 	go func() {
 		var total int64 = 1
 		var spoolErr error

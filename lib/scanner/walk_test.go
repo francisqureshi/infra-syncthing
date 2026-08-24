@@ -753,10 +753,7 @@ func TestBufferedWalkOwnsDiscoverySpoolUntilBoundedFeedDrains(t *testing.T) {
 		}
 	})
 
-	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := discoverySpoolSnapshot(t)
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Folder = "buffered-spool-success"
@@ -793,10 +790,7 @@ func TestBufferedWalkRemovesDiscoverySpoolAfterResultConsumerStops(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := discoverySpoolSnapshot(t)
 	cfg, cfgCancel := testConfig()
 	defer cfgCancel()
 	cfg.Folder = "buffered-spool-consumer-failure"
@@ -842,10 +836,7 @@ func TestBufferedWalkRemovesDiscoverySpoolAfterTraversalCancellation(t *testing.
 			close(release)
 		}
 	})
-	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := discoverySpoolSnapshot(t)
 	cfg, cfgCancel := testConfig()
 	defer cfgCancel()
 	cfg.Folder = "buffered-spool-traversal-cancellation"
@@ -877,10 +868,7 @@ func TestBufferedWalkRemovesDiscoverySpoolAfterTraversalFailure(t *testing.T) {
 	}
 	blocked := make(chan struct{})
 	release := make(chan struct{})
-	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := discoverySpoolSnapshot(t)
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Folder = "buffered-spool-traversal-failure"
@@ -911,10 +899,7 @@ func TestBufferedWalkRemovesDiscoverySpoolAfterHashingFailure(t *testing.T) {
 	}
 	blocked := make(chan struct{})
 	release := make(chan struct{})
-	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := discoverySpoolSnapshot(t)
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Folder = "buffered-spool-hashing-failure"
@@ -1059,10 +1044,7 @@ func TestStreamingWalkRunsDiscoveredFileDuringTraversalWithoutSpool(t *testing.T
 	traversalRelease := make(chan struct{})
 	readStarted := make(chan struct{})
 	readRelease := make(chan struct{})
-	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := discoverySpoolSnapshot(t)
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Folder = "streaming-without-spool"
@@ -1330,39 +1312,44 @@ func awaitScannerSignal(t *testing.T, done <-chan struct{}, description string) 
 	}
 }
 
-func awaitNewDiscoverySpool(t *testing.T, before []string) string {
+func discoverySpoolSnapshot(t *testing.T) map[string]struct{} {
 	t.Helper()
-	known := make(map[string]struct{}, len(before))
-	for _, path := range before {
-		known[path] = struct{}{}
-	}
 	paths, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	snapshot := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		if _, ok := known[path]; !ok {
-			return path
+		snapshot[path] = struct{}{}
+	}
+	return snapshot
+}
+
+func newDiscoverySpools(t *testing.T, before map[string]struct{}) []string {
+	t.Helper()
+	var discovered []string
+	for path := range discoverySpoolSnapshot(t) {
+		if _, ok := before[path]; !ok {
+			discovered = append(discovered, path)
 		}
+	}
+	return discovered
+}
+
+func awaitNewDiscoverySpool(t *testing.T, before map[string]struct{}) string {
+	t.Helper()
+	paths := newDiscoverySpools(t, before)
+	if len(paths) != 0 {
+		return paths[0]
 	}
 	t.Fatal("buffered scan did not create a discovery spool")
 	return ""
 }
 
-func assertNoNewDiscoverySpool(t *testing.T, before []string) {
+func assertNoNewDiscoverySpool(t *testing.T, before map[string]struct{}) {
 	t.Helper()
-	known := make(map[string]struct{}, len(before))
-	for _, path := range before {
-		known[path] = struct{}{}
-	}
-	paths, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range paths {
-		if _, ok := known[path]; !ok {
-			t.Fatalf("streaming scan created discovery spool %q", path)
-		}
+	if paths := newDiscoverySpools(t, before); len(paths) != 0 {
+		t.Fatalf("streaming scan created discovery spools %q", paths)
 	}
 }
 
