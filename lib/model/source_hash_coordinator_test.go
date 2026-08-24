@@ -7,8 +7,8 @@
 package model
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +18,7 @@ import (
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/scanner"
 )
 
 const sourceHashCoordinatorFilesystemType fs.FilesystemType = "source-hash-coordinator"
@@ -43,11 +44,9 @@ type sourceHashCoordinatorFilesystemControl struct {
 	started    chan<- string
 	release    <-chan struct{}
 	traversed  chan struct{}
-	opened     chan struct{}
 	armed      atomic.Bool
 
 	traversedOnce sync.Once
-	openedOnce    sync.Once
 }
 
 type sourceHashCoordinatorFilesystem struct {
@@ -68,7 +67,6 @@ func (f *sourceHashCoordinatorFilesystem) Open(name string) (fs.File, error) {
 	if err != nil || name != "payload" || !f.control.armed.Load() {
 		return file, err
 	}
-	f.control.openedOnce.Do(func() { close(f.control.opened) })
 	return &sourceHashCoordinatorFile{
 		File:    file,
 		control: f.control,
@@ -89,18 +87,44 @@ func (f *sourceHashCoordinatorFile) Read(buf []byte) (int, error) {
 	return f.File.Read(buf)
 }
 
+type observedSourceHashSubmission struct {
+	folder     string
+	submission scanner.SourceHashSubmission
+}
+
+type sourceHashCoordinatorObserver struct {
+	scanner.SourceHashCoordinator
+	submitted chan<- observedSourceHashSubmission
+}
+
+func (c sourceHashCoordinatorObserver) Submit(ctx context.Context, request scanner.SourceHashRequest) scanner.SourceHashSubmission {
+	submission := c.SourceHashCoordinator.Submit(ctx, request)
+	c.submitted <- observedSourceHashSubmission{
+		folder:     request.Folder.ID,
+		submission: submission,
+	}
+	return submission
+}
+
 func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
-	started := make(chan string, 2)
+	started := make(chan string, 3)
+	blockerRelease := make(chan struct{})
 	lowRelease := make(chan struct{})
 	highRelease := make(chan struct{})
 	controls := map[string]*sourceHashCoordinatorFilesystemControl{
+		"blocker": {
+			folder:     "blocker",
+			filesystem: fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			started:    started,
+			release:    blockerRelease,
+			traversed:  make(chan struct{}),
+		},
 		"low": {
 			folder:     "low",
 			filesystem: fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
 			started:    started,
 			release:    lowRelease,
 			traversed:  make(chan struct{}),
-			opened:     make(chan struct{}),
 		},
 		"high": {
 			folder:     "high",
@@ -108,19 +132,13 @@ func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
 			started:    started,
 			release:    highRelease,
 			traversed:  make(chan struct{}),
-			opened:     make(chan struct{}),
 		},
 	}
-	t.Cleanup(func() {
-		closeSourceHashCoordinatorSignal(lowRelease)
-		closeSourceHashCoordinatorSignal(highRelease)
-	})
-
 	cfg := config.New(myID)
 	cfg.Options.MinHomeDiskFree.Value = 0
 	cfg.Options.RawMaxFolderConcurrency = 1
 	cfg.Options.RawHashCapacity = 1
-	for folderID, priority := range map[string]int{"low": -100, "high": 100} {
+	for folderID, priority := range map[string]int{"blocker": 0, "low": -100, "high": 100} {
 		root := rand.String(32)
 		control := controls[folderID]
 		sourceHashCoordinatorFilesystems.Store(root, control)
@@ -143,35 +161,87 @@ func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
 	t.Cleanup(cancel)
 	m := setupModel(t, wrapper)
 	t.Cleanup(func() { cleanupModel(m) })
+	t.Cleanup(func() {
+		closeSourceHashCoordinatorSignal(blockerRelease)
+		closeSourceHashCoordinatorSignal(lowRelease)
+		closeSourceHashCoordinatorSignal(highRelease)
+	})
+	submitted := make(chan observedSourceHashSubmission, 3)
+	m.sourceHashCoordinator = sourceHashCoordinatorObserver{
+		SourceHashCoordinator: m.sourceHashCoordinator,
+		submitted:             submitted,
+	}
 	for _, control := range controls {
 		writeFile(t, control.filesystem, "payload", make([]byte, protocol.MinBlockSize))
 		control.armed.Store(true)
 	}
 
+	blockerResult := make(chan error, 1)
+	go func() { blockerResult <- m.ScanFolder("blocker") }()
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "blocker" {
+		t.Fatalf("first Hashing Quantum = %q, want blocker", got)
+	}
+	blockerSubmission := awaitSourceHashSubmission(t, submitted)
+	if blockerSubmission.folder != "blocker" {
+		t.Fatalf("first Source Hash Work submission = %q, want blocker", blockerSubmission.folder)
+	}
+	awaitSourceHashCoordinatorSignal(t, blockerSubmission.submission.Admitted, "blocker admission")
+	if file, ok := m.testCurrentFolderFile("blocker", "payload"); ok {
+		t.Fatalf("Blocker published while its Hashing Quantum was active: %+v", file)
+	}
+
 	lowResult := make(chan error, 1)
 	go func() { lowResult <- m.ScanFolder("low") }()
-	if got := awaitSourceHashCoordinatorStart(t, started); got != "low" {
-		t.Fatalf("first Hashing Quantum = %q, want low", got)
+	awaitSourceHashCoordinatorSignal(t, controls["low"].traversed, "Low traversal while blocker hashing remains active")
+	lowSubmission := awaitSourceHashSubmission(t, submitted)
+	if lowSubmission.folder != "low" {
+		t.Fatalf("second Source Hash Work submission = %q, want low", lowSubmission.folder)
 	}
-	if file, ok := m.testCurrentFolderFile("low", "payload"); ok {
-		t.Fatalf("Low published while its Hashing Quantum was active: %+v", file)
+	select {
+	case <-lowSubmission.submission.Admitted:
+		t.Fatal("Low Hashing Quantum was admitted while blocker occupied the only Hash Capacity slot")
+	default:
 	}
 
 	highResult := make(chan error, 1)
 	go func() { highResult <- m.ScanFolder("high") }()
-	awaitSourceHashCoordinatorSignal(t, controls["high"].traversed, "High traversal while Low hashing remains active")
-	awaitSourceHashCoordinatorSignal(t, controls["high"].opened, "High Source Hash Work enrollment")
+	awaitSourceHashCoordinatorSignal(t, controls["high"].traversed, "High traversal while blocker hashing remains active")
+	highSubmission := awaitSourceHashSubmission(t, submitted)
+	if highSubmission.folder != "high" {
+		t.Fatalf("third Source Hash Work submission = %q, want high", highSubmission.folder)
+	}
+	select {
+	case <-highSubmission.submission.Admitted:
+		t.Fatal("High Hashing Quantum was admitted while blocker occupied the only Hash Capacity slot")
+	default:
+	}
 
-	close(lowRelease)
+	close(blockerRelease)
 	if got := awaitSourceHashCoordinatorStart(t, started); got != "high" {
-		t.Fatalf("next Hashing Quantum = %q, want high", got)
+		t.Fatalf("first queued admission = %q, want high before earlier Low", got)
+	}
+	awaitSourceHashCoordinatorSignal(t, highSubmission.submission.Admitted, "High strict-priority admission")
+	select {
+	case <-lowSubmission.submission.Admitted:
+		t.Fatal("Low Hashing Quantum was admitted while High occupied the only Hash Capacity slot")
+	default:
 	}
 	if file, ok := m.testCurrentFolderFile("high", "payload"); ok {
 		t.Fatalf("High published while its Hashing Quantum was active: %+v", file)
 	}
 	close(highRelease)
+	awaitSourceHashCoordinatorSignal(t, lowSubmission.submission.Admitted, "Low admission after High completion")
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "low" {
+		t.Fatalf("admission after High completion = %q, want Low", got)
+	}
+	close(lowRelease)
 
-	for folder, result := range map[string]<-chan error{"low": lowResult, "high": highResult} {
+	results := map[string]<-chan error{
+		"blocker": blockerResult,
+		"low":     lowResult,
+		"high":    highResult,
+	}
+	for folder, result := range results {
 		select {
 		case err := <-result:
 			if err != nil {
@@ -203,7 +273,18 @@ func awaitSourceHashCoordinatorSignal(t *testing.T, signal <-chan struct{}, desc
 	select {
 	case <-signal:
 	case <-time.After(5 * time.Second):
-		t.Fatal(fmt.Sprintf("timed out waiting for %s", description))
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func awaitSourceHashSubmission(t *testing.T, submitted <-chan observedSourceHashSubmission) observedSourceHashSubmission {
+	t.Helper()
+	select {
+	case submission := <-submitted:
+		return submission
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Source Hash Work submission")
+		return observedSourceHashSubmission{}
 	}
 }
 

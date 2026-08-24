@@ -13,28 +13,51 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-type sourceHashWork interface {
+// HashingQuantumWork executes sequential Hashing Quanta for one file.
+type HashingQuantumWork interface {
 	HashNext(context.Context) (HashingQuantumResult, error)
 	Close()
 }
 
-type sourceHashRequest struct {
-	folder   string
-	priority int
-	ceiling  int
-	work     sourceHashWork
+// SourceHashFolder is the current scheduling policy for one Folder.
+type SourceHashFolder struct {
+	ID            string
+	Priority      int
+	HasherCeiling int
 }
 
-type sourceHashCompletion struct {
-	file  protocol.FileInfo
-	bytes int64
-	err   error
+// SourceHashRequest transfers ownership of one file's Source Hash Work to the
+// coordinator.
+type SourceHashRequest struct {
+	Folder SourceHashFolder
+	Work   HashingQuantumWork
+}
+
+// SourceHashCompletion reports terminal Source Hash Work. Bytes includes all
+// source bytes consumed, including bytes consumed before a terminal error.
+type SourceHashCompletion struct {
+	File  protocol.FileInfo
+	Bytes int64
+	Err   error
+}
+
+// SourceHashSubmission exposes first admission separately from terminal
+// completion so callers can coordinate deterministic work without inspecting
+// coordinator state.
+type SourceHashSubmission struct {
+	Admitted   <-chan struct{}
+	Completion <-chan SourceHashCompletion
 }
 
 // SourceHashCoordinator admits Source Hash Work against one node-wide Hash
-// Capacity pool. Completion, continuation eligibility, slot release, and
+// Capacity pool. Submit synchronously enrolls work and transfers its ownership
+// to the coordinator. Completion, continuation eligibility, slot release, and
 // replacement selection are serialized as one transition.
-type SourceHashCoordinator struct {
+type SourceHashCoordinator interface {
+	Submit(context.Context, SourceHashRequest) SourceHashSubmission
+}
+
+type sourceHashCoordinator struct {
 	mut sync.Mutex
 
 	capacity int
@@ -44,38 +67,44 @@ type SourceHashCoordinator struct {
 }
 
 type coordinatedSourceHashWork struct {
-	request    sourceHashRequest
-	ctx        context.Context
-	completion chan sourceHashCompletion
-	bytes      int64
+	request     SourceHashRequest
+	ctx         context.Context
+	completion  chan SourceHashCompletion
+	admitted    chan struct{}
+	wasAdmitted bool
+	bytes       int64
 }
 
 // NewSourceHashCoordinator returns a coordinator with the given positive Hash
 // Capacity.
-func NewSourceHashCoordinator(capacity int) *SourceHashCoordinator {
+func NewSourceHashCoordinator(capacity int) SourceHashCoordinator {
 	if capacity < 1 {
 		panic("Hash Capacity must be positive")
 	}
-	return &SourceHashCoordinator{
+	return &sourceHashCoordinator{
 		capacity: capacity,
 		byFolder: make(map[string]int),
 	}
 }
 
-func (c *SourceHashCoordinator) submit(ctx context.Context, request sourceHashRequest) <-chan sourceHashCompletion {
+func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
 	work := &coordinatedSourceHashWork{
 		request:    request,
 		ctx:        ctx,
-		completion: make(chan sourceHashCompletion, 1),
+		completion: make(chan SourceHashCompletion, 1),
+		admitted:   make(chan struct{}),
 	}
 	c.mut.Lock()
 	c.queued = append(c.queued, work)
 	c.scheduleLocked()
 	c.mut.Unlock()
-	return work.completion
+	return SourceHashSubmission{
+		Admitted:   work.admitted,
+		Completion: work.completion,
+	}
 }
 
-func (c *SourceHashCoordinator) scheduleLocked() {
+func (c *sourceHashCoordinator) scheduleLocked() {
 	for c.active < c.capacity && len(c.queued) > 0 {
 		next := c.nextLocked()
 		if next < 0 {
@@ -84,32 +113,36 @@ func (c *SourceHashCoordinator) scheduleLocked() {
 		work := c.queued[next]
 		c.queued = append(c.queued[:next], c.queued[next+1:]...)
 		c.active++
-		c.byFolder[work.request.folder]++
+		c.byFolder[work.request.Folder.ID]++
+		if !work.wasAdmitted {
+			work.wasAdmitted = true
+			close(work.admitted)
+		}
 		go c.runQuantum(work)
 	}
 }
 
-func (c *SourceHashCoordinator) nextLocked() int {
+func (c *sourceHashCoordinator) nextLocked() int {
 	next := -1
 	for i := range c.queued {
 		request := c.queued[i].request
-		if request.ceiling > 0 && c.byFolder[request.folder] >= request.ceiling {
+		if request.Folder.HasherCeiling > 0 && c.byFolder[request.Folder.ID] >= request.Folder.HasherCeiling {
 			continue
 		}
-		if next < 0 || request.priority > c.queued[next].request.priority {
+		if next < 0 || request.Folder.Priority > c.queued[next].request.Folder.Priority {
 			next = i
 		}
 	}
 	return next
 }
 
-func (c *SourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
-	result, err := work.request.work.HashNext(work.ctx)
+func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
+	result, err := work.request.Work.HashNext(work.ctx)
 
 	c.mut.Lock()
 	work.bytes += result.Bytes
 	c.active--
-	c.byFolder[work.request.folder]--
+	c.byFolder[work.request.Folder.ID]--
 	if err == nil && !result.Done {
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
@@ -119,11 +152,11 @@ func (c *SourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 	c.scheduleLocked()
 	c.mut.Unlock()
 
-	work.request.work.Close()
-	work.completion <- sourceHashCompletion{
-		file:  result.File,
-		bytes: work.bytes,
-		err:   err,
+	work.request.Work.Close()
+	work.completion <- SourceHashCompletion{
+		File:  result.File,
+		Bytes: work.bytes,
+		Err:   err,
 	}
 	close(work.completion)
 }

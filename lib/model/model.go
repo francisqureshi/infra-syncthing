@@ -156,7 +156,7 @@ type model struct {
 	folderIOLimiter *folderWorkScheduler
 	// sourceHashCoordinator admits every Folder's Source Hash Work against one
 	// node-wide Hash Capacity pool.
-	sourceHashCoordinator *scanner.SourceHashCoordinator
+	sourceHashCoordinator scanner.SourceHashCoordinator
 	fatalChan             chan error
 	started               chan struct{}
 	keyGen                *protocol.KeyGenerator
