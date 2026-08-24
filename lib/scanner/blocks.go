@@ -46,7 +46,7 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 	}
 
 	var blocks []protocol.BlockInfo
-	var hashes, thisHash []byte
+	var hashes []byte
 
 	if sizehint >= 0 {
 		// Allocate contiguous blocks for the BlockInfo structures and their
@@ -71,7 +71,6 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 	}()
 
 	var offset int64
-	lr := io.LimitReader(r, int64(blocksize)).(*io.LimitedReader)
 	for {
 		select {
 		case <-ctx.Done():
@@ -79,8 +78,7 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 		default:
 		}
 
-		lr.N = int64(blocksize)
-		n, err := io.CopyBuffer(hf, lr, buf)
+		block, remainingHashes, n, err := hashBlock(hf, buf, r, int64(blocksize), offset, hashes)
 		if err != nil {
 			return nil, err
 		}
@@ -90,22 +88,9 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 		}
 
 		counter.Update(n)
-
-		// Carve out a hash-sized chunk of "hashes" to store the hash for this
-		// block.
-		hashes = hf.Sum(hashes)
-		thisHash, hashes = hashes[:hashLength], hashes[hashLength:]
-
-		b := protocol.BlockInfo{
-			Size:   int(n),
-			Offset: offset,
-			Hash:   thisHash,
-		}
-
-		blocks = append(blocks, b)
+		hashes = remainingHashes
+		blocks = append(blocks, block)
 		offset += n
-
-		hf.Reset()
 	}
 
 	if len(blocks) == 0 {
@@ -118,6 +103,26 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 	}
 
 	return blocks, nil
+}
+
+func hashBlock(hf hash.Hash, buf []byte, r io.Reader, size, offset int64, hashes []byte) (protocol.BlockInfo, []byte, int64, error) {
+	defer hf.Reset()
+
+	n, err := io.CopyBuffer(hf, io.LimitReader(r, size), buf)
+	if err != nil {
+		return protocol.BlockInfo{}, hashes, n, err
+	}
+	if n == 0 {
+		return protocol.BlockInfo{}, hashes, 0, nil
+	}
+
+	hashes = hf.Sum(hashes)
+	thisHash, remainingHashes := hashes[:hashLength], hashes[hashLength:]
+	return protocol.BlockInfo{
+		Size:   int(n),
+		Offset: offset,
+		Hash:   thisHash,
+	}, remainingHashes, n, nil
 }
 
 // Validate validates the hash.
