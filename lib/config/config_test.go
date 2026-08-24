@@ -613,13 +613,13 @@ func TestNewSaveLoad(t *testing.T) {
 	}
 }
 
-func TestNetworkPriorityConfiguration(t *testing.T) {
-	if priority := New(device1).Defaults.Folder.NetworkPriority; priority != 0 {
-		t.Fatalf("default Network Priority is %d, expected 0", priority)
+func TestFolderPriorityConfiguration(t *testing.T) {
+	if priority := New(device1).Defaults.Folder.FolderPriority; priority != 0 {
+		t.Fatalf("default Folder Priority is %d, expected 0", priority)
 	}
-	folder := FolderConfiguration{NetworkPriority: 50}
-	if priority := folder.RequiresRestartOnly().NetworkPriority; priority != 0 {
-		t.Fatalf("Network Priority %d unexpectedly requires restart", priority)
+	folder := FolderConfiguration{FolderPriority: 50}
+	if priority := folder.RequiresRestartOnly().FolderPriority; priority != 0 {
+		t.Fatalf("Folder Priority %d unexpectedly requires restart", priority)
 	}
 
 	for _, tc := range []struct {
@@ -636,12 +636,12 @@ func TestNetworkPriorityConfiguration(t *testing.T) {
 			cfg := New(device1)
 			folder := cfg.Defaults.Folder.Copy()
 			adjustFolderConfiguration(&folder, "default", "default", fs.FilesystemTypeBasic, "/tmp")
-			folder.NetworkPriority = tc.priority
+			folder.FolderPriority = tc.priority
 			cfg.Folders = append(cfg.Folders, folder)
 
 			err := cfg.prepare(device1)
 			if tc.wantErr && err == nil {
-				t.Fatal("expected invalid Network Priority to be rejected")
+				t.Fatal("expected invalid Folder Priority to be rejected")
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatal(err)
@@ -650,9 +650,9 @@ func TestNetworkPriorityConfiguration(t *testing.T) {
 	}
 
 	cfg := New(device1)
-	cfg.Defaults.Folder.NetworkPriority = 101
+	cfg.Defaults.Folder.FolderPriority = 101
 	if err := cfg.prepare(device1); err == nil {
-		t.Fatal("expected invalid default folder Network Priority to be rejected")
+		t.Fatal("expected invalid default Folder Priority to be rejected")
 	}
 }
 
@@ -703,12 +703,12 @@ func TestMaxConcurrentOutgoingRequestKiBPersistence(t *testing.T) {
 	}
 }
 
-func TestNetworkPriorityPersistence(t *testing.T) {
+func TestFolderPriorityPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.xml")
 	cfg := New(device1)
 	folder := cfg.Defaults.Folder.Copy()
 	adjustFolderConfiguration(&folder, "default", "default", fs.FilesystemTypeBasic, "/tmp")
-	folder.NetworkPriority = 50
+	folder.FolderPriority = 50
 	cfg.Folders = append(cfg.Folders, folder)
 
 	wrapper := wrap(path, cfg, device1)
@@ -728,8 +728,8 @@ func TestNetworkPriorityPersistence(t *testing.T) {
 	if !ok {
 		t.Fatal("persisted folder is missing")
 	}
-	if loadedFolder.NetworkPriority != 50 {
-		t.Fatalf("persisted Network Priority is %d, expected 50", loadedFolder.NetworkPriority)
+	if loadedFolder.FolderPriority != 50 {
+		t.Fatalf("persisted Folder Priority is %d, expected 50", loadedFolder.FolderPriority)
 	}
 }
 

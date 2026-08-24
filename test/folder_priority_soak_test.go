@@ -27,59 +27,59 @@ const (
 	studioSoakDefaultMultiplier = 4.0
 )
 
-func TestBenchmarkNetworkPriorityStudioSoak(t *testing.T) {
-	profile, safetyMultiplier, err := networkPriorityStudioSoakProfile()
+func TestBenchmarkFolderPriorityStudioSoak(t *testing.T) {
+	profile, safetyMultiplier, err := folderPriorityStudioSoakProfile()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := studioDiskPreflight(profile.ArtifactRoot, studioTotalBytes(profile.ProjectSizes), safetyMultiplier); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("Network Priority studio soak: seed=%d bytes=%d distribution=%s send=%dKiB/s receive=%dKiB/s uploadInFlight=%dKiB downloadInFlight=%dKiB timeout=%s artifactRoot=%s diskMultiplier=%.2f",
+	t.Logf("Folder Priority studio soak: seed=%d bytes=%d distribution=%s send=%dKiB/s receive=%dKiB/s uploadInFlight=%dKiB downloadInFlight=%dKiB timeout=%s artifactRoot=%s diskMultiplier=%.2f",
 		profile.Seed, studioTotalBytes(profile.ProjectSizes), studioEnvString("STUDIO_SOAK_DISTRIBUTION", "equal"),
 		profile.SendRateKiB, profile.ReceiveRateKiB, profile.UploadInFlightKiB, profile.DownloadInFlightKiB,
 		profile.Timeout, profile.ArtifactRoot, safetyMultiplier)
-	runNetworkPriorityStudioWorkload(t, profile)
+	runFolderPriorityStudioWorkload(t, profile)
 }
 
-func networkPriorityStudioSoakProfile() (networkPriorityStudioProfile, float64, error) {
+func folderPriorityStudioSoakProfile() (folderPriorityStudioProfile, float64, error) {
 	totalBytes, err := studioParseBytes(studioEnvString("STUDIO_SOAK_TOTAL_BYTES", "12GiB"))
 	if err != nil {
-		return networkPriorityStudioProfile{}, 0, fmt.Errorf("STUDIO_SOAK_TOTAL_BYTES: %w", err)
+		return folderPriorityStudioProfile{}, 0, fmt.Errorf("STUDIO_SOAK_TOTAL_BYTES: %w", err)
 	}
 	distribution := strings.ToLower(studioEnvString("STUDIO_SOAK_DISTRIBUTION", "equal"))
 	sizes, err := studioDistributeBytes(totalBytes, distribution)
 	if err != nil {
-		return networkPriorityStudioProfile{}, 0, err
+		return folderPriorityStudioProfile{}, 0, err
 	}
 	timeout, err := time.ParseDuration(studioEnvString("STUDIO_SOAK_DURATION", "12h"))
 	if err != nil || timeout <= 0 {
-		return networkPriorityStudioProfile{}, 0, fmt.Errorf("STUDIO_SOAK_DURATION must be a positive Go duration")
+		return folderPriorityStudioProfile{}, 0, fmt.Errorf("STUDIO_SOAK_DURATION must be a positive Go duration")
 	}
 	sendRate, err := studioEnvPositiveInt("STUDIO_SOAK_SEND_KIB", studioSoakDefaultRateKiB)
 	if err != nil {
-		return networkPriorityStudioProfile{}, 0, err
+		return folderPriorityStudioProfile{}, 0, err
 	}
 	receiveRate, err := studioEnvPositiveInt("STUDIO_SOAK_RECEIVE_KIB", studioSoakDefaultRateKiB)
 	if err != nil {
-		return networkPriorityStudioProfile{}, 0, err
+		return folderPriorityStudioProfile{}, 0, err
 	}
 	uploadLimit, err := studioEnvPositiveInt("STUDIO_SOAK_UPLOAD_INFLIGHT_KIB", studioDefaultInFlightKiB)
 	if err != nil {
-		return networkPriorityStudioProfile{}, 0, err
+		return folderPriorityStudioProfile{}, 0, err
 	}
 	downloadLimit, err := studioEnvPositiveInt("STUDIO_SOAK_DOWNLOAD_INFLIGHT_KIB", studioDefaultInFlightKiB)
 	if err != nil {
-		return networkPriorityStudioProfile{}, 0, err
+		return folderPriorityStudioProfile{}, 0, err
 	}
 	if uploadLimit < studioDefaultInFlightKiB || downloadLimit < studioDefaultInFlightKiB {
-		return networkPriorityStudioProfile{}, 0, fmt.Errorf("soak In-Flight Limits must be at least %d KiB", studioDefaultInFlightKiB)
+		return folderPriorityStudioProfile{}, 0, fmt.Errorf("soak In-Flight Limits must be at least %d KiB", studioDefaultInFlightKiB)
 	}
 	multiplier, err := strconv.ParseFloat(studioEnvString("STUDIO_SOAK_DISK_MULTIPLIER", "4"), 64)
 	if err != nil || multiplier < studioSoakDefaultMultiplier {
-		return networkPriorityStudioProfile{}, 0, fmt.Errorf("STUDIO_SOAK_DISK_MULTIPLIER must be at least %.1f", studioSoakDefaultMultiplier)
+		return folderPriorityStudioProfile{}, 0, fmt.Errorf("STUDIO_SOAK_DISK_MULTIPLIER must be at least %.1f", studioSoakDefaultMultiplier)
 	}
-	return networkPriorityStudioProfile{
+	return folderPriorityStudioProfile{
 		Name:                "soak",
 		Seed:                studioEnvInt64("STUDIO_SEED", studioDefaultSeed),
 		ProjectSizes:        sizes,
@@ -89,7 +89,7 @@ func networkPriorityStudioSoakProfile() (networkPriorityStudioProfile, float64, 
 		DownloadInFlightKiB: downloadLimit,
 		ObservationInterval: 2 * time.Second,
 		Timeout:             timeout,
-		ArtifactRoot:        studioEnvString("STUDIO_ARTIFACT_DIR", filepath.Join("logs", "network-priority")),
+		ArtifactRoot:        studioEnvString("STUDIO_ARTIFACT_DIR", filepath.Join("logs", "folder-priority")),
 		RetainArtifacts:     true,
 	}, multiplier, nil
 }

@@ -303,27 +303,27 @@
           </div>
 
           <div class="row">
-            <div class="col-md-6 form-group" ng-class="{'has-error': folderEditor.networkPriority.$invalid && folderEditor.networkPriority.$dirty}">
-              <label for="networkPriority" translate>Network Priority</label>
-              <input name="networkPriority" id="networkPriority" class="form-control" type="number" ng-model="currentFolder.networkPriority" ng-pattern="/^-?\d+$/" required="" aria-required="true" min="-100" max="100" step="1" />
-              <p class="help-block" ng-show="folderEditor.networkPriority.$invalid" translate>
-                Network Priority must be a whole number from -100 through 100.
+            <div class="col-md-6 form-group" ng-class="{'has-error': folderEditor.folderPriority.$invalid && folderEditor.folderPriority.$dirty}">
+              <label for="folderPriority" translate>Folder Priority</label>
+              <input name="folderPriority" id="folderPriority" class="form-control" type="number" ng-model="currentFolder.folderPriority" ng-pattern="/^-?\d+$/" required="" aria-required="true" min="-100" max="100" step="1" />
+              <p class="help-block" ng-show="folderEditor.folderPriority.$invalid" translate>
+                Folder Priority must be a whole number from -100 through 100.
               </p>
             </div>
             <div class="col-md-6 form-group">
-              <label translate>Network Priority Presets</label>
+              <label translate>Folder Priority Presets</label>
               <div class="btn-group btn-group-justified" role="group">
                 <div class="btn-group" role="group">
-                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.networkPriority = -50"><span translate>Low</span> (-50)</button>
+                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.folderPriority = -50"><span translate>Low</span> (-50)</button>
                 </div>
                 <div class="btn-group" role="group">
-                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.networkPriority = 0"><span translate>Normal</span> (0)</button>
+                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.folderPriority = 0"><span translate>Normal</span> (0)</button>
                 </div>
                 <div class="btn-group" role="group">
-                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.networkPriority = 50"><span translate>High</span> (50)</button>
+                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.folderPriority = 50"><span translate>High</span> (50)</button>
                 </div>
                 <div class="btn-group" role="group">
-                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.networkPriority = 100"><span translate>Critical</span> (100)</button>
+                  <button type="button" class="btn btn-default btn-sm" ng-click="currentFolder.folderPriority = 100"><span translate>Critical</span> (100)</button>
                 </div>
               </div>
               <p class="help-block" translate>

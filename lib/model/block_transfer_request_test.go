@@ -106,7 +106,7 @@ func TestModelRequestSchedulesBeforeFileOpenAndReleasesOnCompletion(t *testing.T
 	awaitBlockTransferRequest(t, lowResult).Close()
 }
 
-func TestNetworkPriorityEqualPriorityShareThroughModelRequest(t *testing.T) {
+func TestFolderPriorityEqualPriorityShareThroughModelRequest(t *testing.T) {
 	wrapper, controls := newBlockTransferRequestConfig(t, map[string]int{
 		"gate": 100,
 		"a":    0,
@@ -154,7 +154,7 @@ func TestNetworkPriorityEqualPriorityShareThroughModelRequest(t *testing.T) {
 	}
 }
 
-func TestDefaultNetworkPriorityUsesEqualPriorityShareThroughModelRequest(t *testing.T) {
+func TestDefaultFolderPriorityUsesEqualPriorityShareThroughModelRequest(t *testing.T) {
 	wrapper, controls := newBlockTransferRequestConfigWithLimits(t, map[string]int{
 		"gate": 0,
 		"a":    0,
@@ -209,7 +209,7 @@ func TestDefaultNetworkPriorityUsesEqualPriorityShareThroughModelRequest(t *test
 	}
 }
 
-func TestNetworkPriorityEqualPriorityShareAcrossDevicesThroughModelRequest(t *testing.T) {
+func TestFolderPriorityEqualPriorityShareAcrossDevicesThroughModelRequest(t *testing.T) {
 	const blockSize = protocol.MaxBlockSize
 	wrapper, controls := newBlockTransferRequestConfigWithLimits(t, map[string]int{
 		"gate":   100,
@@ -256,7 +256,7 @@ func TestNetworkPriorityEqualPriorityShareAcrossDevicesThroughModelRequest(t *te
 	gate2.Close()
 }
 
-func TestNetworkPriorityRepeatedLowPriorityRefillThroughModelRequest(t *testing.T) {
+func TestFolderPriorityRepeatedLowPriorityRefillThroughModelRequest(t *testing.T) {
 	const (
 		largeBlock = protocol.MaxBlockSize
 		tailBlock  = protocol.MaxBlockSize / 2
@@ -328,7 +328,7 @@ func TestNetworkPriorityRepeatedLowPriorityRefillThroughModelRequest(t *testing.
 	}
 }
 
-func TestNetworkPriorityLiveReprioritizationThroughModelRequest(t *testing.T) {
+func TestFolderPriorityLiveReprioritizationThroughModelRequest(t *testing.T) {
 	wrapper, controls := newBlockTransferRequestConfig(t, map[string]int{
 		"bulk":  0,
 		"focus": -100,
@@ -359,7 +359,7 @@ func TestNetworkPriorityLiveReprioritizationThroughModelRequest(t *testing.T) {
 			return
 		}
 		found = true
-		folder.NetworkPriority = 100
+		folder.FolderPriority = 100
 		cfg.Folders[index] = folder
 	})
 	if err != nil {
@@ -706,7 +706,7 @@ func newBlockTransferRequestConfigWithLimits(t *testing.T, priorities map[string
 		folder.Path = root
 		folder.FilesystemType = config.FilesystemType(observingBlockTransferFilesystemType)
 		folder.Devices = folderDevices
-		folder.NetworkPriority = priority
+		folder.FolderPriority = priority
 		folder.FSWatcherEnabled = false
 		folder.RescanIntervalS = 0
 		cfg.SetFolder(folder)

@@ -6,43 +6,43 @@
 
 package model
 
-// NetworkPrioritySchedulerDirectionState describes current Block Transfer
+// FolderPrioritySchedulerDirectionState describes current Block Transfer
 // work for one folder in one transfer direction.
-type NetworkPrioritySchedulerDirectionState struct {
+type FolderPrioritySchedulerDirectionState struct {
 	QueuedBytes                 int64   `json:"queuedBytes"`
 	ActiveBytes                 int64   `json:"activeBytes"`
 	OldestSchedulingWaitSeconds float64 `json:"oldestSchedulingWaitSeconds"`
 }
 
-// NetworkPrioritySchedulerState describes whether Network Priority scheduling
+// FolderPrioritySchedulerState describes whether Folder Priority scheduling
 // is active and the current upload and download work for one folder.
-type NetworkPrioritySchedulerState struct {
-	Active   bool                                   `json:"-"`
-	Upload   NetworkPrioritySchedulerDirectionState `json:"upload"`
-	Download NetworkPrioritySchedulerDirectionState `json:"download"`
+type FolderPrioritySchedulerState struct {
+	Active   bool                                  `json:"-"`
+	Upload   FolderPrioritySchedulerDirectionState `json:"upload"`
+	Download FolderPrioritySchedulerDirectionState `json:"download"`
 }
 
-// NetworkPrioritySchedulerStateProvider exposes stable scheduler state without
+// FolderPrioritySchedulerStateProvider exposes stable scheduler state without
 // exposing scheduler queues or admission accounting.
-type NetworkPrioritySchedulerStateProvider interface {
-	NetworkPrioritySchedulerState(folder string) NetworkPrioritySchedulerState
+type FolderPrioritySchedulerStateProvider interface {
+	FolderPrioritySchedulerState(folder string) FolderPrioritySchedulerState
 }
 
-func (m *model) NetworkPrioritySchedulerState(folder string) NetworkPrioritySchedulerState {
+func (m *model) FolderPrioritySchedulerState(folder string) FolderPrioritySchedulerState {
 	upload := m.uploadScheduler.directionState(folder)
 	download := m.downloadScheduler.directionState(folder)
-	return NetworkPrioritySchedulerState{
+	return FolderPrioritySchedulerState{
 		Active:   true,
 		Upload:   upload,
 		Download: download,
 	}
 }
 
-func (s *blockTransferScheduler) directionState(folder string) NetworkPrioritySchedulerDirectionState {
+func (s *blockTransferScheduler) directionState(folder string) FolderPrioritySchedulerDirectionState {
 	s.mut.Lock()
 	defer s.mut.Unlock()
 
-	state := NetworkPrioritySchedulerDirectionState{
+	state := FolderPrioritySchedulerDirectionState{
 		ActiveBytes: s.activeBytes[folder],
 	}
 	var oldestWait float64

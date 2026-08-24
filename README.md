@@ -91,7 +91,7 @@ code-signed.
 ## Documentation
 
 Please see the Syncthing [documentation site][6] [[source]][17].
-Operators using Network Priority should also read the [Network Priority
+Operators using Folder Priority should also read the [Folder Priority
 operator guide][18].
 
 All code is licensed under the [MPLv2 License][7].
@@ -110,4 +110,4 @@ All code is licensed under the [MPLv2 License][7].
 [15]: https://syncthing.net/
 [16]: https://github.com/syncthing/syncthing/blob/main/README-Docker.md
 [17]: https://github.com/syncthing/docs
-[18]: README-Network-Priority.md
+[18]: README-Folder-Priority.md

@@ -1,6 +1,6 @@
-# Operating Network Priority scheduling
+# Operating Folder Priority scheduling
 
-Network Priority is a device-local integer from -100 through 100, defaulting
+Folder Priority is a device-local integer from -100 through 100, defaulting
 to zero. Higher values strictly precede lower values for the next runnable
 Block Transfer. Active transfers and active protocol frames finish without
 preemption. The scheduler also serves installations where every folder keeps
@@ -18,19 +18,18 @@ coordinated end-to-end behavior must update every relevant Syncthing device
 independently through its REST API. A peer using a different local value is
 valid because each device controls its own resources.
 
-`networkPriority` is part of the existing folder configuration returned by
+`folderPriority` is part of the existing folder configuration returned by
 `GET /rest/config/folders/:id` and accepted by `PUT` or `PATCH` on that path:
 
 ```json
 {
-  "networkPriority": 50
+  "folderPriority": 50
 }
 ```
 
 The inclusive bounds are -100 and 100. Invalid values reject the configuration
-update without changing the current value. No feature flag or configuration
-migration is required. An existing `networkPriority` entry in the generic
-`featureFlags` list is harmless but no longer controls scheduling.
+update without changing the current value. Scheduling is universal and is not
+gated by a `featureFlags` entry.
 
 ## In-Flight Limits are not rate limits
 
@@ -43,7 +42,7 @@ positive value is raised to the safe protocol minimum.
 
 An In-Flight Limit caps concurrent active bytes; it does not cap bytes per
 second. `maxSendKbps`, `maxRecvKbps`, and per-device rate limits remain
-authoritative. Network Priority does not bypass those limiters, reserve their
+authoritative. Folder Priority does not bypass those limiters, reserve their
 tokens, or guarantee bandwidth.
 
 ## Observe current scheduler state
@@ -53,8 +52,8 @@ current state for each direction:
 
 ```json
 {
-  "networkPrioritySchedulingActive": true,
-  "networkPriorityScheduling": {
+  "folderPrioritySchedulingActive": true,
+  "folderPriorityScheduling": {
     "upload": {
       "queuedBytes": 1048576,
       "activeBytes": 4194304,
@@ -78,10 +77,10 @@ internal queue records.
 Prometheus exposes equivalent gauges with only the bounded `folder` and
 `direction` labels:
 
-- `syncthing_model_network_priority_scheduler_active`
-- `syncthing_model_network_priority_queued_bytes`
-- `syncthing_model_network_priority_active_bytes`
-- `syncthing_model_network_priority_oldest_scheduling_wait_seconds`
+- `syncthing_model_folder_priority_scheduler_active`
+- `syncthing_model_folder_priority_queued_bytes`
+- `syncthing_model_folder_priority_active_bytes`
+- `syncthing_model_folder_priority_oldest_scheduling_wait_seconds`
 
 ## Validate a three-peer studio workload
 
@@ -95,12 +94,12 @@ test:
 ```sh
 go run build.go install syncthing
 go test -v -timeout 60m -tags integration ./test \
-  -run '^TestNetworkPriorityStudioWorkload$' -count=10
+  -run '^TestFolderPriorityStudioWorkload$' -count=10
 ```
 
 Failures retain the generated homes, configurations, daemon logs, project
 data, JSON Lines timeline, and JSON summary under
-`test/logs/network-priority`. Set `STUDIO_ARTIFACT_DIR` to use another artifact
+`test/logs/folder-priority`. Set `STUDIO_ARTIFACT_DIR` to use another artifact
 root.
 
 The opt-in soak uses the same scenario engine behind the existing
@@ -109,7 +108,7 @@ The opt-in soak uses the same scenario engine behind the existing
 ```sh
 STUDIO_SOAK_TOTAL_BYTES=12GiB \
 go test -v -timeout 12h -tags 'integration,benchmark' ./test \
-  -run '^TestBenchmarkNetworkPriorityStudioSoak$'
+  -run '^TestBenchmarkFolderPriorityStudioSoak$'
 ```
 
 Soak controls are:

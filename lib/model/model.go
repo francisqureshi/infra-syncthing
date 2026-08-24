@@ -1162,14 +1162,14 @@ func (p *pager) done() bool {
 	return p.get == 0
 }
 
-// NetworkPriority supplies the connection writer with the current device-local
+// FolderPriority supplies the connection writer with the current device-local
 // priority for folder-owned output.
-func (m *model) NetworkPriority(folder string) protocol.NetworkPriorityPolicy {
+func (m *model) FolderPriority(folder string) protocol.FolderPriorityPolicy {
 	cfg, ok := m.cfg.Folder(folder)
 	if !ok {
-		return protocol.NetworkPriorityPolicy{}
+		return protocol.FolderPriorityPolicy{}
 	}
-	return protocol.NetworkPriorityPolicy{Priority: cfg.NetworkPriority}
+	return protocol.FolderPriorityPolicy{Priority: cfg.FolderPriority}
 }
 
 // Index is called when a new device is connected and we receive their full index.
@@ -3374,7 +3374,7 @@ func configureDownloadBlockTransferScheduler(scheduler *blockTransferScheduler, 
 func configureFolderWorkScheduler(scheduler *folderWorkScheduler, cfg config.Configuration) {
 	priorities := make(map[string]int, len(cfg.Folders))
 	for _, folder := range cfg.Folders {
-		priorities[folder.ID] = folder.NetworkPriority
+		priorities[folder.ID] = folder.FolderPriority
 	}
 	scheduler.configure(cfg.Options.MaxFolderConcurrency(), priorities)
 }
@@ -3391,7 +3391,7 @@ func configuredBlockTransferFolders(cfg config.Configuration) map[string]blockTr
 	folders := make(map[string]blockTransferFolder, len(cfg.Folders))
 	for _, folder := range cfg.Folders {
 		folders[folder.ID] = blockTransferFolder{
-			priority: folder.NetworkPriority,
+			priority: folder.FolderPriority,
 			runnable: !folder.Paused,
 		}
 	}

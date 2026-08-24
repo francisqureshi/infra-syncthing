@@ -455,7 +455,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	if f.Type != config.FolderTypeSendOnly {
 		f.setState(FolderSyncWaiting)
 
-		if runnable, err := f.networkPriorityPullRunnable(); err != nil {
+		if runnable, err := f.folderPriorityPullRunnable(); err != nil {
 			return false, err
 		} else if !runnable {
 			if f.pullRetryKind != pullRetryUnavailable || !time.Now().Before(f.pullRetryAt) {
@@ -473,7 +473,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 		// Availability may change while the folder is waiting for constrained
 		// I/O. Recheck after admission so a high-priority folder that stopped
 		// being runnable yields the slot immediately.
-		if runnable, err := f.networkPriorityPullRunnable(); err != nil {
+		if runnable, err := f.folderPriorityPullRunnable(); err != nil {
 			return false, err
 		} else if !runnable {
 			f.schedulePullRetry(pullRetryUnavailable, f.pullPause)
@@ -531,7 +531,7 @@ func (f *folder) clearPullRetry() {
 	}
 }
 
-func (f *folder) networkPriorityPullRunnable() (bool, error) {
+func (f *folder) folderPriorityPullRunnable() (bool, error) {
 	puller, ok := f.puller.(runnablePuller)
 	if !ok {
 		return true, nil
