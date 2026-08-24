@@ -39,12 +39,14 @@ func init() {
 }
 
 type sourceHashCoordinatorFilesystemControl struct {
-	folder     string
-	filesystem fs.Filesystem
-	started    chan<- string
-	release    <-chan struct{}
-	traversed  chan struct{}
-	armed      atomic.Bool
+	folder         string
+	filesystem     fs.Filesystem
+	started        chan<- string
+	release        <-chan struct{}
+	quantumStarted chan<- string
+	quantumRelease <-chan struct{}
+	traversed      chan struct{}
+	armed          atomic.Bool
 
 	traversedOnce sync.Once
 }
@@ -64,22 +66,41 @@ func (f *sourceHashCoordinatorFilesystem) DirNames(name string) ([]string, error
 
 func (f *sourceHashCoordinatorFilesystem) Open(name string) (fs.File, error) {
 	file, err := f.Filesystem.Open(name)
-	if err != nil || name != "payload" || !f.control.armed.Load() {
+	if err != nil || !f.control.armed.Load() {
 		return file, err
 	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
 	return &sourceHashCoordinatorFile{
-		File:    file,
-		control: f.control,
+		File:             file,
+		control:          f.control,
+		blockSize:        int64(protocol.FileInfo{Size: info.Size()}.BlockSize()),
+		remainingInBlock: 0,
 	}, nil
 }
 
 type sourceHashCoordinatorFile struct {
 	fs.File
-	control *sourceHashCoordinatorFilesystemControl
-	once    sync.Once
+	control          *sourceHashCoordinatorFilesystemControl
+	once             sync.Once
+	blockSize        int64
+	remainingInBlock int64
 }
 
 func (f *sourceHashCoordinatorFile) Read(buf []byte) (int, error) {
+	if f.control.quantumStarted != nil {
+		if f.remainingInBlock == 0 {
+			f.control.quantumStarted <- f.control.folder
+			<-f.control.quantumRelease
+			f.remainingInBlock = f.blockSize
+		}
+		n, err := f.File.Read(buf)
+		f.remainingInBlock -= int64(n)
+		return n, err
+	}
 	f.once.Do(func() {
 		f.control.started <- f.control.folder
 		<-f.control.release
@@ -253,6 +274,153 @@ func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
 		file, ok := m.testCurrentFolderFile(folder, "payload")
 		if !ok || len(file.Blocks) != 1 || len(file.BlocksHash) == 0 {
 			t.Fatalf("%s complete publication = %+v, present=%v", folder, file, ok)
+		}
+	}
+}
+
+func TestModelSharesEqualPrioritySourceHashWorkByActualBytes(t *testing.T) {
+	started := make(chan string, 8)
+	releases := map[string]chan struct{}{
+		"gate": make(chan struct{}),
+		"a":    make(chan struct{}),
+		"b":    make(chan struct{}),
+	}
+	controls := map[string]*sourceHashCoordinatorFilesystemControl{
+		"gate": {
+			folder:         "gate",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: releases["gate"],
+			traversed:      make(chan struct{}),
+		},
+		"a": {
+			folder:         "a",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: releases["a"],
+			traversed:      make(chan struct{}),
+		},
+		"b": {
+			folder:         "b",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: releases["b"],
+			traversed:      make(chan struct{}),
+		},
+	}
+	cfg := config.New(myID)
+	cfg.Options.MinHomeDiskFree.Value = 0
+	cfg.Options.RawHashCapacity = 2
+	for folderID, priority := range map[string]int{"gate": 100, "a": 0, "b": 0} {
+		root := rand.String(32)
+		control := controls[folderID]
+		sourceHashCoordinatorFilesystems.Store(root, control)
+		t.Cleanup(func() { sourceHashCoordinatorFilesystems.Delete(root) })
+
+		folder := cfg.Defaults.Folder.Copy()
+		folder.ID = folderID
+		folder.Label = folderID
+		folder.Path = root
+		folder.FilesystemType = config.FilesystemType(sourceHashCoordinatorFilesystemType)
+		folder.FolderPriority = priority
+		folder.Hashers = 2
+		folder.FSWatcherEnabled = false
+		folder.RescanIntervalS = 0
+		folder.ScanProgressIntervalS = 0
+		cfg.SetFolder(folder)
+	}
+
+	wrapper, cancel := newConfigWrapper(cfg)
+	t.Cleanup(cancel)
+	m := setupModel(t, wrapper)
+	t.Cleanup(func() { cleanupModel(m) })
+	for _, release := range releases {
+		release := release
+		t.Cleanup(func() { closeSourceHashCoordinatorSignal(release) })
+	}
+	submitted := make(chan observedSourceHashSubmission, 4)
+	m.sourceHashCoordinator = sourceHashCoordinatorObserver{
+		SourceHashCoordinator: m.sourceHashCoordinator,
+		submitted:             submitted,
+	}
+
+	writeFile(t, controls["gate"].filesystem, "payload-1", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["gate"].filesystem, "payload-2", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["a"].filesystem, "payload-1", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["a"].filesystem, "payload-2", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["b"].filesystem, "payload-1", make([]byte, protocol.MinBlockSize/2))
+	writeFile(t, controls["b"].filesystem, "payload-2", make([]byte, protocol.MinBlockSize/2))
+	for _, control := range controls {
+		control.armed.Store(true)
+	}
+
+	scanResults := make(map[string]<-chan error)
+	for _, folder := range []string{"gate", "a", "b"} {
+		result := make(chan error, 1)
+		scanResults[folder] = result
+		go func() { result <- m.ScanFolder(folder) }()
+		awaitSourceHashCoordinatorSignal(t, controls[folder].traversed, folder+" traversal")
+		for range 2 {
+			submission := awaitSourceHashSubmission(t, submitted)
+			if submission.folder != folder {
+				t.Fatalf("Source Hash Work submission = %q, want %q", submission.folder, folder)
+			}
+		}
+		if folder == "gate" {
+			for range 2 {
+				if got := awaitSourceHashCoordinatorStart(t, started); got != "gate" {
+					t.Fatalf("gate Hashing Quantum = %q, want gate", got)
+				}
+			}
+		}
+	}
+
+	releases["gate"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "a" {
+		t.Fatalf("first equal-priority admission = %q, want a", got)
+	}
+	releases["gate"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "b" {
+		t.Fatalf("admission while A had one active block = %q, want b", got)
+	}
+	for index, want := range []string{"b", "a"} {
+		releases[map[string]string{"b": "a", "a": "b"}[want]] <- struct{}{}
+		if got := awaitSourceHashCoordinatorStart(t, started); got != want {
+			t.Fatalf("byte-fair replacement %d = %q, want %q", index+1, got, want)
+		}
+	}
+	releases["a"] <- struct{}{}
+	releases["b"] <- struct{}{}
+
+	for folder, result := range scanResults {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s scan: %v", folder, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s scan", folder)
+		}
+	}
+	for folder, files := range map[string]map[string]int64{
+		"gate": {
+			"payload-1": protocol.MinBlockSize,
+			"payload-2": protocol.MinBlockSize,
+		},
+		"a": {
+			"payload-1": protocol.MinBlockSize,
+			"payload-2": protocol.MinBlockSize,
+		},
+		"b": {
+			"payload-1": protocol.MinBlockSize / 2,
+			"payload-2": protocol.MinBlockSize / 2,
+		},
+	} {
+		for name, size := range files {
+			file, ok := m.testCurrentFolderFile(folder, name)
+			if !ok || file.Size != size || len(file.Blocks) == 0 || len(file.BlocksHash) == 0 {
+				t.Fatalf("%s/%s complete publication = %+v, present=%v", folder, name, file, ok)
+			}
 		}
 	}
 }

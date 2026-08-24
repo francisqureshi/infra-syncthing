@@ -151,6 +151,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 	toHashChan := make(chan protocol.FileInfo)
 	finishedChan := make(chan ScanResult)
 	traversalDone := make(chan struct{})
+	sourceHashEpoch := w.SourceHashCoordinator.BeginSourceHashEpoch(w.SourceHashFolder)
 
 	// A routine which walks the filesystem tree, and sends files which have
 	// been modified to the counter routine.
@@ -163,6 +164,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 			folder:      w.SourceHashFolder,
 			filesystem:  w.Filesystem,
 			coordinator: w.SourceHashCoordinator,
+			epoch:       sourceHashEpoch,
 			outbox:      finishedChan,
 			inbox:       toHashChan,
 		}, w.Hashers)
@@ -191,6 +193,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		}
 
 		if len(filesToHash) == 0 {
+			sourceHashEpoch.Close()
 			close(finishedChan)
 			return
 		}
@@ -203,6 +206,7 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 			folder:      w.SourceHashFolder,
 			filesystem:  w.Filesystem,
 			coordinator: w.SourceHashCoordinator,
+			epoch:       sourceHashEpoch,
 			outbox:      finishedChan,
 			inbox:       realToHashChan,
 			counter:     progress,

@@ -152,6 +152,18 @@ func (w *SourceHashWork) HashNext(ctx context.Context) (HashingQuantumResult, er
 	return completed, err
 }
 
+// NextHashingQuantumBytes returns the expected byte charge for the next
+// Hashing Quantum. The coordinator reserves this amount while the quantum is
+// active and replaces it with the actual consumed bytes on completion.
+func (w *SourceHashWork) NextHashingQuantumBytes() int64 {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	if w.done || w.initialSize == 0 {
+		return 0
+	}
+	return min(int64(w.blockSize), w.initialSize-w.nextOffset)
+}
+
 func hashOneBlock(r io.Reader, size, offset int64, hashes []byte) (protocol.BlockInfo, []byte, int64, error) {
 	hf := hashPool.Get().(hash.Hash)         //nolint:forcetypeassert
 	buf := bufPool.Get().(*[bufSize]byte)[:] //nolint:forcetypeassert

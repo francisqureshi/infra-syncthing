@@ -16,6 +16,7 @@ import (
 // HashingQuantumWork executes sequential Hashing Quanta for one file.
 type HashingQuantumWork interface {
 	HashNext(context.Context) (HashingQuantumResult, error)
+	NextHashingQuantumBytes() int64
 	Close()
 }
 
@@ -49,21 +50,45 @@ type SourceHashSubmission struct {
 	Completion <-chan SourceHashCompletion
 }
 
+// SourceHashEpoch keeps one Folder's Equal-Priority Share open while its scan
+// may still discover or submit Source Hash Work. Close marks discovery and all
+// submissions for the epoch complete; fairness resets after the remaining
+// queued and active work drains.
+type SourceHashEpoch interface {
+	Close()
+}
+
 // SourceHashCoordinator admits Source Hash Work against one node-wide Hash
 // Capacity pool. Submit synchronously enrolls work and transfers its ownership
 // to the coordinator. Completion, continuation eligibility, slot release, and
 // replacement selection are serialized as one transition.
 type SourceHashCoordinator interface {
+	BeginSourceHashEpoch(SourceHashFolder) SourceHashEpoch
 	Submit(context.Context, SourceHashRequest) SourceHashSubmission
 }
 
 type sourceHashCoordinator struct {
 	mut sync.Mutex
 
-	capacity int
-	active   int
-	byFolder map[string]int
-	queued   []*coordinatedSourceHashWork
+	capacity    int
+	active      int
+	byFolder    map[string]int
+	charged     map[sourceHashAccount]int64
+	activeBytes map[sourceHashAccount]int64
+	byAccount   map[sourceHashAccount]int
+	epochs      map[sourceHashAccount]int
+	queued      []*coordinatedSourceHashWork
+}
+
+type sourceHashAccount struct {
+	priority int
+	folder   string
+}
+
+type sourceHashEpoch struct {
+	coordinator *sourceHashCoordinator
+	account     sourceHashAccount
+	once        sync.Once
 }
 
 type coordinatedSourceHashWork struct {
@@ -73,6 +98,7 @@ type coordinatedSourceHashWork struct {
 	admitted    chan struct{}
 	wasAdmitted bool
 	bytes       int64
+	activeBytes int64
 }
 
 // NewSourceHashCoordinator returns a coordinator with the given positive Hash
@@ -82,9 +108,36 @@ func NewSourceHashCoordinator(capacity int) SourceHashCoordinator {
 		panic("Hash Capacity must be positive")
 	}
 	return &sourceHashCoordinator{
-		capacity: capacity,
-		byFolder: make(map[string]int),
+		capacity:    capacity,
+		byFolder:    make(map[string]int),
+		charged:     make(map[sourceHashAccount]int64),
+		activeBytes: make(map[sourceHashAccount]int64),
+		byAccount:   make(map[sourceHashAccount]int),
+		epochs:      make(map[sourceHashAccount]int),
 	}
+}
+
+func (c *sourceHashCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) SourceHashEpoch {
+	account := sourceHashAccount{priority: folder.Priority, folder: folder.ID}
+	c.mut.Lock()
+	c.initializeFairnessLocked(account)
+	c.epochs[account]++
+	c.mut.Unlock()
+	return &sourceHashEpoch{
+		coordinator: c,
+		account:     account,
+	}
+}
+
+func (e *sourceHashEpoch) Close() {
+	e.once.Do(func() {
+		e.coordinator.mut.Lock()
+		e.coordinator.epochs[e.account]--
+		if e.coordinator.epochs[e.account] == 0 {
+			delete(e.coordinator.epochs, e.account)
+		}
+		e.coordinator.mut.Unlock()
+	})
 }
 
 func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
@@ -95,6 +148,7 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 		admitted:   make(chan struct{}),
 	}
 	c.mut.Lock()
+	c.initializeFairnessLocked(work.account())
 	c.queued = append(c.queued, work)
 	c.scheduleLocked()
 	c.mut.Unlock()
@@ -114,6 +168,9 @@ func (c *sourceHashCoordinator) scheduleLocked() {
 		c.queued = append(c.queued[:next], c.queued[next+1:]...)
 		c.active++
 		c.byFolder[work.request.Folder.ID]++
+		c.byAccount[work.account()]++
+		work.activeBytes = max(work.request.Work.NextHashingQuantumBytes(), 0)
+		c.activeBytes[work.account()] += work.activeBytes
 		if !work.wasAdmitted {
 			work.wasAdmitted = true
 			close(work.admitted)
@@ -129,11 +186,48 @@ func (c *sourceHashCoordinator) nextLocked() int {
 		if request.Folder.HasherCeiling > 0 && c.byFolder[request.Folder.ID] >= request.Folder.HasherCeiling {
 			continue
 		}
-		if next < 0 || request.Folder.Priority > c.queued[next].request.Folder.Priority {
+		if next < 0 || request.Folder.Priority > c.queued[next].request.Folder.Priority ||
+			(request.Folder.Priority == c.queued[next].request.Folder.Priority &&
+				c.fairnessScoreLocked(c.queued[i].account()) < c.fairnessScoreLocked(c.queued[next].account())) {
 			next = i
 		}
 	}
 	return next
+}
+
+func (c *sourceHashCoordinator) initializeFairnessLocked(account sourceHashAccount) {
+	if c.participatingLocked(account) {
+		return
+	}
+	var minimum int64
+	found := false
+	for candidate := range c.charged {
+		if candidate.priority != account.priority || !c.participatingLocked(candidate) {
+			continue
+		}
+		bytes := c.fairnessScoreLocked(candidate)
+		if !found || bytes < minimum {
+			minimum = bytes
+			found = true
+		}
+	}
+	c.charged[account] = minimum
+}
+
+func (c *sourceHashCoordinator) fairnessScoreLocked(account sourceHashAccount) int64 {
+	return c.charged[account] + c.activeBytes[account]
+}
+
+func (c *sourceHashCoordinator) participatingLocked(account sourceHashAccount) bool {
+	if c.epochs[account] > 0 || c.byAccount[account] > 0 {
+		return true
+	}
+	for _, work := range c.queued {
+		if work.account() == account {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
@@ -141,8 +235,12 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 
 	c.mut.Lock()
 	work.bytes += result.Bytes
+	c.charged[work.account()] += result.Bytes
+	c.activeBytes[work.account()] -= work.activeBytes
+	work.activeBytes = 0
 	c.active--
 	c.byFolder[work.request.Folder.ID]--
+	c.byAccount[work.account()]--
 	if err == nil && !result.Done {
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
@@ -159,4 +257,11 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 		Err:   err,
 	}
 	close(work.completion)
+}
+
+func (w *coordinatedSourceHashWork) account() sourceHashAccount {
+	return sourceHashAccount{
+		priority: w.request.Folder.Priority,
+		folder:   w.request.Folder.ID,
+	}
 }

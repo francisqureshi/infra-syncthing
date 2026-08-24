@@ -50,6 +50,7 @@ type parallelHasher struct {
 	folder      SourceHashFolder
 	fs          fs.Filesystem
 	coordinator SourceHashCoordinator
+	epoch       SourceHashEpoch
 	outbox      chan<- ScanResult
 	inbox       <-chan protocol.FileInfo
 	counter     Counter
@@ -61,6 +62,7 @@ type parallelHasherConfig struct {
 	folder      SourceHashFolder
 	filesystem  fs.Filesystem
 	coordinator SourceHashCoordinator
+	epoch       SourceHashEpoch
 	outbox      chan<- ScanResult
 	inbox       <-chan protocol.FileInfo
 	counter     Counter
@@ -72,6 +74,7 @@ func newParallelHasher(ctx context.Context, cfg parallelHasherConfig, workers in
 		folder:      cfg.folder,
 		fs:          cfg.filesystem,
 		coordinator: cfg.coordinator,
+		epoch:       cfg.epoch,
 		outbox:      cfg.outbox,
 		inbox:       cfg.inbox,
 		counter:     cfg.counter,
@@ -136,6 +139,9 @@ func (ph *parallelHasher) closeWhenDone() {
 	// In case the hasher aborted on context, wait for filesystem
 	// walking/progress routine to finish.
 	for range ph.inbox {
+	}
+	if ph.epoch != nil {
+		ph.epoch.Close()
 	}
 	if ph.done != nil {
 		close(ph.done)
