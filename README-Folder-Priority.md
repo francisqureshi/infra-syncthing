@@ -1,10 +1,25 @@
 # Operating Folder Priority scheduling
 
 Folder Priority is a device-local integer from -100 through 100, defaulting
-to zero. Higher values strictly precede lower values for the next runnable
-Block Transfer. Active transfers and active protocol frames finish without
-preemption. The scheduler also serves installations where every folder keeps
-the default priority of zero, applying Equal-Priority Share universally.
+to zero. Higher values strictly precede lower values for the next compatible
+Folder-owned work. It covers upload and download Block Transfers,
+Folder-Scoped Metadata, pulls, priority-enrolled prerequisite scan admission,
+and Source Hash Work from explicit, scheduled, watcher, and prerequisite
+scans. Active transfers, protocol frames, directory traversals, and Hashing
+Quanta finish without preemption. The scheduler also serves installations
+where every Folder keeps the default priority of zero, applying
+Equal-Priority Share universally.
+
+Ordinary explicit and maintenance scan admission remains arrival-ordered;
+only the already-enrolled prerequisite scan policy uses Folder Priority.
+Receive-side verification, reuse hashing, version cleanup, and unrelated
+maintenance hashing do not consume Hash Capacity. Folder Priority is not sent
+through BEP and adds no field, scheduling hint, capability negotiation, or
+other wire-protocol change.
+
+The [scheduler prototype](https://github.com/francisqureshi/infra-syncthing/tree/6683a077eaec7b6c0cbfc1c6e3a50ec497b06c97)
+remains linked design evidence only. Its HTML and reducer are not production
+code and are not shipped by Syncthing.
 
 Strict priority intentionally permits starvation. Continuously runnable work
 at a higher priority can keep lower-priority work queued indefinitely. Use the
@@ -30,6 +45,31 @@ valid because each device controls its own resources.
 The inclusive bounds are -100 and 100. Invalid values reject the configuration
 update without changing the current value. Scheduling is universal and is not
 gated by a `featureFlags` entry.
+
+## Configure Hash Capacity and per-Folder ceilings
+
+`hashCapacity` is part of the options configuration returned by
+`GET /rest/config/options` and accepted by `PUT` or `PATCH` on that path:
+
+```json
+{
+  "hashCapacity": 4
+}
+```
+
+Zero selects automatic node-wide Hash Capacity, which is the current positive
+`GOMAXPROCS` value. A positive value sets the live node-wide pool explicitly.
+Increasing it admits compatible queued Source Hash Work immediately. Reducing
+it lets active Hashing Quanta finish and withholds replacements until active
+usage reaches the new limit. A negative value rejects the complete
+configuration update without changing the active capacity.
+
+The existing per-Folder `hashers` setting is a ceiling on that Folder's
+concurrent Hashing Quanta. Zero inherits the whole node-wide pool; a positive
+value limits the Folder to the smaller of that value and available Hash
+Capacity. A ceiling does not reserve capacity, so other Folders can use every
+slot it leaves idle. Unlike node-wide Hash Capacity, changing a positive
+per-Folder `hashers` value retains the existing Folder restart lifecycle.
 
 ## Source Hash Work resource bounds
 
@@ -127,6 +167,35 @@ configured `folder` values and the bounded `work_class` values `upload`,
 - `syncthing_model_folder_priority_hash_capacity`
 - `syncthing_model_folder_priority_retained_handles`
 - `syncthing_model_folder_priority_retained_handle_budget`
+
+## Reproduce the Source Hash Work throughput gate
+
+`BenchmarkSourceHashThroughput` creates 16 deterministic files of
+`16 MiB + 17 bytes` on one basic filesystem, warms that same data once, and
+uses 128 KiB blocks for both paths. `WholeFileBaseline` reproduces the previous
+whole-file worker behavior. `Scheduled` exercises the production Source Hash
+Work coordinator. Both use four effective workers; the scheduled path uses
+Hash Capacity four and a per-Folder ceiling of four.
+
+Run ten samples of each path on the same host:
+
+```sh
+GOMAXPROCS=4 go test ./lib/scanner -run '^$' \
+  -bench '^BenchmarkSourceHashThroughput$' -benchmem \
+  -benchtime=3s -count=10 | tee /tmp/source-hash-throughput.txt
+```
+
+The Go benchmark header records the operating system, architecture, package,
+and CPU. Each sample reports bytes per second and allocations, plus custom
+`gomaxprocs`, `hash-capacity`, `folder-ceiling`, and
+`peak-retained-handles` values. Record `go version` and relevant host details
+with the raw output.
+
+Extract and sort each path's MB/s samples, calculate the median (the mean of
+the two middle values for an even run count), and divide the scheduled median
+by the baseline median. The gate passes only when that ratio is at least
+`0.95`. This comparison belongs in benchmark analysis, not a wall-clock
+functional test.
 
 ## Validate a three-peer studio workload
 
