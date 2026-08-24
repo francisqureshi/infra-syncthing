@@ -48,6 +48,7 @@ type sourceHashCoordinatorFilesystemControl struct {
 	traversed      chan struct{}
 	handleClosed   chan struct{}
 	armed          atomic.Bool
+	opens          atomic.Int64
 
 	traversedOnce    sync.Once
 	handleClosedOnce sync.Once
@@ -71,6 +72,7 @@ func (f *sourceHashCoordinatorFilesystem) Open(name string) (fs.File, error) {
 	if err != nil || !f.control.armed.Load() {
 		return file, err
 	}
+	f.control.opens.Add(1)
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
@@ -708,7 +710,14 @@ func TestModelFolderLifecycleCancelsQueuedSourceHashWork(t *testing.T) {
 			if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != 0 || completed.File.Name != "" {
 				t.Fatalf("%s queued completion = %+v, want zero bytes, no file, and context cancellation", lifecycle, completed)
 			}
-			awaitSourceHashCoordinatorSignal(t, victimClosed, lifecycle+" queued source handle cleanup")
+			if got := harness.controls["victim"].opens.Load(); got != 0 {
+				t.Fatalf("%s queued Source Hash Work opened %d source handles, want zero", lifecycle, got)
+			}
+			select {
+			case <-victimClosed:
+				t.Fatalf("%s queued Source Hash Work closed a handle that should never have opened", lifecycle)
+			default:
+			}
 			select {
 			case <-victimSubmission.submission.Admitted:
 				t.Fatalf("%s admitted canceled queued Source Hash Work", lifecycle)
@@ -906,7 +915,11 @@ func TestModelSharesEqualPrioritySourceHashWorkByActualBytes(t *testing.T) {
 		scanResults[folder] = result
 		go func() { result <- m.ScanFolder(folder) }()
 		awaitSourceHashCoordinatorSignal(t, controls[folder].traversed, folder+" traversal")
-		for range 2 {
+		submissions := 2
+		if folder == "b" {
+			submissions = 1
+		}
+		for range submissions {
 			submission := awaitSourceHashSubmission(t, submitted)
 			if submission.folder != folder {
 				t.Fatalf("Source Hash Work submission = %q, want %q", submission.folder, folder)
@@ -924,6 +937,9 @@ func TestModelSharesEqualPrioritySourceHashWorkByActualBytes(t *testing.T) {
 	releases["gate"] <- struct{}{}
 	if got := awaitSourceHashCoordinatorStart(t, started); got != "a" {
 		t.Fatalf("first equal-priority admission = %q, want a", got)
+	}
+	if submission := awaitSourceHashSubmission(t, submitted); submission.folder != "b" {
+		t.Fatalf("Source Hash Work submission after bounded-window release = %q, want b", submission.folder)
 	}
 	releases["gate"] <- struct{}{}
 	if got := awaitSourceHashCoordinatorStart(t, started); got != "b" {

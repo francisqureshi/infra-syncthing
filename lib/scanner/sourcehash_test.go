@@ -399,6 +399,74 @@ func TestSourceHashWorkCloseDiscardsIncompleteProgress(t *testing.T) {
 	}
 }
 
+func TestRetainedSourceHashWorkRestartsFromBlockZeroAfterHandleRelease(t *testing.T) {
+	const path = "source"
+	blockSize := protocol.MinBlockSize
+	data := make([]byte, 2*blockSize)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	writeSourceHashTestFile(t, underlying, path, data)
+	fss := &observedSourceHashFilesystem{Filesystem: underlying}
+	counter := new(atomicSourceHashCounter)
+	work := newRetainedSourceHashWork("default", fss, protocol.FileInfo{
+		Name:         path,
+		Size:         int64(len(data)),
+		RawBlockSize: int32(blockSize),
+	}, counter)
+	defer work.Close()
+
+	first, err := work.HashNext(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Done || first.Bytes != int64(blockSize) {
+		t.Fatalf("first quantum = %+v, want a %d-byte continuation", first, blockSize)
+	}
+	work.ReleaseRetainedHandle()
+	if got := fss.opens.Load(); got != 1 {
+		t.Fatalf("source opens after displacement = %d, want 1", got)
+	}
+	if got := fss.closes.Load(); got != 1 {
+		t.Fatalf("source closes after displacement = %d, want 1", got)
+	}
+
+	restarted, err := work.HashNext(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Done || restarted.Bytes != int64(blockSize) {
+		t.Fatalf("first quantum after reopen = %+v, want a restarted %d-byte continuation", restarted, blockSize)
+	}
+	completed, err := work.HashNext(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !completed.Done || completed.Bytes != int64(blockSize) {
+		t.Fatalf("completion after reopen = %+v, want a %d-byte completion", completed, blockSize)
+	}
+	wantBlocks, err := Blocks(t.Context(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(completed.File.Blocks, wantBlocks) {
+		t.Errorf("reopened blocks = %v, want %v", completed.File.Blocks, wantBlocks)
+	}
+	if !bytes.Equal(completed.File.BlocksHash, protocol.BlocksHash(wantBlocks)) {
+		t.Errorf("reopened BlocksHash = %x, want %x", completed.File.BlocksHash, protocol.BlocksHash(wantBlocks))
+	}
+	if got := counter.total.Load(); got != 3*int64(blockSize) {
+		t.Errorf("charged source bytes = %d, want discarded plus restarted bytes %d", got, 3*blockSize)
+	}
+	if got := fss.opens.Load(); got != 2 {
+		t.Errorf("source opens = %d, want initial plus fresh reopen", got)
+	}
+	if got := fss.closes.Load(); got != 2 {
+		t.Errorf("source closes = %d, want displaced plus completed handles", got)
+	}
+}
+
 func TestHashFileMatchesWholeFileBaseline(t *testing.T) {
 	const path = "source"
 	const blockSize = 7
@@ -432,9 +500,10 @@ func assertSourceHashWorkDidNotPublish(t *testing.T, result HashingQuantumResult
 
 type observedSourceHashFilesystem struct {
 	fs.Filesystem
-	wrap   func(fs.File) fs.File
-	opens  atomic.Int64
-	closes atomic.Int64
+	wrap    func(fs.File) fs.File
+	handles *sourceHashHandleObserver
+	opens   atomic.Int64
+	closes  atomic.Int64
 }
 
 func (f *observedSourceHashFilesystem) Open(name string) (fs.File, error) {
@@ -443,20 +512,46 @@ func (f *observedSourceHashFilesystem) Open(name string) (fs.File, error) {
 		return nil, err
 	}
 	f.opens.Add(1)
+	if f.handles != nil {
+		f.handles.opened()
+	}
 	if f.wrap != nil {
 		file = f.wrap(file)
 	}
-	return &observedCloseFile{File: file, closes: &f.closes}, nil
+	return &observedCloseFile{File: file, closes: &f.closes, handles: f.handles}, nil
 }
 
 type observedCloseFile struct {
 	fs.File
-	closes *atomic.Int64
+	closes  *atomic.Int64
+	handles *sourceHashHandleObserver
 }
 
 func (f *observedCloseFile) Close() error {
 	f.closes.Add(1)
+	if f.handles != nil {
+		f.handles.closed()
+	}
 	return f.File.Close()
+}
+
+type sourceHashHandleObserver struct {
+	opens   atomic.Int64
+	closes  atomic.Int64
+	current atomic.Int64
+	peak    atomic.Int64
+}
+
+func (o *sourceHashHandleObserver) opened() {
+	o.opens.Add(1)
+	current := o.current.Add(1)
+	for peak := o.peak.Load(); current > peak && !o.peak.CompareAndSwap(peak, current); peak = o.peak.Load() {
+	}
+}
+
+func (o *sourceHashHandleObserver) closed() {
+	o.closes.Add(1)
+	o.current.Add(-1)
 }
 
 var errSourceHashTestRead = errors.New("source hash test read error")

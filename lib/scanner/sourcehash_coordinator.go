@@ -8,15 +8,26 @@ package scanner
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
+// sourceHashLookahead keeps a small, node-wide choice of ready files beyond
+// active Hash Capacity. Enrolled file descriptors and active-plus-retained
+// source handles are each bounded by Hash Capacity plus this lookahead.
+const sourceHashLookahead = 3
+
+var errSourceHashWorkDisplaced = errors.New("source hash work displaced by resource pressure")
+
 // HashingQuantumWork executes sequential Hashing Quanta for one file.
+// ReleaseRetainedHandle discards incomplete progress while keeping the work
+// reusable so its next quantum reopens the source and starts from block zero.
 type HashingQuantumWork interface {
 	HashNext(context.Context) (HashingQuantumResult, error)
 	NextHashingQuantumBytes() int64
+	ReleaseRetainedHandle()
 	Close()
 }
 
@@ -60,8 +71,9 @@ type SourceHashEpoch interface {
 
 // SourceHashCoordinator admits Source Hash Work against one node-wide Hash
 // Capacity pool. Submit synchronously enrolls work and transfers its ownership
-// to the coordinator. Completion, continuation eligibility, slot release, and
-// replacement selection are serialized as one transition.
+// to the coordinator, applying backpressure once Hash Capacity plus the fixed
+// lookahead is enrolled. Completion, continuation eligibility, slot release,
+// and replacement selection are serialized as one transition.
 type SourceHashCoordinator interface {
 	Configure(capacity int, priorities map[string]int)
 	BeginSourceHashEpoch(SourceHashFolder) SourceHashEpoch
@@ -71,18 +83,20 @@ type SourceHashCoordinator interface {
 type sourceHashCoordinator struct {
 	mut sync.Mutex
 
-	capacity      int
-	active        int
-	priorities    map[string]int
-	configured    bool
-	activeWorks   map[*coordinatedSourceHashWork]struct{}
-	byFolder      map[string]int
-	charged       map[equalPriorityShareKey]int64
-	activeBytes   map[equalPriorityShareKey]int64
-	activeByShare map[equalPriorityShareKey]int
-	epochs        map[string]int
-	epochPriority map[string]int
-	queued        []*coordinatedSourceHashWork
+	capacity          int
+	active            int
+	priorities        map[string]int
+	configured        bool
+	activeWorks       map[*coordinatedSourceHashWork]struct{}
+	byFolder          map[string]int
+	charged           map[equalPriorityShareKey]int64
+	activeBytes       map[equalPriorityShareKey]int64
+	activeByShare     map[equalPriorityShareKey]int
+	epochs            map[string]int
+	epochPriority     map[string]int
+	queued            []*coordinatedSourceHashWork
+	enrollmentChanged chan struct{}
+	cleanupInProgress int
 }
 
 type equalPriorityShareKey struct {
@@ -115,15 +129,16 @@ func NewSourceHashCoordinator(capacity int) SourceHashCoordinator {
 		panic("Hash Capacity must be positive")
 	}
 	return &sourceHashCoordinator{
-		capacity:      capacity,
-		priorities:    make(map[string]int),
-		activeWorks:   make(map[*coordinatedSourceHashWork]struct{}),
-		byFolder:      make(map[string]int),
-		charged:       make(map[equalPriorityShareKey]int64),
-		activeBytes:   make(map[equalPriorityShareKey]int64),
-		activeByShare: make(map[equalPriorityShareKey]int),
-		epochs:        make(map[string]int),
-		epochPriority: make(map[string]int),
+		capacity:          capacity,
+		priorities:        make(map[string]int),
+		activeWorks:       make(map[*coordinatedSourceHashWork]struct{}),
+		byFolder:          make(map[string]int),
+		charged:           make(map[equalPriorityShareKey]int64),
+		activeBytes:       make(map[equalPriorityShareKey]int64),
+		activeByShare:     make(map[equalPriorityShareKey]int),
+		epochs:            make(map[string]int),
+		epochPriority:     make(map[string]int),
+		enrollmentChanged: make(chan struct{}),
 	}
 }
 
@@ -190,11 +205,29 @@ func (c *sourceHashCoordinator) Configure(capacity int, priorities map[string]in
 		queued = append(queued, work)
 	}
 	c.queued = queued
+	displaced := make([]*coordinatedSourceHashWork, 0)
+	for len(c.queued) > 0 && c.active+len(c.queued) > c.capacity+sourceHashLookahead {
+		victim := c.lowestPriorityQueuedLocked()
+		displaced = append(displaced, c.queued[victim])
+		c.queued = append(c.queued[:victim], c.queued[victim+1:]...)
+	}
+	cleanup := len(canceled) > 0 || len(displaced) > 0
+	if cleanup {
+		c.cleanupAndScheduleLocked(func() {
+			for _, work := range canceled {
+				c.cancel(work)
+			}
+			for _, work := range displaced {
+				work.request.Work.ReleaseRetainedHandle()
+				completeDisplacedSourceHashWork(work)
+			}
+		}, true)
+		c.mut.Unlock()
+		return
+	}
+	c.notifyEnrollmentChangedLocked()
 	c.scheduleLocked()
 	c.mut.Unlock()
-	for _, work := range canceled {
-		c.cancel(work)
-	}
 }
 
 func (*sourceHashCoordinator) cancel(work *coordinatedSourceHashWork) {
@@ -206,6 +239,14 @@ func completeCanceledSourceHashWork(work *coordinatedSourceHashWork) {
 	work.completion <- SourceHashCompletion{
 		Bytes: work.bytes,
 		Err:   context.Canceled,
+	}
+	close(work.completion)
+}
+
+func completeDisplacedSourceHashWork(work *coordinatedSourceHashWork) {
+	work.completion <- SourceHashCompletion{
+		Bytes: work.bytes,
+		Err:   errSourceHashWorkDisplaced,
 	}
 	close(work.completion)
 }
@@ -245,30 +286,98 @@ func (c *sourceHashCoordinator) Submit(ctx context.Context, request SourceHashRe
 		completion: make(chan SourceHashCompletion, 1),
 		admitted:   make(chan struct{}),
 	}
-	c.mut.Lock()
-	if c.configured {
-		priority, ok := c.priorities[request.Folder.ID]
-		if !ok {
-			c.mut.Unlock()
+
+	for {
+		if err := ctx.Err(); err != nil {
 			c.cancel(work)
 			return SourceHashSubmission{
 				Admitted:   work.admitted,
 				Completion: work.completion,
 			}
 		}
-		work.request.Folder.Priority = priority
-	}
-	c.initializeFairnessLocked(work.shareKey())
-	c.queued = append(c.queued, work)
-	c.scheduleLocked()
-	c.mut.Unlock()
-	return SourceHashSubmission{
-		Admitted:   work.admitted,
-		Completion: work.completion,
+		c.mut.Lock()
+		if c.configured {
+			priority, ok := c.priorities[request.Folder.ID]
+			if !ok {
+				c.mut.Unlock()
+				c.cancel(work)
+				return SourceHashSubmission{
+					Admitted:   work.admitted,
+					Completion: work.completion,
+				}
+			}
+			work.request.Folder.Priority = priority
+		}
+		if c.active+len(c.queued) >= c.capacity+sourceHashLookahead {
+			victim := c.displacementCandidateLocked(work.request.Folder.Priority)
+			if victim < 0 {
+				changed := c.enrollmentChanged
+				c.mut.Unlock()
+				select {
+				case <-changed:
+					continue
+				case <-ctx.Done():
+					c.cancel(work)
+					return SourceHashSubmission{
+						Admitted:   work.admitted,
+						Completion: work.completion,
+					}
+				}
+			}
+
+			displaced := c.queued[victim]
+			c.queued = append(c.queued[:victim], c.queued[victim+1:]...)
+			c.initializeFairnessLocked(work.shareKey())
+			c.queued = append(c.queued, work)
+			c.cleanupAndScheduleLocked(func() {
+				displaced.request.Work.ReleaseRetainedHandle()
+				completeDisplacedSourceHashWork(displaced)
+			}, false)
+			c.mut.Unlock()
+			return SourceHashSubmission{
+				Admitted:   work.admitted,
+				Completion: work.completion,
+			}
+		}
+		c.initializeFairnessLocked(work.shareKey())
+		c.queued = append(c.queued, work)
+		c.scheduleLocked()
+		c.mut.Unlock()
+		return SourceHashSubmission{
+			Admitted:   work.admitted,
+			Completion: work.completion,
+		}
 	}
 }
 
+func (c *sourceHashCoordinator) lowestPriorityQueuedLocked() int {
+	victim := 0
+	for i := 1; i < len(c.queued); i++ {
+		if c.queued[i].request.Folder.Priority < c.queued[victim].request.Folder.Priority {
+			victim = i
+		}
+	}
+	return victim
+}
+
+func (c *sourceHashCoordinator) displacementCandidateLocked(priority int) int {
+	victim := -1
+	for i, candidate := range c.queued {
+		candidatePriority := candidate.request.Folder.Priority
+		if candidatePriority >= priority {
+			continue
+		}
+		if victim < 0 || candidatePriority < c.queued[victim].request.Folder.Priority {
+			victim = i
+		}
+	}
+	return victim
+}
+
 func (c *sourceHashCoordinator) scheduleLocked() {
+	if c.cleanupInProgress > 0 {
+		return
+	}
 	for c.active < c.capacity && len(c.queued) > 0 {
 		next := c.nextLocked()
 		if next < 0 {
@@ -373,32 +482,54 @@ func (c *sourceHashCoordinator) runQuantum(work *coordinatedSourceHashWork) {
 	c.activeBytes[work.activeShare] -= work.activeBytes
 	work.activeBytes = 0
 	if work.canceled {
-		c.mut.Unlock()
-		work.request.Work.Close()
-		c.mut.Lock()
 		c.releaseActiveLocked(work)
-		c.scheduleLocked()
+		c.cleanupAndScheduleLocked(work.request.Work.Close, true)
 		c.mut.Unlock()
 		completeCanceledSourceHashWork(work)
 		return
 	}
 	c.releaseActiveLocked(work)
 	if !work.canceled && err == nil && !result.Done {
+		if c.active+len(c.queued)+1 > c.capacity+sourceHashLookahead {
+			c.cleanupAndScheduleLocked(work.request.Work.ReleaseRetainedHandle, true)
+			c.mut.Unlock()
+			completeDisplacedSourceHashWork(work)
+			return
+		}
 		c.queued = append(c.queued, work)
 		c.scheduleLocked()
 		c.mut.Unlock()
 		return
 	}
-	c.scheduleLocked()
+	c.cleanupAndScheduleLocked(work.request.Work.Close, true)
 	c.mut.Unlock()
 
-	work.request.Work.Close()
 	work.completion <- SourceHashCompletion{
 		File:  result.File,
 		Bytes: work.bytes,
 		Err:   err,
 	}
 	close(work.completion)
+}
+
+// cleanupAndScheduleLocked begins and returns with the coordinator mutex held.
+// Scheduling remains paused while cleanup runs without the mutex so a
+// replacement cannot acquire a handle before the displaced owner releases it.
+func (c *sourceHashCoordinator) cleanupAndScheduleLocked(cleanup func(), enrollmentChanged bool) {
+	c.cleanupInProgress++
+	c.mut.Unlock()
+	cleanup()
+	c.mut.Lock()
+	c.cleanupInProgress--
+	if enrollmentChanged {
+		c.notifyEnrollmentChangedLocked()
+	}
+	c.scheduleLocked()
+}
+
+func (c *sourceHashCoordinator) notifyEnrollmentChangedLocked() {
+	close(c.enrollmentChanged)
+	c.enrollmentChanged = make(chan struct{})
 }
 
 func (c *sourceHashCoordinator) releaseActiveLocked(work *coordinatedSourceHashWork) {

@@ -8,6 +8,7 @@ package scanner
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/syncthing/syncthing/lib/fs"
@@ -105,16 +106,18 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 				panic("Bug. Asked to hash a directory or a deleted file.")
 			}
 
-			work, err := NewSourceHashWork(ph.folder.ID, ph.fs, f, ph.counter)
-			if err != nil {
-				handleError(ctx, "hashing", f.Name, err, ph.outbox)
-				continue
+			work := newRetainedSourceHashWork(ph.folder.ID, ph.fs, f, ph.counter)
+			var completion SourceHashCompletion
+			for {
+				submission := ph.coordinator.Submit(ctx, SourceHashRequest{
+					Folder: ph.folder,
+					Work:   work,
+				})
+				completion = <-submission.Completion
+				if !errors.Is(completion.Err, errSourceHashWorkDisplaced) {
+					break
+				}
 			}
-			submission := ph.coordinator.Submit(ctx, SourceHashRequest{
-				Folder: ph.folder,
-				Work:   work,
-			})
-			completion := <-submission.Completion
 			if completion.Err != nil {
 				handleError(ctx, "hashing", f.Name, completion.Err, ph.outbox)
 				continue

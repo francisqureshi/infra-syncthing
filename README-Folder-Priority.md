@@ -31,6 +31,29 @@ The inclusive bounds are -100 and 100. Invalid values reject the configuration
 update without changing the current value. Scheduling is universal and is not
 gated by a `featureFlags` entry.
 
+## Source Hash Work resource bounds
+
+Source Hash Work uses one node-wide active window. At any time, the coordinator
+owns no more than effective Hash Capacity plus a fixed lookahead of three
+enrolled files. Each enrolled file contributes at most one next-Hashing-Quantum
+descriptor; complete block arrays remain private to the file owner and are
+never materialized in scheduler state.
+
+The same `Hash Capacity + 3` bound applies to active plus retained source
+handles across all Folders. Files beyond the active window remain under scan
+backpressure without an open source handle. A newly runnable higher-priority
+file may displace lower-priority retained work when the window is full. That
+closes the displaced handle, discards its incomplete block list, preserves its
+actual-byte Equal-Priority Share charge, and later starts a fresh pass from
+block zero after reopening and restating the source. Hashes from before the
+close are never joined to the reopened handle.
+
+Live Hash Capacity shrink does not interrupt active Hashing Quanta. Queued
+descriptors and retained handles are released immediately where possible, then
+usage converges to the smaller `Hash Capacity + 3` bound as active quanta reach
+their block boundaries. Folder pause/removal, mutation, read errors, and
+successful completion close every handle that no longer has an owner.
+
 ## In-Flight Limits are not rate limits
 
 `maxConcurrentIncomingRequestKiB` is the node-wide upload In-Flight Limit for

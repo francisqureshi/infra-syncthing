@@ -56,6 +56,84 @@ type SourceHashWork struct {
 	done        bool
 }
 
+// retainedSourceHashWork opens its source lazily and can discard an incomplete
+// pass under node-wide handle pressure. The next Hashing Quantum then opens and
+// stats the source again and starts a new pass from block zero.
+type retainedSourceHashWork struct {
+	mut sync.Mutex
+
+	folderID   string
+	filesystem fs.Filesystem
+	file       protocol.FileInfo
+	counter    Counter
+	current    *SourceHashWork
+	closed     bool
+}
+
+func newRetainedSourceHashWork(folderID string, filesystem fs.Filesystem, file protocol.FileInfo, counter Counter) *retainedSourceHashWork {
+	return &retainedSourceHashWork{
+		folderID:   folderID,
+		filesystem: filesystem,
+		file:       file,
+		counter:    counter,
+	}
+}
+
+func (w *retainedSourceHashWork) HashNext(ctx context.Context) (HashingQuantumResult, error) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	if w.closed {
+		return HashingQuantumResult{}, errSourceHashWorkDone
+	}
+	if w.current == nil {
+		current, err := NewSourceHashWork(w.folderID, w.filesystem, w.file, w.counter)
+		if err != nil {
+			return HashingQuantumResult{}, err
+		}
+		w.current = current
+	}
+
+	result, err := w.current.HashNext(ctx)
+	if err != nil || result.Done {
+		w.current = nil
+	}
+	return result, err
+}
+
+func (w *retainedSourceHashWork) NextHashingQuantumBytes() int64 {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	if w.closed {
+		return 0
+	}
+	if w.current != nil {
+		return w.current.NextHashingQuantumBytes()
+	}
+	return min(int64(w.file.BlockSize()), max(w.file.Size, 0))
+}
+
+func (w *retainedSourceHashWork) ReleaseRetainedHandle() {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	if w.current != nil {
+		w.current.Close()
+		w.current = nil
+	}
+}
+
+func (w *retainedSourceHashWork) Close() {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	if w.closed {
+		return
+	}
+	w.closed = true
+	if w.current != nil {
+		w.current.Close()
+		w.current = nil
+	}
+}
+
 // NewSourceHashWork opens file and captures the source state which must remain
 // valid until hashing completes. Terminal outcomes close the source handle;
 // callers must Close work which they abandon between quanta.
