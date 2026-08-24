@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -153,13 +154,12 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 	traversalDone := make(chan struct{})
 	sourceHashEpoch := w.SourceHashCoordinator.BeginSourceHashEpoch(w.SourceHashFolder)
 
-	// A routine which walks the filesystem tree, and sends files which have
-	// been modified to the counter routine.
-	go w.scan(ctx, toHashChan, finishedChan, traversalDone)
-
 	// We're not required to emit scan progress events, just kick off hashers,
 	// and feed inputs directly from the walker.
 	if w.ProgressTickIntervalS < 0 {
+		// A routine which walks the filesystem tree, and sends files which have
+		// been modified directly to the hashers.
+		go w.scan(ctx, toHashChan, finishedChan, traversalDone)
 		newParallelHasher(ctx, parallelHasherConfig{
 			folder:      w.SourceHashFolder,
 			filesystem:  w.Filesystem,
@@ -171,29 +171,56 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		return WalkResult{Results: finishedChan, TraversalDone: traversalDone}
 	}
 
+	discoverySpool, err := newDiscoverySpool()
+	if err != nil {
+		sourceHashEpoch.Close()
+		close(traversalDone)
+		go func() {
+			handleError(ctx, "creating discovery spool", w.Folder, err, finishedChan)
+			close(finishedChan)
+		}()
+		return WalkResult{Results: finishedChan, TraversalDone: traversalDone}
+	}
+
+	// Buffered progress mode completes discovery into a scan-owned disk spool
+	// before feeding a bounded set of files to Source Hash Work.
+	go w.scan(ctx, toHashChan, finishedChan, traversalDone)
+
 	// Defaults to every 2 seconds.
 	if w.ProgressTickIntervalS == 0 {
 		w.ProgressTickIntervalS = 2
 	}
 
-	// We need to emit progress events, hence we create a routine which buffers
-	// the list of files to be hashed, counts the total number of
-	// bytes to hash, and once no more files need to be hashed (chan gets closed),
-	// start a routine which periodically emits FolderScanProgress events,
-	// until a stop signal is sent by the parallel hasher.
-	// Parallel hasher is stopped by this routine when we close the channel over
-	// which it receives the files we ask it to hash.
+	// We need to emit progress events, hence we spool the metadata for files to
+	// be hashed and count the total number of bytes. Once discovery finishes,
+	// the spool feeds the bounded hasher window while progress is emitted.
 	go func() {
-		var filesToHash []protocol.FileInfo
 		var total int64 = 1
+		var spoolErr error
 
 		for file := range toHashChan {
-			filesToHash = append(filesToHash, file)
+			if spoolErr == nil {
+				spoolErr = discoverySpool.Append(file)
+			}
 			total += file.Size
 		}
 
-		if len(filesToHash) == 0 {
+		if spoolErr == nil {
+			spoolErr = discoverySpool.Rewind()
+		}
+		if spoolErr != nil {
+			spoolErr = errors.Join(spoolErr, discoverySpool.Close())
 			sourceHashEpoch.Close()
+			handleError(ctx, "buffering discovery", w.Folder, spoolErr, finishedChan)
+			close(finishedChan)
+			return
+		}
+		if discoverySpool.Len() == 0 {
+			spoolErr = discoverySpool.Close()
+			sourceHashEpoch.Close()
+			if spoolErr != nil {
+				handleError(ctx, "removing discovery spool", w.Folder, spoolErr, finishedChan)
+			}
 			close(finishedChan)
 			return
 		}
@@ -201,8 +228,9 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		realToHashChan := make(chan protocol.FileInfo)
 		done := make(chan struct{})
 		progress := newByteCounter()
+		hasherCtx, cancelHasher := context.WithCancel(ctx)
 
-		newParallelHasher(ctx, parallelHasherConfig{
+		newParallelHasher(hasherCtx, parallelHasherConfig{
 			folder:      w.SourceHashFolder,
 			filesystem:  w.Filesystem,
 			coordinator: w.SourceHashCoordinator,
@@ -212,6 +240,10 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 			counter:     progress,
 			done:        done,
 		}, w.Hashers)
+		go func() {
+			<-done
+			cancelHasher()
+		}()
 
 		// A routine which actually emits the FolderScanProgress events
 		// every w.ProgressTicker ticks, until the hasher routines terminate.
@@ -247,13 +279,26 @@ func (w *walker) walk(ctx context.Context) WalkResult {
 		}()
 
 	loop:
-		for _, file := range filesToHash {
+		for {
+			file, err := discoverySpool.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				spoolErr = err
+				cancelHasher()
+				break
+			}
 			l.Debugln(w, "real to hash:", file.Name)
 			select {
 			case realToHashChan <- file:
 			case <-ctx.Done():
 				break loop
 			}
+		}
+		spoolErr = errors.Join(spoolErr, discoverySpool.Close())
+		if spoolErr != nil {
+			handleError(ctx, "reading discovery spool", w.Folder, spoolErr, finishedChan)
 		}
 		close(realToHashChan)
 	}()

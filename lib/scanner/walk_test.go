@@ -15,10 +15,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	rdebug "runtime/debug"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -734,8 +736,357 @@ func TestBufferedWalkSignalsTraversalBeforeHashingCompletes(t *testing.T) {
 	testWalkSignalsTraversalBeforeHashingCompletes(t, 0)
 }
 
+func TestBufferedWalkOwnsDiscoverySpoolUntilBoundedFeedDrains(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"payload", "zz-queued"} {
+		if err := fs.WriteFile(underlying, name, make([]byte, 128<<10), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-readRelease:
+		default:
+			close(readRelease)
+		}
+	})
+
+	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-success"
+	cfg.Filesystem = &readBarrierFilesystem{
+		Filesystem: underlying,
+		started:    readStarted,
+		release:    readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.ProgressTickIntervalS = 1
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "buffered traversal completion")
+	awaitScannerSignal(t, readStarted, "buffered hashing to start")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+
+	close(readRelease)
+	var results []ScanResult
+	for result := range walkResult.Results {
+		results = append(results, result)
+	}
+	if len(results) != 2 {
+		t.Fatalf("scan results = %v, want two completed files", results)
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after success: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterResultConsumerStops(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"a", "b", "c"} {
+		if err := fs.WriteFile(underlying, name, make([]byte, 128<<10), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "buffered-spool-consumer-failure"
+	cfg.Filesystem = underlying
+	cfg.Hashers = 1
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "buffered traversal completion")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	select {
+	case result := <-walkResult.Results:
+		if result.Err != nil {
+			t.Fatal(result.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first buffered result")
+	}
+
+	// A model result-consumer failure cancels the scan context before it
+	// returns. Do the same while unread discovery records remain.
+	cancel()
+	for range walkResult.Results {
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after result-consumer failure: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterTraversalCancellation(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"a", "b"} {
+		if err := fs.WriteFile(underlying, name, []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "buffered-spool-traversal-cancellation"
+	cfg.Filesystem = &walkBarrierFilesystem{
+		Filesystem: underlying,
+		path:       "a",
+		blocked:    blocked,
+		release:    release,
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+
+	awaitScannerSignal(t, blocked, "buffered traversal barrier")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	cancel()
+	close(release)
+	awaitScannerSignal(t, walkResult.TraversalDone, "cancelled buffered traversal completion")
+	for range walkResult.Results {
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after traversal cancellation: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterTraversalFailure(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-traversal-failure"
+	cfg.Filesystem = &walkBarrierFilesystem{
+		Filesystem: underlying,
+		path:       "payload",
+		blocked:    blocked,
+		release:    release,
+		walkErr:    errors.New("controlled traversal failure"),
+	}
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, blocked, "buffered traversal failure barrier")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	close(release)
+	awaitScannerSignal(t, walkResult.TraversalDone, "failed buffered traversal completion")
+	for range walkResult.Results {
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after traversal failure: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterHashingFailure(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-hashing-failure"
+	cfg.Filesystem = &openErrorFilesystem{
+		Filesystem: &walkBarrierFilesystem{
+			Filesystem: underlying,
+			path:       "payload",
+			blocked:    blocked,
+			release:    release,
+		},
+		path: "payload",
+		err:  errors.New("controlled hashing failure"),
+	}
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, blocked, "buffered hashing failure barrier")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	close(release)
+	var hashingErr error
+	for result := range walkResult.Results {
+		hashingErr = errors.Join(hashingErr, result.Err)
+	}
+	if hashingErr == nil || !strings.Contains(hashingErr.Error(), "controlled hashing failure") {
+		t.Fatalf("scan error = %v, want controlled hashing failure", hashingErr)
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after hashing failure: %v", err)
+	}
+}
+
+func TestBufferedWalkBoundsSyntheticMultiTerabyteDiscovery(t *testing.T) {
+	const (
+		files            = 32 << 10
+		logicalFileSize  = int64(64 << 30)
+		maxRetainedBytes = 8 << 20
+		window           = 2
+	)
+	filesystem := &logicalInventoryFilesystem{
+		Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
+		files:      files,
+		fileSize:   logicalFileSize,
+	}
+	coordinator := &inventorySourceHashCoordinator{
+		submitted: make(chan struct{}, window),
+	}
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "buffered-spool-logical-inventory"
+	cfg.Filesystem = filesystem
+	cfg.Hashers = window
+	cfg.SourceHashCoordinator = coordinator
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+	awaitScannerSignal(t, walkResult.TraversalDone, "synthetic logical inventory traversal")
+	for range window {
+		awaitScannerSignal(t, coordinator.submitted, "bounded Source Hash Work submission")
+	}
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	var retained uint64
+	if after.HeapAlloc > before.HeapAlloc {
+		retained = after.HeapAlloc - before.HeapAlloc
+	}
+	if retained > maxRetainedBytes {
+		t.Fatalf("buffered discovery retained %d bytes for %d files, want at most %d", retained, files, maxRetainedBytes)
+	}
+	if got := coordinator.enrolled.Load(); got != window {
+		t.Fatalf("Source Hash Work materialized %d files, want bounded window %d", got, window)
+	}
+	if got := filesystem.opens.Load(); got != 0 {
+		t.Fatalf("buffered discovery opened %d source handles before admission, want zero", got)
+	}
+	if logicalBytes := int64(files) * logicalFileSize; logicalBytes < 1<<40 {
+		t.Fatalf("synthetic inventory is only %d bytes", logicalBytes)
+	}
+
+	cancel()
+	for range walkResult.Results {
+	}
+}
+
+func TestBufferedWalkPreservesFinalScanProgressTotals(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for name, data := range map[string][]byte{
+		"a": []byte("abc"),
+		"b": []byte("12345"),
+	} {
+		if err := fs.WriteFile(underlying, name, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-progress"
+	cfg.Filesystem = underlying
+	cfg.ProgressTickIntervalS = 1
+	sub := cfg.EventLogger.Subscribe(events.FolderScanProgress)
+	defer sub.Unsubscribe()
+	walkResult := Walk(t.Context(), cfg)
+	for result := range walkResult.Results {
+		if result.Err != nil {
+			t.Fatal(result.Err)
+		}
+	}
+
+	select {
+	case event := <-sub.C():
+		data, ok := event.Data.(map[string]any)
+		if !ok {
+			t.Fatalf("progress event data = %T, want map", event.Data)
+		}
+		if got, want := data["folder"], cfg.Folder; got != want {
+			t.Fatalf("progress folder = %v, want %v", got, want)
+		}
+		if got, want := data["current"], int64(8); got != want {
+			t.Fatalf("progress current = %v, want %v", got, want)
+		}
+		if got, want := data["total"], int64(9); got != want {
+			t.Fatalf("progress total = %v, want %v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for final buffered progress event")
+	}
+}
+
 func TestStreamingWalkSignalsTraversalBeforeHashingCompletes(t *testing.T) {
 	testWalkSignalsTraversalBeforeHashingCompletes(t, -1)
+}
+
+func TestStreamingWalkRunsDiscoveredFileDuringTraversalWithoutSpool(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", make([]byte, 128<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	traversalBlocked := make(chan struct{})
+	traversalRelease := make(chan struct{})
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	before, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "streaming-without-spool"
+	cfg.Filesystem = &readBarrierFilesystem{
+		Filesystem: &walkBarrierFilesystem{
+			Filesystem: underlying,
+			path:       "payload",
+			blocked:    traversalBlocked,
+			release:    traversalRelease,
+		},
+		started: readStarted,
+		release: readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.ProgressTickIntervalS = -1
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, traversalBlocked, "streaming traversal barrier")
+	awaitScannerSignal(t, readStarted, "streaming hashing during traversal")
+	assertNoNewDiscoverySpool(t, before)
+	close(traversalRelease)
+	close(readRelease)
+	for range walkResult.Results {
+	}
 }
 
 func TestWalkWithoutHashingCancellationClosesResultsWhenConsumerStops(t *testing.T) {
@@ -849,6 +1200,104 @@ type readBarrierFilesystem struct {
 	release chan struct{}
 }
 
+type walkBarrierFilesystem struct {
+	fs.Filesystem
+	path    string
+	blocked chan struct{}
+	release chan struct{}
+	walkErr error
+	once    sync.Once
+}
+
+type openErrorFilesystem struct {
+	fs.Filesystem
+	path string
+	err  error
+}
+
+type logicalInventoryFilesystem struct {
+	fs.Filesystem
+	files    int
+	fileSize int64
+	opens    atomic.Int64
+}
+
+func (f *logicalInventoryFilesystem) Walk(_ string, walkFn fs.WalkFunc) error {
+	if err := walkFn(".", fakeInfo{name: "."}, nil); err != nil {
+		return err
+	}
+	for i := range f.files {
+		name := fmt.Sprintf("file-%08d-%0240d", i, i)
+		if err := walkFn(name, fakeInfo{name: name, size: f.fileSize}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *logicalInventoryFilesystem) Open(string) (fs.File, error) {
+	f.opens.Add(1)
+	return nil, errors.New("synthetic source must not open during discovery")
+}
+
+func (*logicalInventoryFilesystem) PlatformData(string, bool, bool, fs.XattrFilter) (protocol.PlatformData, error) {
+	return protocol.PlatformData{}, nil
+}
+
+type inventorySourceHashCoordinator struct {
+	enrolled  atomic.Int64
+	submitted chan struct{}
+}
+
+func (*inventorySourceHashCoordinator) Configure(int, map[string]int) {}
+
+func (*inventorySourceHashCoordinator) BeginSourceHashEpoch(SourceHashFolder) SourceHashEpoch {
+	return noopSourceHashEpoch{}
+}
+
+func (c *inventorySourceHashCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
+	c.enrolled.Add(1)
+	c.submitted <- struct{}{}
+	admitted := make(chan struct{})
+	close(admitted)
+	completion := make(chan SourceHashCompletion, 1)
+	go func() {
+		<-ctx.Done()
+		request.Work.Close()
+		completion <- SourceHashCompletion{Err: ctx.Err()}
+		close(completion)
+	}()
+	return SourceHashSubmission{Admitted: admitted, Completion: completion}
+}
+
+type noopSourceHashEpoch struct{}
+
+func (noopSourceHashEpoch) Close() {}
+
+func (f *openErrorFilesystem) Open(name string) (fs.File, error) {
+	if name == f.path {
+		return nil, f.err
+	}
+	return f.Filesystem.Open(name)
+}
+
+func (f *walkBarrierFilesystem) Walk(root string, walkFn fs.WalkFunc) error {
+	err := f.Filesystem.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		walkErr := walkFn(path, info, err)
+		if path == f.path {
+			f.once.Do(func() {
+				close(f.blocked)
+				<-f.release
+			})
+		}
+		return walkErr
+	})
+	if err != nil {
+		return err
+	}
+	return f.walkErr
+}
+
 func (f *readBarrierFilesystem) Open(name string) (fs.File, error) {
 	file, err := f.Filesystem.Open(name)
 	if err != nil || name != "payload" {
@@ -878,6 +1327,42 @@ func awaitScannerSignal(t *testing.T, done <-chan struct{}, description string) 
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func awaitNewDiscoverySpool(t *testing.T, before []string) string {
+	t.Helper()
+	known := make(map[string]struct{}, len(before))
+	for _, path := range before {
+		known[path] = struct{}{}
+	}
+	paths, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if _, ok := known[path]; !ok {
+			return path
+		}
+	}
+	t.Fatal("buffered scan did not create a discovery spool")
+	return ""
+}
+
+func assertNoNewDiscoverySpool(t *testing.T, before []string) {
+	t.Helper()
+	known := make(map[string]struct{}, len(before))
+	for _, path := range before {
+		known[path] = struct{}{}
+	}
+	paths, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if _, ok := known[path]; !ok {
+			t.Fatalf("streaming scan created discovery spool %q", path)
+		}
 	}
 }
 
