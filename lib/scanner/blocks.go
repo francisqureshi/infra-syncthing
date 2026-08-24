@@ -52,11 +52,7 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 		// Allocate contiguous blocks for the BlockInfo structures and their
 		// hashes once and for all, and stick to the specified size.
 		r = io.LimitReader(r, sizehint)
-		numBlocks := sizehint / int64(blocksize)
-		remainder := sizehint % int64(blocksize)
-		if remainder != 0 {
-			numBlocks++
-		}
+		numBlocks := blockCount(sizehint, blocksize)
 		blocks = make([]protocol.BlockInfo, 0, numBlocks)
 		hashes = make([]byte, 0, hashLength*numBlocks)
 	}
@@ -103,6 +99,13 @@ func Blocks(ctx context.Context, r io.Reader, blocksize int, sizehint int64, cou
 	}
 
 	return blocks, nil
+}
+
+func blockCount(size int64, blockSize int) int64 {
+	if size == 0 {
+		return 0
+	}
+	return (size-1)/int64(blockSize) + 1
 }
 
 func hashBlock(hf hash.Hash, buf []byte, r io.Reader, size, offset int64, hashes []byte) (protocol.BlockInfo, []byte, int64, error) {
