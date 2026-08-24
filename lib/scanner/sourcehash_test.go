@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
@@ -151,11 +153,12 @@ func TestSourceHashWorkDiscardsProgressAfterMutation(t *testing.T) {
 	const path = "source"
 	blockSize := protocol.MinBlockSize
 	data := make([]byte, 2*blockSize)
+	folderID := "source-hash-mutation-" + rand.String(16)
 	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
 	writeSourceHashTestFile(t, underlying, path, data)
 	fss := &observedSourceHashFilesystem{Filesystem: underlying}
 
-	work, err := NewSourceHashWork("default", fss, protocol.FileInfo{
+	work, err := NewSourceHashWork(folderID, fss, protocol.FileInfo{
 		Name:         path,
 		Size:         int64(len(data)),
 		RawBlockSize: int32(blockSize),
@@ -187,6 +190,18 @@ func TestSourceHashWorkDiscardsProgressAfterMutation(t *testing.T) {
 	if got := fss.closes.Load(); got != 1 {
 		t.Errorf("source closes = %d, want 1", got)
 	}
+	if got := sourceHashMetricValue(t, folderID); got != float64(len(data)) {
+		t.Errorf("hashed-bytes metric after final validation failure = %v, want %d", got, len(data))
+	}
+}
+
+func sourceHashMetricValue(t *testing.T, folderID string) float64 {
+	t.Helper()
+	metric := new(dto.Metric)
+	if err := metricHashedBytes.WithLabelValues(folderID).Write(metric); err != nil {
+		t.Fatal(err)
+	}
+	return metric.GetCounter().GetValue()
 }
 
 func TestSourceHashWorkReportsBytesAndDiscardsProgressAfterReadError(t *testing.T) {

@@ -78,10 +78,7 @@ func newSourceHashWork(folderID string, filesystem fs.Filesystem, file protocol.
 		counter = &noopCounter{}
 	}
 
-	numBlocks := info.Size() / int64(blockSize)
-	if info.Size()%int64(blockSize) != 0 {
-		numBlocks++
-	}
+	numBlocks := blockCount(info.Size(), blockSize)
 
 	return &SourceHashWork{
 		folderID:    folderID,
@@ -134,6 +131,7 @@ func (w *SourceHashWork) HashNext(ctx context.Context) (HashingQuantumResult, er
 		return result, err
 	}
 	if bytesHashed != quantumSize {
+		w.recordHashedFile()
 		err := w.validate()
 		w.discard()
 		if err != nil {
@@ -165,6 +163,7 @@ func hashOneBlock(r io.Reader, size, offset int64, hashes []byte) (protocol.Bloc
 }
 
 func (w *SourceHashWork) complete() (HashingQuantumResult, error) {
+	w.recordHashedFile()
 	if err := w.validate(); err != nil {
 		w.discard()
 		return HashingQuantumResult{}, err
@@ -175,11 +174,14 @@ func (w *SourceHashWork) complete() (HashingQuantumResult, error) {
 	w.file.Blocks = w.blocks
 	w.file.BlocksHash = protocol.BlocksHash(w.blocks)
 	w.file.Size = w.nextOffset
-	metricHashedBytes.WithLabelValues(w.folderID).Add(float64(w.initialSize))
 	return HashingQuantumResult{
 		Done: true,
 		File: w.file,
 	}, nil
+}
+
+func (w *SourceHashWork) recordHashedFile() {
+	metricHashedBytes.WithLabelValues(w.folderID).Add(float64(w.initialSize))
 }
 
 func (w *SourceHashWork) validate() error {
