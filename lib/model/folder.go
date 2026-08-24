@@ -818,6 +818,16 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 				fchan = nil
 				continue
 			}
+			// Traversal can finish after the pre-check but before this case is
+			// selected. Latch it again before doing any result-consumer work.
+			if traversalDone != nil {
+				select {
+				case <-traversalDone:
+					releaseScanAdmission()
+					traversalDone = nil
+				default:
+				}
+			}
 			if res.Err != nil {
 				f.newScanError(res.Path, res.Err)
 				continue

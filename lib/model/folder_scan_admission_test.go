@@ -9,6 +9,7 @@ package model
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
 )
 
@@ -48,11 +50,13 @@ type scanAdmissionFilesystemControl struct {
 	releaseFailure   chan struct{}
 	traversalBlocked chan struct{}
 	releaseTraversal chan struct{}
+	consumerFailure  chan struct{}
 	armed            atomic.Bool
 	blockRead        atomic.Bool
 	blockReconcile   atomic.Bool
 	failTraversal    atomic.Bool
 	blockTraversal   atomic.Bool
+	observeFailure   atomic.Bool
 }
 
 type scanAdmissionFilesystem struct {
@@ -61,10 +65,6 @@ type scanAdmissionFilesystem struct {
 }
 
 func (f *scanAdmissionFilesystem) DirNames(name string) ([]string, error) {
-	if f.control.armed.Load() && name == "blocked" && f.control.blockTraversal.CompareAndSwap(true, false) {
-		close(f.control.traversalBlocked)
-		<-f.control.releaseTraversal
-	}
 	if f.control.armed.Load() && name == "failure" && f.control.failTraversal.CompareAndSwap(true, false) {
 		close(f.control.traversalFailure)
 		<-f.control.releaseFailure
@@ -76,7 +76,9 @@ func (f *scanAdmissionFilesystem) DirNames(name string) ([]string, error) {
 		default:
 		}
 	}
-	return f.Filesystem.DirNames(name)
+	names, err := f.Filesystem.DirNames(name)
+	slices.Sort(names)
+	return names, err
 }
 
 func (f *scanAdmissionFilesystem) Open(name string) (fs.File, error) {
@@ -91,11 +93,22 @@ func (f *scanAdmissionFilesystem) Open(name string) (fs.File, error) {
 }
 
 func (f *scanAdmissionFilesystem) Lstat(name string) (fs.FileInfo, error) {
+	if f.control.armed.Load() && name == "zz-blocked" && f.control.blockTraversal.CompareAndSwap(true, false) {
+		close(f.control.traversalBlocked)
+		<-f.control.releaseTraversal
+	}
 	if f.control.armed.Load() && name == "deleted" && f.control.blockReconcile.CompareAndSwap(true, false) {
 		close(f.control.reconciliation)
 		<-f.control.releaseReconcile
 	}
 	return f.Filesystem.Lstat(name)
+}
+
+func (f *scanAdmissionFilesystem) Stat(name string) (fs.FileInfo, error) {
+	if f.control.armed.Load() && f.control.observeFailure.CompareAndSwap(true, false) {
+		close(f.control.consumerFailure)
+	}
+	return f.Filesystem.Stat(name)
 }
 
 type scanAdmissionFile struct {
@@ -196,9 +209,10 @@ func TestTraversalFailureReleasesFolderConcurrency(t *testing.T) {
 
 func TestCancelledScanDoesNotLeakScanAdmission(t *testing.T) {
 	m, controls := newScanAdmissionModel(t, 0)
-	if err := controls["low"].filesystem.Mkdir("blocked", 0o755); err != nil {
+	if err := m.ScanFolder("low"); err != nil {
 		t.Fatal(err)
 	}
+	writeFile(t, controls["low"].filesystem, "zz-blocked", []byte("blocked"))
 	if err := controls["high"].filesystem.Mkdir("traversal", 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -233,34 +247,70 @@ func TestCancelledScanDoesNotLeakScanAdmission(t *testing.T) {
 }
 
 func TestResultConsumerFailureDoesNotLeakScanAdmission(t *testing.T) {
-	m, controls := newScanAdmissionModel(t, 0)
+	m, controls := newScanAdmissionModel(t, -1)
+	if err := m.ScanFolder("low"); err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, controls["low"].filesystem, "payload", make([]byte, 128<<10))
-	for _, control := range controls {
-		if err := control.filesystem.Mkdir("traversal", 0o755); err != nil {
+	writeFile(t, controls["low"].filesystem, "zz-blocked", []byte("blocked"))
+	for _, folderID := range []string{"high", "next"} {
+		if err := controls[folderID].filesystem.Mkdir("traversal", 0o755); err != nil {
 			t.Fatal(err)
 		}
+	}
+	for _, control := range controls {
 		control.armed.Store(true)
 	}
 	controls["low"].blockRead.Store(true)
+	controls["low"].blockTraversal.Store(true)
 
 	sub := m.evLogger.Subscribe(events.StateChanged)
 	defer sub.Unsubscribe()
+	runner, ok := m.folderRunners.Get("low")
+	if !ok {
+		t.Fatal("low folder is not running")
+	}
+	lowFolder := runner.(*sendReceiveFolder).folder
+	scanCtx, cancelScan := context.WithCancel(t.Context())
+	defer cancelScan()
+	if err := lowFolder.ioLimiter.takeWithContext(scanCtx, lowFolder.ID, folderWorkMaintenance); err != nil {
+		t.Fatal(err)
+	}
+	var releaseScanAdmissionOnce sync.Once
+	releaseScanAdmission := func() {
+		releaseScanAdmissionOnce.Do(lowFolder.ioLimiter.give)
+	}
+	defer releaseScanAdmission()
+	batch := lowFolder.newScanBatch()
 	lowResult := make(chan error, 1)
-	go func() { lowResult <- m.ScanFolder("low") }()
-	awaitScanAdmissionSignalOrResult(t, controls["low"].walked, lowResult, "low traversal")
-	awaitScanAdmissionSignal(t, controls["low"].read, "low hashing")
+	go func() {
+		_, err := lowFolder.scanSubdirsChangedAndNew(scanCtx, nil, batch, releaseScanAdmission)
+		lowResult <- err
+	}()
+	awaitScanAdmissionSignalOrResult(t, controls["low"].read, lowResult, "low hashing")
+	awaitScanAdmissionSignalOrResult(t, controls["low"].traversalBlocked, lowResult, "blocked low traversal")
+	for range MaxBatchSizeFiles {
+		batch.updateBatch.Append(protocol.FileInfo{Name: "prefill"})
+	}
 
-	// The scan batch rechecks folder health before publishing completed-file
-	// results. Removing the marker after traversal makes that consumer fail.
+	// A full pending batch makes the completed file result recheck folder
+	// health and fail while traversal remains blocked.
+	controls["low"].observeFailure.Store(true)
 	if err := controls["low"].filesystem.Remove(config.DefaultMarkerName); err != nil {
 		t.Fatal(err)
 	}
 	highResult := make(chan error, 1)
 	go func() { highResult <- m.ScanFolder("high") }()
 	awaitFolderStateEvent(t, sub, "high", FolderScanWaiting)
-	awaitScanAdmissionSignalOrResult(t, controls["high"].walked, highResult, "high traversal while low result consumption remains pending")
-
 	close(controls["low"].release)
+	awaitScanAdmissionSignalOrResult(t, controls["low"].consumerFailure, lowResult, "result-consumer failure during traversal")
+	select {
+	case <-controls["high"].walked:
+		t.Fatal("high traversal started before failed low traversal released scan admission")
+	default:
+	}
+	close(controls["low"].releaseTraversal)
+	awaitScanAdmissionSignalOrResult(t, controls["high"].walked, highResult, "high traversal after result-consumer failure")
 	if err := <-lowResult; err == nil {
 		t.Fatal("low scan succeeded after its result consumer lost folder health")
 	}
@@ -331,6 +381,7 @@ func newScanAdmissionModel(t *testing.T, scanProgressInterval int) (*testModel, 
 			releaseFailure:   make(chan struct{}),
 			traversalBlocked: make(chan struct{}),
 			releaseTraversal: make(chan struct{}),
+			consumerFailure:  make(chan struct{}),
 		}
 		scanAdmissionFilesystems.Store(root, control)
 		t.Cleanup(func() {
