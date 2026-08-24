@@ -43,6 +43,13 @@ type sourceHashThroughputResult struct {
 	peakRetainedHandles int64
 }
 
+type sourceHashThroughputRun struct {
+	filesystem fs.Filesystem
+	handles    *sourceHashHandleObserver
+	inbox      <-chan protocol.FileInfo
+	results    chan ScanResult
+}
+
 func TestSourceHashThroughputPathsUseIdenticalWork(t *testing.T) {
 	const (
 		folder           = "throughput"
@@ -144,44 +151,37 @@ func BenchmarkSourceHashThroughput(b *testing.B) {
 }
 
 func runWholeFileHashThroughput(ctx context.Context, spec sourceHashThroughputSpec) (sourceHashThroughputResult, error) {
-	if err := validateSourceHashThroughputSpec(spec); err != nil {
+	run, err := newSourceHashThroughputRun(spec)
+	if err != nil {
 		return sourceHashThroughputResult{}, err
 	}
-	handles := new(sourceHashHandleObserver)
-	filesystem := &observedSourceHashFilesystem{Filesystem: spec.filesystem, handles: handles}
-	inbox := make(chan protocol.FileInfo, len(spec.files))
-	results := make(chan ScanResult, len(spec.files))
-	for _, file := range spec.files {
-		inbox <- file
-	}
-	close(inbox)
 
 	var workers sync.WaitGroup
 	workers.Add(spec.effectiveWorkers)
 	for range spec.effectiveWorkers {
 		go func() {
 			defer workers.Done()
-			for file := range inbox {
-				completed, err := hashWholeFileBaseline(ctx, spec.folder.ID, filesystem, file)
-				results <- ScanResult{File: completed, Err: err, Path: file.Name}
+			for file := range run.inbox {
+				completed, err := hashWholeFileBaseline(ctx, spec.folder.ID, run.filesystem, file)
+				run.results <- ScanResult{File: completed, Err: err, Path: file.Name}
 			}
 		}()
 	}
 	workers.Wait()
-	close(results)
+	close(run.results)
 
 	result := sourceHashThroughputResult{
 		effectiveWorkers:    spec.effectiveWorkers,
-		peakRetainedHandles: handles.peak.Load(),
+		peakRetainedHandles: run.handles.peak.Load(),
 	}
-	for completed := range results {
+	for completed := range run.results {
 		if completed.Err != nil {
 			return sourceHashThroughputResult{}, fmt.Errorf("whole-file baseline %s: %w", completed.Path, completed.Err)
 		}
 		result.files = append(result.files, completed.File)
 		result.bytes += completed.File.Size
 	}
-	if current := handles.current.Load(); current != 0 {
+	if current := run.handles.current.Load(); current != 0 {
 		return sourceHashThroughputResult{}, fmt.Errorf("whole-file baseline retained %d source handles", current)
 	}
 	return result, nil
@@ -221,35 +221,28 @@ func hashWholeFileBaseline(ctx context.Context, folder string, filesystem fs.Fil
 }
 
 func runScheduledHashThroughput(ctx context.Context, spec sourceHashThroughputSpec) (sourceHashThroughputResult, error) {
-	if err := validateSourceHashThroughputSpec(spec); err != nil {
+	run, err := newSourceHashThroughputRun(spec)
+	if err != nil {
 		return sourceHashThroughputResult{}, err
 	}
-	handles := new(sourceHashHandleObserver)
-	filesystem := &observedSourceHashFilesystem{Filesystem: spec.filesystem, handles: handles}
 	coordinator := NewSourceHashCoordinator(spec.effectiveWorkers)
 	coordinator.Configure(spec.effectiveWorkers, map[string]int{spec.folder.ID: spec.folder.Priority})
 	epoch := coordinator.BeginSourceHashEpoch(spec.folder)
-	inbox := make(chan protocol.FileInfo, len(spec.files))
-	results := make(chan ScanResult, len(spec.files))
-	for _, file := range spec.files {
-		inbox <- file
-	}
-	close(inbox)
 
 	newParallelHasher(ctx, parallelHasherConfig{
 		folder:      spec.folder,
-		filesystem:  filesystem,
+		filesystem:  run.filesystem,
 		coordinator: coordinator,
 		epoch:       epoch,
-		outbox:      results,
-		inbox:       inbox,
+		outbox:      run.results,
+		inbox:       run.inbox,
 	}, spec.effectiveWorkers)
 
 	result := sourceHashThroughputResult{
 		effectiveWorkers: spec.effectiveWorkers,
 	}
 	var resultErr error
-	for completed := range results {
+	for completed := range run.results {
 		if completed.Err != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("scheduled %s: %w", completed.Path, completed.Err))
 			continue
@@ -257,11 +250,29 @@ func runScheduledHashThroughput(ctx context.Context, spec sourceHashThroughputSp
 		result.files = append(result.files, completed.File)
 		result.bytes += completed.File.Size
 	}
-	result.peakRetainedHandles = handles.peak.Load()
-	if current := handles.current.Load(); current != 0 {
+	result.peakRetainedHandles = run.handles.peak.Load()
+	if current := run.handles.current.Load(); current != 0 {
 		resultErr = errors.Join(resultErr, fmt.Errorf("scheduled path retained %d source handles", current))
 	}
 	return result, resultErr
+}
+
+func newSourceHashThroughputRun(spec sourceHashThroughputSpec) (sourceHashThroughputRun, error) {
+	if err := validateSourceHashThroughputSpec(spec); err != nil {
+		return sourceHashThroughputRun{}, err
+	}
+	handles := new(sourceHashHandleObserver)
+	inbox := make(chan protocol.FileInfo, len(spec.files))
+	for _, file := range spec.files {
+		inbox <- file
+	}
+	close(inbox)
+	return sourceHashThroughputRun{
+		filesystem: &observedSourceHashFilesystem{Filesystem: spec.filesystem, handles: handles},
+		handles:    handles,
+		inbox:      inbox,
+		results:    make(chan ScanResult, len(spec.files)),
+	}, nil
 }
 
 func validateSourceHashThroughputSpec(spec sourceHashThroughputSpec) error {
