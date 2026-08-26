@@ -19,6 +19,8 @@ import (
 	"github.com/syncthing/syncthing/lib/structutil"
 )
 
+const FeatureFlagNetworkPriority = "networkPriority"
+
 type OptionsConfiguration struct {
 	RawListenAddresses          []string `json:"listenAddresses" xml:"listenAddress" default:"default"`
 	RawGlobalAnnServers         []string `json:"globalAnnounceServers" xml:"globalAnnounceServer" default:"default"`

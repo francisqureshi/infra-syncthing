@@ -116,6 +116,8 @@ type FolderSummary struct {
 
 	IgnorePatterns bool   `json:"ignorePatterns"`
 	WatchError     string `json:"watchError"`
+
+	NetworkPrioritySchedulingActive bool `json:"networkPrioritySchedulingActive"`
 }
 
 func (c *folderSummaryService) Summary(folder string) (*FolderSummary, error) {

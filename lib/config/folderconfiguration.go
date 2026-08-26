@@ -36,6 +36,8 @@ var (
 const (
 	DefaultMarkerName          = ".stfolder"
 	EncryptionTokenName        = "syncthing-encryption_password_token" //nolint: gosec
+	NetworkPriorityMin         = -100
+	NetworkPriorityMax         = 100
 	maxConcurrentWritesDefault = 16
 	maxConcurrentWritesLimit   = 256
 )
@@ -87,6 +89,7 @@ type FolderConfiguration struct {
 	SyncXattrs              bool                        `json:"syncXattrs" xml:"syncXattrs"`
 	SendXattrs              bool                        `json:"sendXattrs" xml:"sendXattrs"`
 	BlockIndexing           bool                        `json:"blockIndexing" xml:"blockIndexing" default:"true"`
+	NetworkPriority         int                         `json:"networkPriority" xml:"networkPriority" restart:"false"`
 	XattrFilter             XattrFilter                 `json:"xattrFilter" xml:"xattrFilter"`
 	// Legacy deprecated
 	DeprecatedReadOnly       bool    `json:"-" xml:"ro,attr,omitempty"`        // Deprecated: Do not use.
@@ -276,7 +279,11 @@ func (f *FolderConfiguration) DeviceIDs() []protocol.DeviceID {
 	return deviceIDs
 }
 
-func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) {
+func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices map[protocol.DeviceID]*DeviceConfiguration) error {
+	if f.NetworkPriority < NetworkPriorityMin || f.NetworkPriority > NetworkPriorityMax {
+		return fmt.Errorf("Network Priority %d must be between %d and %d", f.NetworkPriority, NetworkPriorityMin, NetworkPriorityMax)
+	}
+
 	// Ensure that
 	// - any loose devices are not present in the wrong places
 	// - there are no duplicate devices
@@ -323,6 +330,8 @@ func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices ma
 	if f.Type == FolderTypeReceiveEncrypted {
 		f.IgnorePerms = true
 	}
+
+	return nil
 }
 
 // RequiresRestartOnly returns a copy with only the attributes that require
