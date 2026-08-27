@@ -998,7 +998,10 @@ func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPrioritySourceHashWork(t 
 		ctx, cancel := context.WithCancel(t.Context())
 		workload.cancel = cancel
 		workload.walkResult = Walk(ctx, cfg)
-		awaitScannerSignal(t, workload.walkResult.TraversalDone, workload.folder+" synthetic logical inventory traversal")
+		// This deliberately formats and spools tens of thousands of synthetic
+		// entries. Leave headroom for shared CI runners without reducing the
+		// inventory that makes the retained-memory assertion meaningful.
+		awaitScannerSignalWithin(t, workload.walkResult.TraversalDone, workload.folder+" synthetic logical inventory traversal", 30*time.Second)
 		for range window {
 			if got := awaitCoordinatorStart(t, coordinator.submitted); got != workload.folder {
 				t.Fatalf("bounded Source Hash Work submission = %q, want %s", got, workload.folder)
@@ -1636,9 +1639,14 @@ func (f *readBarrierFile) Read(buf []byte) (int, error) {
 
 func awaitScannerSignal(t *testing.T, done <-chan struct{}, description string) {
 	t.Helper()
+	awaitScannerSignalWithin(t, done, description, 5*time.Second)
+}
+
+func awaitScannerSignalWithin(t *testing.T, done <-chan struct{}, description string, timeout time.Duration) {
+	t.Helper()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		t.Fatalf("timed out waiting for %s", description)
 	}
 }
