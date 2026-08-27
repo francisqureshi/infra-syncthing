@@ -628,9 +628,6 @@ func TestModelFolderPullRetriesDownloadWhenBackoffExpires(t *testing.T) {
 		t.Fatal("folder runner not found")
 	}
 	folder := runner.(*sendReceiveFolder)
-	// Expire the real retry timer immediately so the test uses explicit
-	// request signals instead of waiting for wall-clock backoff.
-	folder.pullPause = 0
 
 	fc := addFakeConn(m, device1, "folder")
 	if err := m.ScanFolder("folder"); err != nil {
@@ -655,6 +652,17 @@ func TestModelFolderPullRetriesDownloadWhenBackoffExpires(t *testing.T) {
 		case got := <-attempts:
 			if got != want {
 				t.Fatalf("download attempt = %d, want %d", got, want)
+			}
+			if got == 1 {
+				// The request callback runs before pull records its retry.
+				// Synchronize through folder.serve so the real backoff is
+				// installed first, then expire it deterministically.
+				if err := folder.doInSync(func(context.Context) error {
+					folder.schedulePullRetry(pullRetryFailure, 0)
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatalf("timed out waiting for download attempt %d", want)
