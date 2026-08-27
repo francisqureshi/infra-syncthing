@@ -109,7 +109,7 @@ func (opts OptionsConfiguration) Copy() OptionsConfiguration {
 func (opts *OptionsConfiguration) prepare(guiPWIsSet bool) error {
 	structutil.FillNilSlices(opts)
 	if opts.RawHashCapacity < 0 {
-		return fmt.Errorf("Hash Capacity %d must not be negative", opts.RawHashCapacity)
+		return fmt.Errorf("hash capacity %d must not be negative", opts.RawHashCapacity)
 	}
 
 	opts.RawListenAddresses = stringutil.UniqueTrimmedStrings(opts.RawListenAddresses)

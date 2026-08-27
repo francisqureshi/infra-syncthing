@@ -2605,7 +2605,7 @@ func (m *model) requestGlobalWithAvailability(ctx context.Context, availability 
 		if len(candidates) > 0 {
 			selected = candidates[0]
 		}
-		return nil, selected, fmt.Errorf("requestGlobal: no connection to an available device")
+		return nil, selected, errors.New("requestGlobal: no connection to an available device")
 	}
 
 	descriptor := blockTransferDescriptor{

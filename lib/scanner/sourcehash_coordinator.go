@@ -9,6 +9,7 @@ package scanner
 import (
 	"context"
 	"errors"
+	"maps"
 	"sync"
 	"time"
 
@@ -141,7 +142,7 @@ type sourceHashEpoch struct {
 
 type coordinatedSourceHashWork struct {
 	request     SourceHashRequest
-	ctx         context.Context
+	ctx         context.Context //nolint:containedctx // Submission cancellation must remain attached while work is queued.
 	completion  chan SourceHashCompletion
 	admitted    chan struct{}
 	wasAdmitted bool
@@ -245,9 +246,7 @@ func (c *sourceHashCoordinator) Configure(capacity int, priorities map[string]in
 		panic("Hash Capacity must be positive")
 	}
 	nextPriorities := make(map[string]int, len(priorities))
-	for folder, priority := range priorities {
-		nextPriorities[folder] = priority
-	}
+	maps.Copy(nextPriorities, priorities)
 	c.mut.Lock()
 	reprioritized := make(map[int]map[string]struct{})
 	if c.configured {

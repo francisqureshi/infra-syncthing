@@ -749,8 +749,7 @@ func (c *rawConnection) handleRequest(req *Request) {
 	res, err := c.model.Request(req)
 	if err != nil {
 		var done chan struct{}
-		var ordered orderedRequestError
-		if errors.As(err, &ordered) {
+		if ordered, ok := errors.AsType[orderedRequestError](err); ok {
 			ordered.WaitForResponse()
 			done = make(chan struct{})
 			defer func() {
