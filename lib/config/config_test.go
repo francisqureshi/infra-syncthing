@@ -613,13 +613,13 @@ func TestNewSaveLoad(t *testing.T) {
 	}
 }
 
-func TestNetworkPriorityConfiguration(t *testing.T) {
-	if priority := New(device1).Defaults.Folder.NetworkPriority; priority != 0 {
-		t.Fatalf("default Network Priority is %d, expected 0", priority)
+func TestFolderPriorityConfiguration(t *testing.T) {
+	if priority := New(device1).Defaults.Folder.FolderPriority; priority != 0 {
+		t.Fatalf("default Folder Priority is %d, expected 0", priority)
 	}
-	folder := FolderConfiguration{NetworkPriority: 50}
-	if priority := folder.RequiresRestartOnly().NetworkPriority; priority != 0 {
-		t.Fatalf("Network Priority %d unexpectedly requires restart", priority)
+	folder := FolderConfiguration{FolderPriority: 50}
+	if priority := folder.RequiresRestartOnly().FolderPriority; priority != 0 {
+		t.Fatalf("Folder Priority %d unexpectedly requires restart", priority)
 	}
 
 	for _, tc := range []struct {
@@ -636,12 +636,12 @@ func TestNetworkPriorityConfiguration(t *testing.T) {
 			cfg := New(device1)
 			folder := cfg.Defaults.Folder.Copy()
 			adjustFolderConfiguration(&folder, "default", "default", fs.FilesystemTypeBasic, "/tmp")
-			folder.NetworkPriority = tc.priority
+			folder.FolderPriority = tc.priority
 			cfg.Folders = append(cfg.Folders, folder)
 
 			err := cfg.prepare(device1)
 			if tc.wantErr && err == nil {
-				t.Fatal("expected invalid Network Priority to be rejected")
+				t.Fatal("expected invalid Folder Priority to be rejected")
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatal(err)
@@ -650,18 +650,65 @@ func TestNetworkPriorityConfiguration(t *testing.T) {
 	}
 
 	cfg := New(device1)
-	cfg.Defaults.Folder.NetworkPriority = 101
+	cfg.Defaults.Folder.FolderPriority = 101
 	if err := cfg.prepare(device1); err == nil {
-		t.Fatal("expected invalid default folder Network Priority to be rejected")
+		t.Fatal("expected invalid default Folder Priority to be rejected")
 	}
 }
 
-func TestNetworkPriorityPersistence(t *testing.T) {
+func TestMaxConcurrentOutgoingRequestKiB(t *testing.T) {
+	const defaultLimitKiB = 256 * 1024
+	const minimumLimitKiB = 2 * protocol.MaxBlockSize / 1024
+
+	tests := []struct {
+		name string
+		raw  int
+		want int
+	}{
+		{name: "default", raw: 0, want: defaultLimitKiB},
+		{name: "disabled", raw: -1, want: 0},
+		{name: "minimum clamped", raw: 1, want: minimumLimitKiB},
+		{name: "explicit", raw: minimumLimitKiB + 1, want: minimumLimitKiB + 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := OptionsConfiguration{RawMaxConcurrentOutgoingRequestKiB: tc.raw}
+			if got := opts.MaxConcurrentOutgoingRequestKiB(); got != tc.want {
+				t.Fatalf("MaxConcurrentOutgoingRequestKiB() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMaxConcurrentOutgoingRequestKiBPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.xml")
+	cfg := New(device1)
+	cfg.Options.RawMaxConcurrentOutgoingRequestKiB = 64 * 1024
+
+	wrapper := wrap(path, cfg, device1)
+	if err := wrapper.Save(); err != nil {
+		wrapper.stop()
+		t.Fatal(err)
+	}
+	wrapper.stop()
+
+	loaded, err := load(path, device1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loaded.stop()
+	if got := loaded.Options().RawMaxConcurrentOutgoingRequestKiB; got != cfg.Options.RawMaxConcurrentOutgoingRequestKiB {
+		t.Fatalf("persisted maxConcurrentOutgoingRequestKiB = %d, want %d", got, cfg.Options.RawMaxConcurrentOutgoingRequestKiB)
+	}
+}
+
+func TestFolderPriorityPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.xml")
 	cfg := New(device1)
 	folder := cfg.Defaults.Folder.Copy()
 	adjustFolderConfiguration(&folder, "default", "default", fs.FilesystemTypeBasic, "/tmp")
-	folder.NetworkPriority = 50
+	folder.FolderPriority = 50
 	cfg.Folders = append(cfg.Folders, folder)
 
 	wrapper := wrap(path, cfg, device1)
@@ -681,8 +728,8 @@ func TestNetworkPriorityPersistence(t *testing.T) {
 	if !ok {
 		t.Fatal("persisted folder is missing")
 	}
-	if loadedFolder.NetworkPriority != 50 {
-		t.Fatalf("persisted Network Priority is %d, expected 50", loadedFolder.NetworkPriority)
+	if loadedFolder.FolderPriority != 50 {
+		t.Fatalf("persisted Folder Priority is %d, expected 50", loadedFolder.FolderPriority)
 	}
 }
 
@@ -1379,6 +1426,26 @@ func TestMaxConcurrentFolders(t *testing.T) {
 		if res != tc.output {
 			t.Errorf("Wrong MaxFolderConcurrency, %d => %d, expected %d", tc.input, res, tc.output)
 		}
+	}
+}
+
+func TestHashCapacity(t *testing.T) {
+	automatic := OptionsConfiguration{}
+	if got, want := automatic.HashCapacity(), runtime.GOMAXPROCS(0); got != want || got < 1 {
+		t.Fatalf("automatic Hash Capacity = %d, want positive GOMAXPROCS %d", got, want)
+	}
+
+	explicit := OptionsConfiguration{RawHashCapacity: 3}
+	if got := explicit.HashCapacity(); got != 3 {
+		t.Fatalf("explicit Hash Capacity = %d, want 3", got)
+	}
+	if got := explicit.RequiresRestartOnly().RawHashCapacity; got != 0 {
+		t.Fatalf("restart-only Hash Capacity = %d, want live value omitted", got)
+	}
+
+	folder := FolderConfiguration{Hashers: 2}
+	if got := folder.RequiresRestartOnly().Hashers; got != 2 {
+		t.Fatalf("restart-only per-Folder hasher ceiling = %d, want 2", got)
 	}
 }
 

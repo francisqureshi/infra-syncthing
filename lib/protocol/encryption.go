@@ -138,8 +138,7 @@ func (e encryptedModel) Request(req *Request) (RequestResponse, error) {
 		data = nd
 	}
 	enc := encryptBytes(data, fileKey)
-	resp.Close()
-	return rawResponse{enc}, nil
+	return newRawResponse(enc, resp), nil
 }
 
 func (e encryptedModel) DownloadProgress(p *DownloadProgress) error {
@@ -636,15 +635,43 @@ func deslashify(s string) (string, error) {
 }
 
 type rawResponse struct {
-	data []byte
+	data     []byte
+	response RequestResponse
+}
+
+type retainedRequestResponse interface {
+	RetainForTransmission() bool
+}
+
+func newRawResponse(data []byte, response RequestResponse) rawResponse {
+	if retained, ok := response.(retainedRequestResponse); ok && retained.RetainForTransmission() {
+		return rawResponse{data: data, response: response}
+	}
+	response.Close()
+	return rawResponse{data: data}
 }
 
 func (r rawResponse) Data() []byte {
 	return r.data
 }
 
-func (rawResponse) Close() {}
-func (rawResponse) Wait()  {}
+func (r rawResponse) Close() {
+	if r.response != nil {
+		r.response.Close()
+	}
+}
+
+func (r rawResponse) Wait() {
+	if r.response != nil {
+		r.response.Wait()
+	}
+}
+
+func (r rawResponse) WaitForResponse() {
+	if ordered, ok := r.response.(orderedRequestResponse); ok {
+		ordered.WaitForResponse()
+	}
+}
 
 // IsEncryptedParent returns true if the path points at a parent directory of
 // encrypted data, i.e. is not a "real" directory. This is determined by

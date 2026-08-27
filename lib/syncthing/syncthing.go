@@ -253,6 +253,7 @@ func (a *App) startup() error {
 
 	keyGen := protocol.NewKeyGenerator()
 	m := model.NewModel(a.cfg, a.myID, a.sdb, protectedFiles, a.evLogger, keyGen)
+	model.RegisterFolderPriorityMetrics(a.cfg, m)
 	a.Internals = newInternals(m)
 
 	a.mainService.Add(m)

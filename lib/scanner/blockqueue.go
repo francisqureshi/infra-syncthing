@@ -17,46 +17,30 @@ import (
 
 // HashFile hashes the files and returns a list of blocks representing the file.
 func HashFile(ctx context.Context, folderID string, fs fs.Filesystem, path string, blockSize int, counter Counter) ([]protocol.BlockInfo, error) {
-	fd, err := fs.Open(path)
+	file, err := hashFileInfo(ctx, folderID, fs, protocol.FileInfo{Name: path}, blockSize, counter)
 	if err != nil {
-		l.Debugln("open:", err)
+		l.Debugln("hash file:", err)
 		return nil, err
 	}
-	defer fd.Close()
+	return file.Blocks, nil
+}
 
-	// Get the size and modtime of the file before we start hashing it.
-
-	fi, err := fd.Stat()
+func hashFileInfo(ctx context.Context, folderID string, filesystem fs.Filesystem, file protocol.FileInfo, blockSize int, counter Counter) (protocol.FileInfo, error) {
+	work, err := newSourceHashWork(folderID, filesystem, file, blockSize, counter)
 	if err != nil {
-		l.Debugln("stat before:", err)
-		return nil, err
+		return protocol.FileInfo{}, err
 	}
-	size := fi.Size()
-	modTime := fi.ModTime()
+	defer work.Close()
 
-	// Hash the file. This may take a while for large files.
-
-	blocks, err := Blocks(ctx, fd, blockSize, size, counter)
-	if err != nil {
-		l.Debugln("blocks:", err)
-		return nil, err
+	for {
+		result, err := work.HashNext(ctx)
+		if err != nil {
+			return protocol.FileInfo{}, err
+		}
+		if result.Done {
+			return result.File, nil
+		}
 	}
-
-	metricHashedBytes.WithLabelValues(folderID).Add(float64(size))
-
-	// Recheck the size and modtime again. If they differ, the file changed
-	// while we were reading it and our hash results are invalid.
-
-	fi, err = fd.Stat()
-	if err != nil {
-		l.Debugln("stat after:", err)
-		return nil, err
-	}
-	if size != fi.Size() || !modTime.Equal(fi.ModTime()) {
-		return nil, errors.New("file changed during hashing")
-	}
-
-	return blocks, nil
 }
 
 // The parallel hasher reads FileInfo structures from the inbox, hashes the
@@ -64,23 +48,41 @@ func HashFile(ctx context.Context, folderID string, fs fs.Filesystem, path strin
 // workers are used in parallel. The outbox will become closed when the inbox
 // is closed and all items handled.
 type parallelHasher struct {
-	folderID string
-	fs       fs.Filesystem
-	outbox   chan<- ScanResult
-	inbox    <-chan protocol.FileInfo
-	counter  Counter
-	done     chan<- struct{}
-	wg       sync.WaitGroup
+	folder             SourceHashFolder
+	fs                 fs.Filesystem
+	coordinator        SourceHashCoordinator
+	epoch              SourceHashEpoch
+	outbox             chan<- ScanResult
+	inbox              <-chan protocol.FileInfo
+	counter            Counter
+	done               chan<- struct{}
+	fromDiscoverySpool bool
+	wg                 sync.WaitGroup
 }
 
-func newParallelHasher(ctx context.Context, folderID string, fs fs.Filesystem, workers int, outbox chan<- ScanResult, inbox <-chan protocol.FileInfo, counter Counter, done chan<- struct{}) {
+type parallelHasherConfig struct {
+	folder             SourceHashFolder
+	filesystem         fs.Filesystem
+	coordinator        SourceHashCoordinator
+	epoch              SourceHashEpoch
+	outbox             chan<- ScanResult
+	inbox              <-chan protocol.FileInfo
+	counter            Counter
+	done               chan<- struct{}
+	fromDiscoverySpool bool
+}
+
+func newParallelHasher(ctx context.Context, cfg parallelHasherConfig, workers int) {
 	ph := &parallelHasher{
-		folderID: folderID,
-		fs:       fs,
-		outbox:   outbox,
-		inbox:    inbox,
-		counter:  counter,
-		done:     done,
+		folder:             cfg.folder,
+		fs:                 cfg.filesystem,
+		coordinator:        cfg.coordinator,
+		epoch:              cfg.epoch,
+		outbox:             cfg.outbox,
+		inbox:              cfg.inbox,
+		counter:            cfg.counter,
+		done:               cfg.done,
+		fromDiscoverySpool: cfg.fromDiscoverySpool,
 	}
 
 	ph.wg.Add(workers)
@@ -107,23 +109,29 @@ func (ph *parallelHasher) hashFiles(ctx context.Context) {
 				panic("Bug. Asked to hash a directory or a deleted file.")
 			}
 
-			blocks, err := HashFile(ctx, ph.folderID, ph.fs, f.Name, f.BlockSize(), ph.counter)
-			if err != nil {
-				handleError(ctx, "hashing", f.Name, err, ph.outbox)
+			work := newRetainedSourceHashWork(ph.folder.ID, ph.fs, f, ph.counter)
+			var completion SourceHashCompletion
+			var discoverySpoolEpoch SourceHashEpoch
+			if ph.fromDiscoverySpool {
+				discoverySpoolEpoch = ph.epoch
+			}
+			for {
+				submission := ph.coordinator.Submit(ctx, SourceHashRequest{
+					Folder:              ph.folder,
+					Work:                work,
+					DiscoverySpoolEpoch: discoverySpoolEpoch,
+				})
+				discoverySpoolEpoch = nil
+				completion = <-submission.Completion
+				if !errors.Is(completion.Err, errSourceHashWorkDisplaced) {
+					break
+				}
+			}
+			if completion.Err != nil {
+				handleError(ctx, "hashing", f.Name, completion.Err, ph.outbox)
 				continue
 			}
-
-			f.Blocks = blocks
-			f.BlocksHash = protocol.BlocksHash(blocks)
-
-			// The size we saw when initially deciding to hash the file
-			// might not have been the size it actually had when we hashed
-			// it. Update the size from the block list.
-
-			f.Size = 0
-			for _, b := range blocks {
-				f.Size += int64(b.Size)
-			}
+			f = completion.File
 
 			l.Debugln("completed hashing:", f)
 			select {
@@ -143,6 +151,9 @@ func (ph *parallelHasher) closeWhenDone() {
 	// In case the hasher aborted on context, wait for filesystem
 	// walking/progress routine to finish.
 	for range ph.inbox {
+	}
+	if ph.epoch != nil {
+		ph.epoch.Close()
 	}
 	if ph.done != nil {
 		close(ph.done)

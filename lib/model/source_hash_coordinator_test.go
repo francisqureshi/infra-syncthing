@@ -1,0 +1,1816 @@
+// Copyright (C) 2026 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
+
+package model
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/scanner"
+)
+
+const sourceHashCoordinatorFilesystemType fs.FilesystemType = "source-hash-coordinator"
+
+var sourceHashCoordinatorFilesystems sync.Map
+
+func init() {
+	fs.RegisterFilesystemType(sourceHashCoordinatorFilesystemType, func(root string, _ ...fs.Option) (fs.Filesystem, error) {
+		control, ok := sourceHashCoordinatorFilesystems.Load(root)
+		if !ok {
+			return nil, errors.New("missing Source Hash Work filesystem")
+		}
+		return &sourceHashCoordinatorFilesystem{
+			Filesystem: control.(*sourceHashCoordinatorFilesystemControl).filesystem,
+			control:    control.(*sourceHashCoordinatorFilesystemControl),
+		}, nil
+	})
+}
+
+type sourceHashCoordinatorFilesystemControl struct {
+	folder         string
+	filesystem     fs.Filesystem
+	started        chan<- string
+	release        <-chan struct{}
+	quantumStarted chan<- string
+	quantumRelease <-chan struct{}
+	traversed      chan struct{}
+	handleClosed   chan struct{}
+	armed          atomic.Bool
+	opens          atomic.Int64
+	mutationSize   int
+	readError      error
+	handles        *sourceHashCoordinatorHandleObserver
+
+	traversedOnce    sync.Once
+	handleClosedOnce sync.Once
+}
+
+type sourceHashCoordinatorFilesystem struct {
+	fs.Filesystem
+	control *sourceHashCoordinatorFilesystemControl
+}
+
+type sourceHashCoordinatorHandleObserver struct {
+	current atomic.Int64
+	peak    atomic.Int64
+}
+
+func (o *sourceHashCoordinatorHandleObserver) opened() {
+	current := o.current.Add(1)
+	for peak := o.peak.Load(); current > peak && !o.peak.CompareAndSwap(peak, current); peak = o.peak.Load() {
+	}
+}
+
+func (o *sourceHashCoordinatorHandleObserver) closed() {
+	o.current.Add(-1)
+}
+
+func (f *sourceHashCoordinatorFilesystem) DirNames(name string) ([]string, error) {
+	names, err := f.Filesystem.DirNames(name)
+	if f.control.armed.Load() {
+		f.control.traversedOnce.Do(func() { close(f.control.traversed) })
+	}
+	return names, err
+}
+
+func (f *sourceHashCoordinatorFilesystem) Open(name string) (fs.File, error) {
+	file, err := f.Filesystem.Open(name)
+	if err != nil || !f.control.armed.Load() {
+		return file, err
+	}
+	f.control.opens.Add(1)
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if f.control.handles != nil {
+		f.control.handles.opened()
+	}
+	return &sourceHashCoordinatorFile{
+		File:             file,
+		control:          f.control,
+		blockSize:        int64(protocol.FileInfo{Size: info.Size()}.BlockSize()),
+		remainingInBlock: 0,
+	}, nil
+}
+
+type sourceHashCoordinatorFile struct {
+	fs.File
+	control          *sourceHashCoordinatorFilesystemControl
+	once             sync.Once
+	blockSize        int64
+	remainingInBlock int64
+	completedBlocks  int
+	closeOnce        sync.Once
+}
+
+func (f *sourceHashCoordinatorFile) Close() error {
+	var err error
+	f.closeOnce.Do(func() {
+		err = f.File.Close()
+		if f.control.handles != nil {
+			f.control.handles.closed()
+		}
+		if f.control.handleClosed != nil {
+			f.control.handleClosedOnce.Do(func() { close(f.control.handleClosed) })
+		}
+	})
+	return err
+}
+
+func (f *sourceHashCoordinatorFile) Read(buf []byte) (int, error) {
+	if f.control.quantumStarted != nil {
+		if f.remainingInBlock == 0 {
+			f.control.quantumStarted <- f.control.folder
+			<-f.control.quantumRelease
+			if f.completedBlocks > 0 && f.control.readError != nil {
+				return 0, f.control.readError
+			}
+			f.remainingInBlock = f.blockSize
+		}
+		n, err := f.File.Read(buf)
+		f.remainingInBlock -= int64(n)
+		if n > 0 && f.remainingInBlock == 0 {
+			f.completedBlocks++
+			if f.completedBlocks == 1 && f.control.mutationSize > 0 {
+				if mutationErr := f.File.Truncate(int64(f.control.mutationSize)); mutationErr != nil {
+					return n, mutationErr
+				}
+			}
+		}
+		return n, err
+	}
+	f.once.Do(func() {
+		f.control.started <- f.control.folder
+		<-f.control.release
+	})
+	return f.File.Read(buf)
+}
+
+type observedSourceHashSubmission struct {
+	folder      string
+	submission  scanner.SourceHashSubmission
+	contextDone <-chan struct{}
+}
+
+type sourceHashCoordinatorObserver struct {
+	scanner.SourceHashCoordinator
+	submitted  chan<- observedSourceHashSubmission
+	configured chan<- observedSourceHashConfiguration
+}
+
+type observedSourceHashConfiguration struct {
+	capacity   int
+	priorities map[string]int
+}
+
+func (c sourceHashCoordinatorObserver) Configure(capacity int, priorities map[string]int) {
+	c.SourceHashCoordinator.Configure(capacity, priorities)
+	if c.configured != nil {
+		c.configured <- observedSourceHashConfiguration{
+			capacity:   capacity,
+			priorities: priorities,
+		}
+	}
+}
+
+func (c sourceHashCoordinatorObserver) SourceHashWorkState(folder string) scanner.SourceHashWorkState {
+	return c.SourceHashCoordinator.(scanner.SourceHashWorkStateProvider).SourceHashWorkState(folder)
+}
+
+func (c sourceHashCoordinatorObserver) Submit(ctx context.Context, request scanner.SourceHashRequest) scanner.SourceHashSubmission {
+	submission := c.SourceHashCoordinator.Submit(ctx, request)
+	callerCompletion := make(chan scanner.SourceHashCompletion, 1)
+	observedCompletion := make(chan scanner.SourceHashCompletion, 1)
+	go func() {
+		completion, ok := <-submission.Completion
+		if ok {
+			callerCompletion <- completion
+			observedCompletion <- completion
+		}
+		close(callerCompletion)
+		close(observedCompletion)
+	}()
+	callerSubmission := scanner.SourceHashSubmission{
+		Admitted:   submission.Admitted,
+		Completion: callerCompletion,
+	}
+	observed := observedSourceHashSubmission{
+		folder:      request.Folder.ID,
+		contextDone: ctx.Done(),
+		submission: scanner.SourceHashSubmission{
+			Admitted:   submission.Admitted,
+			Completion: observedCompletion,
+		},
+	}
+	if c.submitted != nil {
+		select {
+		case c.submitted <- observed:
+		default:
+		}
+	}
+	return callerSubmission
+}
+
+func TestModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		scanProgressInterval int
+	}{
+		{name: "buffered", scanProgressInterval: 0},
+		{name: "streaming", scanProgressInterval: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testModelSchedulesSourceHashWorkAfterTraversalRelease(t, tc.scanProgressInterval)
+		})
+	}
+}
+
+func testModelSchedulesSourceHashWorkAfterTraversalRelease(t *testing.T, scanProgressInterval int) {
+	started := make(chan string, 3)
+	lowRelease := make(chan struct{})
+	highRelease := make(chan struct{})
+	controls := map[string]*sourceHashCoordinatorFilesystemControl{
+		"low": {
+			folder:         "low",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: lowRelease,
+			traversed:      make(chan struct{}),
+		},
+		"high": {
+			folder:         "high",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: highRelease,
+			traversed:      make(chan struct{}),
+		},
+	}
+	cfg := config.New(myID)
+	cfg.Options.MinHomeDiskFree.Value = 0
+	cfg.Options.RawMaxFolderConcurrency = 1
+	cfg.Options.RawHashCapacity = 1
+	for folderID, priority := range map[string]int{"low": -100, "high": 100} {
+		root := rand.String(32)
+		control := controls[folderID]
+		sourceHashCoordinatorFilesystems.Store(root, control)
+		t.Cleanup(func() { sourceHashCoordinatorFilesystems.Delete(root) })
+
+		folder := cfg.Defaults.Folder.Copy()
+		folder.ID = folderID
+		folder.Label = folderID
+		folder.Path = root
+		folder.FilesystemType = config.FilesystemType(sourceHashCoordinatorFilesystemType)
+		folder.FolderPriority = priority
+		folder.Hashers = 1
+		folder.FSWatcherEnabled = false
+		folder.RescanIntervalS = 0
+		folder.ScanProgressIntervalS = scanProgressInterval
+		cfg.SetFolder(folder)
+	}
+
+	wrapper, cancel := newConfigWrapper(cfg)
+	t.Cleanup(cancel)
+	m := setupModel(t, wrapper)
+	t.Cleanup(func() { cleanupModel(m) })
+	t.Cleanup(func() {
+		closeSourceHashCoordinatorSignal(lowRelease)
+		closeSourceHashCoordinatorSignal(highRelease)
+	})
+	submitted := make(chan observedSourceHashSubmission, 2)
+	m.sourceHashCoordinator = sourceHashCoordinatorObserver{
+		SourceHashCoordinator: m.sourceHashCoordinator,
+		submitted:             submitted,
+	}
+	writeFile(t, controls["low"].filesystem, "payload", make([]byte, 2*protocol.MinBlockSize))
+	writeFile(t, controls["high"].filesystem, "payload", make([]byte, protocol.MinBlockSize))
+	controls["low"].armed.Store(true)
+	controls["high"].armed.Store(true)
+
+	lowResult := make(chan error, 1)
+	go func() { lowResult <- m.ScanFolder("low") }()
+	awaitSourceHashCoordinatorSignal(t, controls["low"].traversed, "Low traversal")
+	lowSubmission := awaitSourceHashSubmission(t, submitted)
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "low" {
+		t.Fatalf("active Hashing Quantum = %q, want Low", got)
+	}
+	awaitSourceHashCoordinatorSignal(t, lowSubmission.submission.Admitted, "Low admission")
+	if file, ok := m.testCurrentFolderFile("low", "payload"); ok {
+		t.Fatalf("Low published while its first Hashing Quantum was active: %+v", file)
+	}
+
+	highResult := make(chan error, 1)
+	go func() { highResult <- m.ScanFolder("high") }()
+	awaitSourceHashCoordinatorSignal(t, controls["high"].traversed, "High traversal after Low released traversal admission")
+	highSubmission := awaitSourceHashSubmission(t, submitted)
+	if highSubmission.folder != "high" {
+		t.Fatalf("second Source Hash Work submission = %q, want High", highSubmission.folder)
+	}
+	select {
+	case <-highSubmission.submission.Admitted:
+		t.Fatal("High Hashing Quantum was admitted while Low occupied the only Hash Capacity slot")
+	default:
+	}
+
+	lowRelease <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "high" {
+		t.Fatalf("admission after Low's first quantum = %q, want High", got)
+	}
+	awaitSourceHashCoordinatorSignal(t, highSubmission.submission.Admitted, "High strict-priority admission")
+	if file, ok := m.testCurrentFolderFile("low", "payload"); ok {
+		t.Fatalf("Low published between Hashing Quanta: %+v", file)
+	}
+	if file, ok := m.testCurrentFolderFile("high", "payload"); ok {
+		t.Fatalf("High published while its Hashing Quantum was active: %+v", file)
+	}
+	highRelease <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "low" {
+		t.Fatalf("admission after High completion = %q, want Low continuation", got)
+	}
+	lowRelease <- struct{}{}
+
+	results := map[string]<-chan error{
+		"low":  lowResult,
+		"high": highResult,
+	}
+	for folder, result := range results {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s scan: %v", folder, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s scan", folder)
+		}
+		file, ok := m.testCurrentFolderFile(folder, "payload")
+		if !ok || len(file.Blocks) == 0 || len(file.BlocksHash) == 0 {
+			t.Fatalf("%s complete publication = %+v, present=%v", folder, file, ok)
+		}
+	}
+}
+
+func TestModelScheduledSourceHashWorkMatchesWholeFileBaseline(t *testing.T) {
+	harness := newSourceHashModelTestHarness(t, 2, map[string]sourceHashModelTestFolder{
+		"low":  {priority: -100},
+		"high": {priority: 100},
+	})
+	for _, release := range harness.releases {
+		close(release)
+	}
+
+	files := map[string]map[string][]byte{
+		"low": {
+			"empty":       nil,
+			"final-short": []byte("final short block"),
+		},
+		"high": {
+			"exact-block": make([]byte, protocol.MinBlockSize),
+			"multi-block": make([]byte, 2*protocol.MinBlockSize+17),
+		},
+	}
+	for folder, folderFiles := range files {
+		control := harness.controls[folder]
+		if err := control.filesystem.Remove("payload"); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range folderFiles {
+			writeFile(t, control.filesystem, name, data)
+		}
+	}
+
+	submissionsDone := make(chan struct{})
+	go func() {
+		for range 4 {
+			<-harness.submitted
+		}
+		close(submissionsDone)
+	}()
+	for _, folder := range []string{"low", "high"} {
+		if err := harness.model.ScanFolder(folder); err != nil {
+			t.Fatalf("scan %s: %v", folder, err)
+		}
+	}
+	awaitSourceHashCoordinatorSignal(t, submissionsDone, "scheduled Source Hash Work submissions")
+
+	for folder, folderFiles := range files {
+		for name, data := range folderFiles {
+			assertSourceHashModelFileMatchesBaseline(t, harness.model, folder, name, data)
+		}
+	}
+}
+
+func TestModelScheduledSourceHashWorkMatchesBaselineAfterCancellationAndRescan(t *testing.T) {
+	data := make([]byte, 2*protocol.MinBlockSize+17)
+	harness := newSourceHashModelTestHarness(t, 1, map[string]sourceHashModelTestFolder{
+		"folder": {
+			size:                   len(data),
+			gateEachHashingQuantum: true,
+		},
+	})
+
+	scanResult := make(chan error, 1)
+	go func() { scanResult <- harness.model.ScanFolder("folder") }()
+	awaitSourceHashCoordinatorSignal(t, harness.controls["folder"].traversed, "canceled traversal")
+	submission := awaitSourceHashSubmission(t, harness.submitted)
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "folder" {
+		t.Fatalf("active Hashing Quantum = %q, want folder", got)
+	}
+
+	pauseWaiter, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		folder, index, ok := cfg.Folder("folder")
+		if !ok {
+			return
+		}
+		folder.Paused = true
+		cfg.Folders[index] = folder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused := make(chan struct{})
+	go func() {
+		pauseWaiter.Wait()
+		close(paused)
+	}()
+	awaitSourceHashConfiguration(t, harness.configured, "pause cancellation")
+	harness.releases["folder"] <- struct{}{}
+	completed := awaitSourceHashCompletion(t, submission.submission.Completion, "canceled Source Hash Work")
+	if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != protocol.MinBlockSize || completed.File.Name != "" {
+		t.Fatalf("canceled completion = %+v, want one charged block and no file", completed)
+	}
+	awaitSourceHashCoordinatorSignal(t, paused, "paused Folder")
+	select {
+	case err := <-scanResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled scan: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for canceled scan")
+	}
+	if file, ok := harness.model.testCurrentFolderFile("folder", "payload"); ok {
+		t.Fatalf("canceled scan published partial file: %+v", file)
+	}
+
+	closeSourceHashCoordinatorSignal(harness.releases["folder"])
+	unpauseWaiter, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		folder, index, ok := cfg.Folder("folder")
+		if !ok {
+			return
+		}
+		folder.Paused = false
+		cfg.Folders[index] = folder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unpaused := make(chan struct{})
+	go func() {
+		unpauseWaiter.Wait()
+		close(unpaused)
+	}()
+	awaitSourceHashConfiguration(t, harness.configured, "unpause rescan")
+	awaitSourceHashCoordinatorSignal(t, unpaused, "unpaused Folder")
+	rescanSubmission := awaitSourceHashSubmission(t, harness.submitted)
+	if rescanSubmission.folder != "folder" {
+		t.Fatalf("rescan Source Hash Work submission = %q, want folder", rescanSubmission.folder)
+	}
+	if completed := awaitSourceHashCompletion(t, rescanSubmission.submission.Completion, "rescanned Source Hash Work"); completed.Err != nil {
+		t.Fatal(completed.Err)
+	}
+
+	rescanResult := make(chan error, 1)
+	go func() { rescanResult <- harness.model.ScanFolder("folder") }()
+	awaitSourceHashModelScan(t, rescanResult, "post-cancellation rescan")
+	assertSourceHashModelFileMatchesBaseline(t, harness.model, "folder", "payload", data)
+}
+
+func TestModelScheduledSourceHashWorkMatchesBaselineAfterDisplacement(t *testing.T) {
+	data := make([]byte, 2*protocol.MinBlockSize)
+	harness := newSourceHashModelTestHarness(t, 1, map[string]sourceHashModelTestFolder{
+		"low": {
+			priority:               -100,
+			size:                   len(data),
+			gateEachHashingQuantum: true,
+			observeHandleClose:     true,
+		},
+		"gate": {
+			priority:               50,
+			gateEachHashingQuantum: true,
+		},
+		"filler-1": {
+			priority:               0,
+			gateEachHashingQuantum: true,
+		},
+		"filler-2": {
+			priority:               0,
+			gateEachHashingQuantum: true,
+		},
+		"high": {
+			priority:               100,
+			gateEachHashingQuantum: true,
+		},
+	})
+
+	lowResult := make(chan error, 1)
+	go func() { lowResult <- harness.model.ScanFolder("low") }()
+	awaitSourceHashCoordinatorSignal(t, harness.controls["low"].traversed, "Low displacement traversal")
+	lowSubmission := awaitSourceHashSubmission(t, harness.submitted)
+	if lowSubmission.folder != "low" {
+		t.Fatalf("first Source Hash Work submission = %q, want Low", lowSubmission.folder)
+	}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "low" {
+		t.Fatalf("first Hashing Quantum = %q, want Low", got)
+	}
+	gateResult := startSourceHashModelScan(t, harness, "gate", 1, 0)
+	harness.releases["low"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "gate" {
+		t.Fatalf("admission after Low first quantum = %q, want gate", got)
+	}
+
+	fillerOneResult := startSourceHashModelScan(t, harness, "filler-1", 1, 0)
+	fillerTwoResult := startSourceHashModelScan(t, harness, "filler-2", 1, 0)
+	highResult := startSourceHashModelScan(t, harness, "high", 1, 0)
+	displaced := awaitSourceHashCompletion(t, lowSubmission.submission.Completion, "displaced Low Source Hash Work")
+	if displaced.Err == nil || displaced.Bytes != protocol.MinBlockSize || displaced.File.Name != "" {
+		t.Fatalf("displaced Low completion = %+v, want one charged block and no file", displaced)
+	}
+	awaitSourceHashCoordinatorSignal(t, harness.controls["low"].handleClosed, "displaced Low source handle close")
+	if file, ok := harness.model.testCurrentFolderFile("low", "payload"); ok {
+		t.Fatalf("displaced Low work published a partial file: %+v", file)
+	}
+
+	harness.releases["gate"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "high" {
+		t.Fatalf("admission after gate = %q, want High", got)
+	}
+	harness.releases["high"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "filler-1" {
+		t.Fatalf("admission after High = %q, want filler-1", got)
+	}
+	lowRetry := awaitSourceHashSubmission(t, harness.submitted)
+	if lowRetry.folder != "low" {
+		t.Fatalf("submission after displacement = %q, want Low retry", lowRetry.folder)
+	}
+	harness.releases["filler-1"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "filler-2" {
+		t.Fatalf("admission after filler-1 = %q, want filler-2", got)
+	}
+	harness.releases["filler-2"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "low" {
+		t.Fatalf("admission after higher-priority work drains = %q, want restarted Low", got)
+	}
+	harness.releases["low"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "low" {
+		t.Fatalf("restarted Low continuation = %q, want Low", got)
+	}
+	harness.releases["low"] <- struct{}{}
+
+	for description, result := range map[string]<-chan error{
+		"Low":      lowResult,
+		"gate":     gateResult,
+		"filler-1": fillerOneResult,
+		"filler-2": fillerTwoResult,
+		"High":     highResult,
+	} {
+		awaitSourceHashModelScan(t, result, description+" displacement scan")
+	}
+	if got := harness.controls["low"].opens.Load(); got != 2 {
+		t.Fatalf("Low source opens = %d, want initial plus fresh restart", got)
+	}
+	assertSourceHashModelFileMatchesBaseline(t, harness.model, "low", "payload", data)
+}
+
+func TestModelBoundsSyntheticFiveTerabyteAndHighPrioritySourceHashWork(t *testing.T) {
+	const (
+		lowFiles        = 32 << 10
+		highFiles       = 320
+		logicalFileSize = int64(160 << 20)
+		hashCapacity    = 2
+	)
+	harness := newSourceHashModelTestHarness(t, hashCapacity, map[string]sourceHashModelTestFolder{
+		"low": {
+			priority:               -100,
+			hashers:                hashCapacity,
+			logicalInventory:       true,
+			gateEachHashingQuantum: true,
+		},
+		"high": {
+			priority:               100,
+			hashers:                hashCapacity,
+			logicalInventory:       true,
+			gateEachHashingQuantum: true,
+		},
+	})
+	handles := new(sourceHashCoordinatorHandleObserver)
+	for _, control := range harness.controls {
+		control.handles = handles
+	}
+	createSourceHashLogicalInventory(t, harness.controls["low"].filesystem, lowFiles, logicalFileSize)
+	createSourceHashLogicalInventory(t, harness.controls["high"].filesystem, highFiles, logicalFileSize)
+
+	lowResult := startSourceHashModelScanWithSubmissionTimeout(t, harness, "low", hashCapacity, hashCapacity, 30*time.Second)
+	highResult := startSourceHashModelScanWithSubmissionTimeout(t, harness, "high", hashCapacity, 0, 30*time.Second)
+	provider := harness.model.sourceHashCoordinator.(scanner.SourceHashWorkStateProvider)
+	lowState := provider.SourceHashWorkState("low")
+	highState := provider.SourceHashWorkState("high")
+	if lowState.Active != hashCapacity || lowState.Queued != lowFiles-hashCapacity {
+		t.Fatalf("Low synthetic model state = %#v, want %d active and %d queued", lowState, hashCapacity, lowFiles-hashCapacity)
+	}
+	if highState.Active != 0 || highState.Queued != highFiles {
+		t.Fatalf("High synthetic model state = %#v, want zero active and %d queued", highState, highFiles)
+	}
+	if lowState.RetainedHandles != hashCapacity || lowState.RetainedHandleBudget != hashCapacity+3 {
+		t.Fatalf("synthetic retained-handle state = %#v, want %d retained within budget %d", lowState, hashCapacity, hashCapacity+3)
+	}
+	if got := handles.current.Load(); got != hashCapacity {
+		t.Fatalf("real synthetic source handles = %d, want active Hash Capacity %d", got, hashCapacity)
+	}
+	for folder, control := range harness.controls {
+		if got := control.opens.Load(); got != map[string]int64{"low": hashCapacity, "high": 0}[folder] {
+			t.Fatalf("%s real source opens = %d before High admission", folder, got)
+		}
+	}
+
+	harness.releases["low"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "high" {
+		t.Fatalf("synthetic admission after Low quantum = %q, want High", got)
+	}
+	if got := handles.current.Load(); got != hashCapacity+1 {
+		t.Fatalf("real retained handles after High admission = %d, want %d", got, hashCapacity+1)
+	}
+	if got, budget := handles.peak.Load(), int64(lowState.RetainedHandleBudget); got > budget {
+		t.Fatalf("real source handle peak = %d, want at most budget %d", got, budget)
+	}
+
+	pauseWaiter, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		for _, folderID := range []string{"low", "high"} {
+			folder, index, ok := cfg.Folder(folderID)
+			if !ok {
+				continue
+			}
+			folder.Paused = true
+			cfg.Folders[index] = folder
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused := make(chan struct{})
+	go func() {
+		pauseWaiter.Wait()
+		close(paused)
+	}()
+	awaitSourceHashConfiguration(t, harness.configured, "synthetic workload cancellation")
+	closeSourceHashCoordinatorSignal(harness.releases["low"])
+	closeSourceHashCoordinatorSignal(harness.releases["high"])
+	select {
+	case <-paused:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for synthetic Folders to pause")
+	}
+	awaitCanceledSourceHashModelScan(t, lowResult, "Low synthetic scan")
+	awaitCanceledSourceHashModelScan(t, highResult, "High synthetic scan")
+
+	if got := handles.current.Load(); got != 0 {
+		t.Fatalf("real synthetic source handles after cancellation = %d, want zero", got)
+	}
+	for _, folder := range []string{"low", "high"} {
+		if got := provider.SourceHashWorkState(folder); got.Active != 0 || got.Queued != 0 || got.RetainedHandles != 0 {
+			t.Fatalf("%s synthetic model state after cancellation = %#v, want drained state", folder, got)
+		}
+	}
+	if logicalBytes := int64(lowFiles) * logicalFileSize; logicalBytes != 5<<40 {
+		t.Fatalf("Low synthetic inventory = %d bytes, want 5 TiB", logicalBytes)
+	}
+	if logicalBytes := int64(highFiles) * logicalFileSize; logicalBytes != 50<<30 {
+		t.Fatalf("High synthetic workload = %d bytes, want 50 GiB", logicalBytes)
+	}
+}
+
+func TestModelUsesEveryCompatibleHashSlotByFolderPriority(t *testing.T) {
+	t.Run("saturated pool replaces Low with High at every boundary", func(t *testing.T) {
+		harness := newSourceHashModelTestHarness(t, 3, map[string]sourceHashModelTestFolder{
+			"low": {
+				priority:               0,
+				files:                  3,
+				hashers:                3,
+				gateEachHashingQuantum: true,
+			},
+			"high": {
+				priority:               100,
+				files:                  3,
+				hashers:                3,
+				gateEachHashingQuantum: true,
+			},
+		})
+
+		lowResult := startSourceHashModelScan(t, harness, "low", 3, 3)
+		highResult := startSourceHashModelScan(t, harness, "high", 3, 0)
+		select {
+		case got := <-harness.started:
+			t.Fatalf("High preempted saturated Low Hashing Quanta with %q", got)
+		default:
+		}
+
+		for range 3 {
+			harness.releases["low"] <- struct{}{}
+			if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "high" {
+				t.Fatalf("saturated replacement admission = %q, want High", got)
+			}
+		}
+		for range 3 {
+			harness.releases["high"] <- struct{}{}
+		}
+
+		awaitSourceHashModelScan(t, lowResult, "Low saturated scan")
+		awaitSourceHashModelScan(t, highResult, "High saturated scan")
+		assertSourceHashModelFilesPublished(t, harness.model, "low", 3)
+		assertSourceHashModelFilesPublished(t, harness.model, "high", 3)
+	})
+
+	t.Run("one sequential High file leaves spare slots to Low", func(t *testing.T) {
+		harness := newSourceHashModelTestHarness(t, 3, map[string]sourceHashModelTestFolder{
+			"high": {
+				priority:               100,
+				size:                   2 * protocol.MinBlockSize,
+				hashers:                3,
+				gateEachHashingQuantum: true,
+			},
+			"low": {
+				priority:               0,
+				files:                  2,
+				hashers:                2,
+				gateEachHashingQuantum: true,
+			},
+		})
+
+		highResult := startSourceHashModelScan(t, harness, "high", 1, 1)
+		lowResult := startSourceHashModelScan(t, harness, "low", 2, 2)
+		harness.releases["high"] <- struct{}{}
+		if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "high" {
+			t.Fatalf("sequential continuation admission = %q, want High", got)
+		}
+		harness.releases["high"] <- struct{}{}
+		for range 2 {
+			harness.releases["low"] <- struct{}{}
+		}
+
+		awaitSourceHashModelScan(t, highResult, "sequential High scan")
+		awaitSourceHashModelScan(t, lowResult, "spare-slot Low scan")
+		assertSourceHashModelFilesPublished(t, harness.model, "high", 1)
+		assertSourceHashModelFilesPublished(t, harness.model, "low", 2)
+	})
+
+	t.Run("per-Folder ceiling leaves unreserved capacity to Low", func(t *testing.T) {
+		harness := newSourceHashModelTestHarness(t, 3, map[string]sourceHashModelTestFolder{
+			"high": {
+				priority:               100,
+				files:                  3,
+				hashers:                2,
+				gateEachHashingQuantum: true,
+			},
+			"low": {
+				priority:               0,
+				hashers:                1,
+				gateEachHashingQuantum: true,
+			},
+		})
+
+		highResult := startSourceHashModelScan(t, harness, "high", 2, 2)
+		lowResult := startSourceHashModelScan(t, harness, "low", 1, 1)
+		select {
+		case got := <-harness.started:
+			t.Fatalf("per-Folder ceiling admitted unexpected Hashing Quantum %q", got)
+		default:
+		}
+
+		harness.releases["high"] <- struct{}{}
+		submission := awaitSourceHashSubmission(t, harness.submitted)
+		if submission.folder != "high" {
+			t.Fatalf("submission after per-Folder slot release = %q, want High", submission.folder)
+		}
+		if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "high" {
+			t.Fatalf("admission after per-Folder slot release = %q, want High", got)
+		}
+		for range 2 {
+			harness.releases["high"] <- struct{}{}
+		}
+		harness.releases["low"] <- struct{}{}
+
+		awaitSourceHashModelScan(t, highResult, "ceiling-limited High scan")
+		awaitSourceHashModelScan(t, lowResult, "unreserved-capacity Low scan")
+		assertSourceHashModelFilesPublished(t, harness.model, "high", 3)
+		assertSourceHashModelFilesPublished(t, harness.model, "low", 1)
+	})
+}
+
+func TestModelSourceHashWorkFailuresPublishNoPartialFile(t *testing.T) {
+	controlledReadError := errors.New("controlled Source Hash Work read error")
+	for _, tc := range []struct {
+		name      string
+		configure func(*sourceHashCoordinatorFilesystemControl)
+	}{
+		{
+			name: "source mutation",
+			configure: func(control *sourceHashCoordinatorFilesystemControl) {
+				control.mutationSize = 2*protocol.MinBlockSize - 1
+			},
+		},
+		{
+			name: "read error",
+			configure: func(control *sourceHashCoordinatorFilesystemControl) {
+				control.readError = controlledReadError
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newSourceHashModelTestHarness(t, 1, map[string]sourceHashModelTestFolder{
+				"folder": {
+					size:                   2 * protocol.MinBlockSize,
+					gateEachHashingQuantum: true,
+				},
+			})
+			control := harness.controls["folder"]
+			tc.configure(control)
+
+			scanResult := make(chan error, 1)
+			go func() { scanResult <- harness.model.ScanFolder("folder") }()
+			awaitSourceHashCoordinatorSignal(t, control.traversed, "failure-case traversal")
+			submission := awaitSourceHashSubmission(t, harness.submitted)
+			if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "folder" {
+				t.Fatalf("first Hashing Quantum = %q, want folder", got)
+			}
+
+			harness.releases["folder"] <- struct{}{}
+			if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "folder" {
+				t.Fatalf("second Hashing Quantum = %q, want folder", got)
+			}
+			if file, ok := harness.model.testCurrentFolderFile("folder", "payload"); ok {
+				t.Fatalf("failure case published between Hashing Quanta: %+v", file)
+			}
+			harness.releases["folder"] <- struct{}{}
+
+			completed := awaitSourceHashCompletion(t, submission.submission.Completion, "failed Source Hash Work completion")
+			if completed.Err == nil || completed.File.Name != "" || completed.File.Blocks != nil || completed.File.BlocksHash != nil {
+				t.Fatalf("failed Source Hash Work completion = %+v, want error and no file", completed)
+			}
+			awaitSourceHashModelScan(t, scanResult, "failure-case scan")
+			if file, ok := harness.model.testCurrentFolderFile("folder", "payload"); ok {
+				t.Fatalf("failure case published partial file: %+v", file)
+			}
+		})
+	}
+}
+
+func TestModelAppliesLiveFolderPriorityToQueuedSourceHashWork(t *testing.T) {
+	harness := newSourceHashModelTestHarness(t, 1, map[string]sourceHashModelTestFolder{
+		"gate":  {priority: 100},
+		"bulk":  {priority: 0},
+		"focus": {priority: -100},
+	})
+
+	scanResults := make(map[string]<-chan error, len(harness.controls))
+	for _, folder := range []string{"gate", "bulk", "focus"} {
+		result := make(chan error, 1)
+		scanResults[folder] = result
+		go func() { result <- harness.model.ScanFolder(folder) }()
+		awaitSourceHashCoordinatorSignal(t, harness.controls[folder].traversed, folder+" traversal")
+		submission := awaitSourceHashSubmission(t, harness.submitted)
+		if submission.folder != folder {
+			t.Fatalf("Source Hash Work submission = %q, want %q", submission.folder, folder)
+		}
+		if folder == "gate" {
+			if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "gate" {
+				t.Fatalf("active Hashing Quantum = %q, want gate", got)
+			}
+		}
+	}
+
+	found := false
+	waiter, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		folder, index, ok := cfg.Folder("focus")
+		if !ok {
+			return
+		}
+		found = true
+		folder.FolderPriority = 100
+		cfg.Folders[index] = folder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	if !found {
+		t.Fatal("focus Folder disappeared before reprioritization")
+	}
+	select {
+	case got := <-harness.started:
+		t.Fatalf("live priority change preempted active Hashing Quantum with %q", got)
+	default:
+	}
+
+	close(harness.releases["gate"])
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "focus" {
+		t.Fatalf("first admission after live reprioritization = %q, want focus", got)
+	}
+	close(harness.releases["focus"])
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "bulk" {
+		t.Fatalf("remaining admission = %q, want bulk", got)
+	}
+	close(harness.releases["bulk"])
+
+	for folder, result := range scanResults {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s scan: %v", folder, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s scan", folder)
+		}
+		file, ok := harness.model.testCurrentFolderFile(folder, "payload")
+		if !ok || len(file.Blocks) != 1 || len(file.BlocksHash) == 0 {
+			t.Fatalf("%s complete publication = %+v, present=%v", folder, file, ok)
+		}
+	}
+}
+
+func TestModelAppliesValidHashCapacityGrowthLiveAfterAtomicValidationFailure(t *testing.T) {
+	harness := newSourceHashModelTestHarness(t, 1, map[string]sourceHashModelTestFolder{
+		"a": {},
+		"b": {},
+	})
+
+	results := make(map[string]<-chan error, 2)
+	var bSubmission scanner.SourceHashSubmission
+	for _, folder := range []string{"a", "b"} {
+		result := make(chan error, 1)
+		results[folder] = result
+		go func() { result <- harness.model.ScanFolder(folder) }()
+		awaitSourceHashCoordinatorSignal(t, harness.controls[folder].traversed, folder+" traversal")
+		submission := awaitSourceHashSubmission(t, harness.submitted)
+		if submission.folder != folder {
+			t.Fatalf("Source Hash Work submission = %q, want %q", submission.folder, folder)
+		}
+		if folder == "a" {
+			if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "a" {
+				t.Fatalf("initial Hashing Quantum = %q, want a", got)
+			}
+		} else {
+			bSubmission = submission.submission
+		}
+	}
+
+	if _, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.RawHashCapacity = -1
+	}); err == nil {
+		t.Fatal("negative Hash Capacity was accepted")
+	}
+	if got := harness.wrapper.Options().RawHashCapacity; got != 1 {
+		t.Fatalf("stored Hash Capacity = %d after rejection, want 1", got)
+	}
+	select {
+	case <-bSubmission.Admitted:
+		t.Fatal("rejected Hash Capacity change altered active admission capacity")
+	default:
+	}
+
+	waiter, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.RawHashCapacity = 2
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	if harness.wrapper.RequiresRestart() {
+		t.Fatal("live Hash Capacity growth unexpectedly requires restart")
+	}
+	awaitSourceHashCoordinatorSignal(t, bSubmission.Admitted, "live Hash Capacity growth")
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "b" {
+		t.Fatalf("growth admission = %q, want b", got)
+	}
+
+	close(harness.releases["a"])
+	close(harness.releases["b"])
+	for folder, result := range results {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s scan: %v", folder, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s scan", folder)
+		}
+	}
+}
+
+func TestModelDrainsLiveHashCapacityShrinkBeforeReplacement(t *testing.T) {
+	harness := newSourceHashModelTestHarness(t, 2, map[string]sourceHashModelTestFolder{
+		"a": {},
+		"b": {},
+		"c": {},
+	})
+
+	results := make(map[string]<-chan error, 3)
+	submissions := make(map[string]scanner.SourceHashSubmission, 3)
+	for _, folder := range []string{"a", "b", "c"} {
+		result := make(chan error, 1)
+		results[folder] = result
+		go func() { result <- harness.model.ScanFolder(folder) }()
+		awaitSourceHashCoordinatorSignal(t, harness.controls[folder].traversed, folder+" traversal")
+		submission := awaitSourceHashSubmission(t, harness.submitted)
+		if submission.folder != folder {
+			t.Fatalf("Source Hash Work submission = %q, want %q", submission.folder, folder)
+		}
+		submissions[folder] = submission.submission
+	}
+	initial := map[string]bool{"a": false, "b": false}
+	for range 2 {
+		got := awaitSourceHashCoordinatorStart(t, harness.started)
+		if _, ok := initial[got]; !ok || initial[got] {
+			t.Fatalf("unexpected initial Hashing Quantum %q", got)
+		}
+		initial[got] = true
+	}
+	select {
+	case <-submissions["c"].Admitted:
+		t.Fatal("third Folder admitted before Hash Capacity shrink")
+	default:
+	}
+
+	waiter, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.RawHashCapacity = 1
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	observation := awaitSourceHashConfiguration(t, harness.configured, "live Hash Capacity shrink")
+	if observation.capacity != 1 {
+		t.Fatalf("configured Hash Capacity = %d, want 1", observation.capacity)
+	}
+	if harness.wrapper.RequiresRestart() {
+		t.Fatal("live Hash Capacity shrink unexpectedly requires restart")
+	}
+
+	close(harness.releases["a"])
+	completion := awaitSourceHashCompletion(t, submissions["a"].Completion, "first grandfathered completion")
+	if completion.Err != nil {
+		t.Fatal(completion.Err)
+	}
+	select {
+	case <-submissions["c"].Admitted:
+		t.Fatal("replacement admitted while usage equaled shrunken Hash Capacity")
+	default:
+	}
+
+	close(harness.releases["b"])
+	completion = awaitSourceHashCompletion(t, submissions["b"].Completion, "second grandfathered completion")
+	if completion.Err != nil {
+		t.Fatal(completion.Err)
+	}
+	awaitSourceHashCoordinatorSignal(t, submissions["c"].Admitted, "post-drain replacement")
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "c" {
+		t.Fatalf("post-drain Hashing Quantum = %q, want c", got)
+	}
+	close(harness.releases["c"])
+	completion = awaitSourceHashCompletion(t, submissions["c"].Completion, "replacement completion")
+	if completion.Err != nil {
+		t.Fatal(completion.Err)
+	}
+
+	for folder, result := range results {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s scan: %v", folder, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s scan", folder)
+		}
+	}
+}
+
+func TestModelFolderLifecycleCleansUpActiveSourceHashWorkAtHashingQuantumBoundary(t *testing.T) {
+	for _, lifecycle := range []string{"pause", "remove"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			harness := newSourceHashModelTestHarness(t, 1, map[string]sourceHashModelTestFolder{
+				"victim": {
+					size:                   2 * protocol.MinBlockSize,
+					gateEachHashingQuantum: true,
+					observeHandleClose:     true,
+				},
+			})
+			control := harness.controls["victim"]
+			handleClosed := control.handleClosed
+
+			scanResult := make(chan error, 1)
+			go func() { scanResult <- harness.model.ScanFolder("victim") }()
+			awaitSourceHashCoordinatorSignal(t, control.traversed, "victim traversal")
+			submission := awaitSourceHashSubmission(t, harness.submitted)
+			if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "victim" {
+				t.Fatalf("active Hashing Quantum = %q, want victim", got)
+			}
+
+			var waiter config.Waiter
+			var err error
+			switch lifecycle {
+			case "pause":
+				waiter, err = harness.wrapper.Modify(func(cfg *config.Configuration) {
+					folder, index, ok := cfg.Folder("victim")
+					if !ok {
+						return
+					}
+					folder.Paused = true
+					cfg.Folders[index] = folder
+				})
+			case "remove":
+				waiter, err = harness.wrapper.RemoveFolder("victim")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			committed := make(chan struct{})
+			go func() {
+				waiter.Wait()
+				close(committed)
+			}()
+			observation := awaitSourceHashConfiguration(t, harness.configured, lifecycle+" configuration")
+			if _, ok := observation.priorities["victim"]; ok {
+				t.Fatalf("%s kept victim runnable in Source Hash Work configuration", lifecycle)
+			}
+			select {
+			case completed := <-submission.submission.Completion:
+				t.Fatalf("%s preempted active Hashing Quantum: %+v", lifecycle, completed)
+			default:
+			}
+			select {
+			case <-handleClosed:
+				t.Fatalf("%s closed source handle before active block boundary", lifecycle)
+			default:
+			}
+
+			close(harness.releases["victim"])
+			completed := awaitSourceHashCompletion(t, submission.submission.Completion, lifecycle+" active cleanup")
+			if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != protocol.MinBlockSize || completed.File.Name != "" {
+				t.Fatalf("%s completion = %+v, want one charged block, no file, and context cancellation", lifecycle, completed)
+			}
+			awaitSourceHashCoordinatorSignal(t, handleClosed, lifecycle+" source handle cleanup")
+			awaitSourceHashCoordinatorSignal(t, committed, lifecycle+" configuration commit")
+			select {
+			case got := <-harness.started:
+				t.Fatalf("%s admitted another Hashing Quantum after cleanup: %q", lifecycle, got)
+			default:
+			}
+			select {
+			case <-scanResult:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for scan after Folder %s", lifecycle)
+			}
+			if lifecycle == "pause" {
+				if file, ok := harness.model.testCurrentFolderFile("victim", "payload"); ok {
+					t.Fatalf("pause published incomplete Source Hash Work: %+v", file)
+				}
+			}
+		})
+	}
+}
+
+func TestModelFolderLifecycleCancelsQueuedSourceHashWork(t *testing.T) {
+	for _, lifecycle := range []string{"pause", "remove"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			harness := newSourceHashModelTestHarness(t, 1, map[string]sourceHashModelTestFolder{
+				"gate": {},
+				"victim": {
+					observeHandleClose: true,
+				},
+			})
+			victimClosed := harness.controls["victim"].handleClosed
+
+			gateScan := make(chan error, 1)
+			go func() { gateScan <- harness.model.ScanFolder("gate") }()
+			awaitSourceHashCoordinatorSignal(t, harness.controls["gate"].traversed, "gate traversal")
+			gateSubmission := awaitSourceHashSubmission(t, harness.submitted)
+			if gateSubmission.folder != "gate" {
+				t.Fatalf("first Source Hash Work submission = %q, want gate", gateSubmission.folder)
+			}
+			if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "gate" {
+				t.Fatalf("active Hashing Quantum = %q, want gate", got)
+			}
+
+			victimScan := make(chan error, 1)
+			go func() { victimScan <- harness.model.ScanFolder("victim") }()
+			awaitSourceHashCoordinatorSignal(t, harness.controls["victim"].traversed, "victim traversal")
+			victimSubmission := awaitSourceHashSubmission(t, harness.submitted)
+			if victimSubmission.folder != "victim" {
+				t.Fatalf("queued Source Hash Work submission = %q, want victim", victimSubmission.folder)
+			}
+			select {
+			case <-victimSubmission.submission.Admitted:
+				t.Fatal("victim admitted while gate occupied the only Hash Capacity slot")
+			default:
+			}
+
+			var waiter config.Waiter
+			var err error
+			switch lifecycle {
+			case "pause":
+				waiter, err = harness.wrapper.Modify(func(cfg *config.Configuration) {
+					folder, index, ok := cfg.Folder("victim")
+					if !ok {
+						return
+					}
+					folder.Paused = true
+					cfg.Folders[index] = folder
+				})
+			case "remove":
+				waiter, err = harness.wrapper.RemoveFolder("victim")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			committed := make(chan struct{})
+			go func() {
+				waiter.Wait()
+				close(committed)
+			}()
+			observation := awaitSourceHashConfiguration(t, harness.configured, lifecycle+" queued cancellation")
+			if _, ok := observation.priorities["victim"]; ok {
+				t.Fatalf("%s kept queued victim runnable", lifecycle)
+			}
+			completed := awaitSourceHashCompletion(t, victimSubmission.submission.Completion, lifecycle+" queued completion")
+			if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != 0 || completed.File.Name != "" {
+				t.Fatalf("%s queued completion = %+v, want zero bytes, no file, and context cancellation", lifecycle, completed)
+			}
+			if got := harness.controls["victim"].opens.Load(); got != 0 {
+				t.Fatalf("%s queued Source Hash Work opened %d source handles, want zero", lifecycle, got)
+			}
+			select {
+			case <-victimClosed:
+				t.Fatalf("%s queued Source Hash Work closed a handle that should never have opened", lifecycle)
+			default:
+			}
+			select {
+			case <-victimSubmission.submission.Admitted:
+				t.Fatalf("%s admitted canceled queued Source Hash Work", lifecycle)
+			default:
+			}
+			select {
+			case got := <-harness.started:
+				t.Fatalf("%s started unexpected Hashing Quantum %q", lifecycle, got)
+			default:
+			}
+			awaitSourceHashCoordinatorSignal(t, committed, lifecycle+" queued configuration commit")
+			select {
+			case <-victimScan:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for victim scan after %s", lifecycle)
+			}
+			if lifecycle == "pause" {
+				if file, ok := harness.model.testCurrentFolderFile("victim", "payload"); ok {
+					t.Fatalf("pause published canceled queued Source Hash Work: %+v", file)
+				}
+			}
+
+			close(harness.releases["gate"])
+			completion := awaitSourceHashCompletion(t, gateSubmission.submission.Completion, "gate completion")
+			if completion.Err != nil {
+				t.Fatal(completion.Err)
+			}
+			select {
+			case err := <-gateScan:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for gate scan")
+			}
+		})
+	}
+}
+
+func TestModelPositiveFolderHashersChangeRestartsActiveSourceHashWork(t *testing.T) {
+	harness := newSourceHashModelTestHarness(t, 2, map[string]sourceHashModelTestFolder{
+		"folder": {
+			size:                   2 * protocol.MinBlockSize,
+			gateEachHashingQuantum: true,
+			observeHandleClose:     true,
+		},
+	})
+	control := harness.controls["folder"]
+	handleClosed := control.handleClosed
+
+	scanResult := make(chan error, 1)
+	go func() { scanResult <- harness.model.ScanFolder("folder") }()
+	awaitSourceHashCoordinatorSignal(t, control.traversed, "Folder traversal")
+	submission := awaitSourceHashSubmission(t, harness.submitted)
+	if got := awaitSourceHashCoordinatorStart(t, harness.started); got != "folder" {
+		t.Fatalf("active Hashing Quantum = %q, want folder", got)
+	}
+
+	waiter, err := harness.wrapper.Modify(func(cfg *config.Configuration) {
+		folder, index, ok := cfg.Folder("folder")
+		if !ok {
+			return
+		}
+		folder.Hashers = 2
+		cfg.Folders[index] = folder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := make(chan struct{})
+	go func() {
+		waiter.Wait()
+		close(committed)
+	}()
+	observation := awaitSourceHashConfiguration(t, harness.configured, "positive per-Folder hashers change")
+	if _, ok := observation.priorities["folder"]; !ok {
+		t.Fatal("positive per-Folder hashers change made Folder unavailable")
+	}
+	awaitSourceHashCoordinatorSignal(t, submission.contextDone, "Folder restart cancellation")
+	select {
+	case completed := <-submission.submission.Completion:
+		t.Fatalf("Folder restart preempted active Hashing Quantum: %+v", completed)
+	default:
+	}
+	select {
+	case <-handleClosed:
+		t.Fatal("Folder restart closed source handle before active Hashing Quantum boundary")
+	default:
+	}
+
+	close(harness.releases["folder"])
+	completed := awaitSourceHashCompletion(t, submission.submission.Completion, "restarted Source Hash Work cleanup")
+	if !errors.Is(completed.Err, context.Canceled) || completed.Bytes != protocol.MinBlockSize || completed.File.Name != "" {
+		t.Fatalf("restart completion = %+v, want one charged block, no file, and context cancellation", completed)
+	}
+	awaitSourceHashCoordinatorSignal(t, handleClosed, "restarted source handle cleanup")
+	awaitSourceHashCoordinatorSignal(t, committed, "positive per-Folder hashers restart commit")
+	if got := harness.model.numHashers("folder"); got != 2 {
+		t.Fatalf("post-restart per-Folder hasher ceiling = %d, want 2", got)
+	}
+	select {
+	case got := <-harness.started:
+		t.Fatalf("restarted Source Hash Work continued with %q", got)
+	default:
+	}
+	select {
+	case <-scanResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for scan canceled by per-Folder hashers restart")
+	}
+	if file, ok := harness.model.testCurrentFolderFile("folder", "payload"); ok {
+		t.Fatalf("per-Folder hashers restart published incomplete Source Hash Work: %+v", file)
+	}
+}
+
+func TestModelSharesEqualPrioritySourceHashWorkByActualBytes(t *testing.T) {
+	started := make(chan string, 8)
+	releases := map[string]chan struct{}{
+		"gate": make(chan struct{}),
+		"a":    make(chan struct{}),
+		"b":    make(chan struct{}),
+	}
+	controls := map[string]*sourceHashCoordinatorFilesystemControl{
+		"gate": {
+			folder:         "gate",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: releases["gate"],
+			traversed:      make(chan struct{}),
+		},
+		"a": {
+			folder:         "a",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: releases["a"],
+			traversed:      make(chan struct{}),
+		},
+		"b": {
+			folder:         "b",
+			filesystem:     fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			quantumStarted: started,
+			quantumRelease: releases["b"],
+			traversed:      make(chan struct{}),
+		},
+	}
+	cfg := config.New(myID)
+	cfg.Options.MinHomeDiskFree.Value = 0
+	cfg.Options.RawHashCapacity = 2
+	for folderID, priority := range map[string]int{"gate": 100, "a": 0, "b": 0} {
+		root := rand.String(32)
+		control := controls[folderID]
+		sourceHashCoordinatorFilesystems.Store(root, control)
+		t.Cleanup(func() { sourceHashCoordinatorFilesystems.Delete(root) })
+
+		folder := cfg.Defaults.Folder.Copy()
+		folder.ID = folderID
+		folder.Label = folderID
+		folder.Path = root
+		folder.FilesystemType = config.FilesystemType(sourceHashCoordinatorFilesystemType)
+		folder.FolderPriority = priority
+		folder.Hashers = 2
+		folder.FSWatcherEnabled = false
+		folder.RescanIntervalS = 0
+		folder.ScanProgressIntervalS = 0
+		cfg.SetFolder(folder)
+	}
+
+	wrapper, cancel := newConfigWrapper(cfg)
+	t.Cleanup(cancel)
+	m := setupModel(t, wrapper)
+	t.Cleanup(func() { cleanupModel(m) })
+	for _, release := range releases {
+		release := release
+		t.Cleanup(func() { closeSourceHashCoordinatorSignal(release) })
+	}
+	submitted := make(chan observedSourceHashSubmission, 4)
+	m.sourceHashCoordinator = sourceHashCoordinatorObserver{
+		SourceHashCoordinator: m.sourceHashCoordinator,
+		submitted:             submitted,
+	}
+
+	writeFile(t, controls["gate"].filesystem, "payload-1", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["gate"].filesystem, "payload-2", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["a"].filesystem, "payload-1", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["a"].filesystem, "payload-2", make([]byte, protocol.MinBlockSize))
+	writeFile(t, controls["b"].filesystem, "payload-1", make([]byte, protocol.MinBlockSize/2))
+	writeFile(t, controls["b"].filesystem, "payload-2", make([]byte, protocol.MinBlockSize/2))
+	for _, control := range controls {
+		control.armed.Store(true)
+	}
+
+	scanResults := make(map[string]<-chan error)
+	for _, folder := range []string{"gate", "a", "b"} {
+		result := make(chan error, 1)
+		scanResults[folder] = result
+		go func() { result <- m.ScanFolder(folder) }()
+		awaitSourceHashCoordinatorSignal(t, controls[folder].traversed, folder+" traversal")
+		submissions := 2
+		if folder == "b" {
+			submissions = 1
+		}
+		for range submissions {
+			submission := awaitSourceHashSubmission(t, submitted)
+			if submission.folder != folder {
+				t.Fatalf("Source Hash Work submission = %q, want %q", submission.folder, folder)
+			}
+		}
+		if folder == "gate" {
+			for range 2 {
+				if got := awaitSourceHashCoordinatorStart(t, started); got != "gate" {
+					t.Fatalf("gate Hashing Quantum = %q, want gate", got)
+				}
+			}
+		}
+	}
+
+	releases["gate"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "a" {
+		t.Fatalf("first equal-priority admission = %q, want a", got)
+	}
+	if submission := awaitSourceHashSubmission(t, submitted); submission.folder != "b" {
+		t.Fatalf("Source Hash Work submission after bounded-window release = %q, want b", submission.folder)
+	}
+	releases["gate"] <- struct{}{}
+	if got := awaitSourceHashCoordinatorStart(t, started); got != "b" {
+		t.Fatalf("admission while A had one active block = %q, want b", got)
+	}
+	for index, want := range []string{"b", "a"} {
+		releases[map[string]string{"b": "a", "a": "b"}[want]] <- struct{}{}
+		if got := awaitSourceHashCoordinatorStart(t, started); got != want {
+			t.Fatalf("byte-fair replacement %d = %q, want %q", index+1, got, want)
+		}
+	}
+	releases["a"] <- struct{}{}
+	releases["b"] <- struct{}{}
+
+	for folder, result := range scanResults {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s scan: %v", folder, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s scan", folder)
+		}
+	}
+	for folder, files := range map[string]map[string]int64{
+		"gate": {
+			"payload-1": protocol.MinBlockSize,
+			"payload-2": protocol.MinBlockSize,
+		},
+		"a": {
+			"payload-1": protocol.MinBlockSize,
+			"payload-2": protocol.MinBlockSize,
+		},
+		"b": {
+			"payload-1": protocol.MinBlockSize / 2,
+			"payload-2": protocol.MinBlockSize / 2,
+		},
+	} {
+		for name, size := range files {
+			file, ok := m.testCurrentFolderFile(folder, name)
+			if !ok || file.Size != size || len(file.Blocks) == 0 || len(file.BlocksHash) == 0 {
+				t.Fatalf("%s/%s complete publication = %+v, present=%v", folder, name, file, ok)
+			}
+		}
+	}
+}
+
+type sourceHashModelTestFolder struct {
+	priority               int
+	size                   int
+	files                  int
+	hashers                int
+	logicalInventory       bool
+	gateEachHashingQuantum bool
+	observeHandleClose     bool
+}
+
+type sourceHashModelTestHarness struct {
+	wrapper    config.Wrapper
+	model      *testModel
+	started    chan string
+	releases   map[string]chan struct{}
+	controls   map[string]*sourceHashCoordinatorFilesystemControl
+	submitted  chan observedSourceHashSubmission
+	configured chan observedSourceHashConfiguration
+}
+
+func newSourceHashModelTestHarness(t *testing.T, capacity int, folders map[string]sourceHashModelTestFolder) *sourceHashModelTestHarness {
+	t.Helper()
+	harness := &sourceHashModelTestHarness{
+		started:    make(chan string, 64),
+		releases:   make(map[string]chan struct{}, len(folders)),
+		controls:   make(map[string]*sourceHashCoordinatorFilesystemControl, len(folders)),
+		submitted:  make(chan observedSourceHashSubmission, 64),
+		configured: make(chan observedSourceHashConfiguration, 2*len(folders)+8),
+	}
+	cfg := config.New(myID)
+	cfg.Options.MinHomeDiskFree.Value = 0
+	cfg.Options.RawHashCapacity = capacity
+
+	for folderID, spec := range folders {
+		release := make(chan struct{})
+		filesystemRoot := rand.String(32) + "?content=true"
+		if spec.logicalInventory {
+			filesystemRoot = rand.String(32)
+		}
+		control := &sourceHashCoordinatorFilesystemControl{
+			folder:     folderID,
+			filesystem: fs.NewFilesystem(fs.FilesystemTypeFake, filesystemRoot),
+			traversed:  make(chan struct{}),
+		}
+		if spec.gateEachHashingQuantum {
+			control.quantumStarted = harness.started
+			control.quantumRelease = release
+		} else {
+			control.started = harness.started
+			control.release = release
+		}
+		if spec.observeHandleClose {
+			control.handleClosed = make(chan struct{})
+		}
+		harness.releases[folderID] = release
+		harness.controls[folderID] = control
+
+		root := rand.String(32)
+		sourceHashCoordinatorFilesystems.Store(root, control)
+		t.Cleanup(func() { sourceHashCoordinatorFilesystems.Delete(root) })
+		t.Cleanup(func() { closeSourceHashCoordinatorSignal(release) })
+
+		folder := cfg.Defaults.Folder.Copy()
+		folder.ID = folderID
+		folder.Label = folderID
+		folder.Path = root
+		folder.FilesystemType = config.FilesystemType(sourceHashCoordinatorFilesystemType)
+		folder.FolderPriority = spec.priority
+		folder.Hashers = spec.hashers
+		if folder.Hashers == 0 {
+			folder.Hashers = 1
+		}
+		folder.FSWatcherEnabled = false
+		folder.RescanIntervalS = 0
+		folder.ScanProgressIntervalS = 0
+		cfg.SetFolder(folder)
+	}
+
+	var cancel context.CancelFunc
+	harness.wrapper, cancel = newConfigWrapper(cfg)
+	t.Cleanup(cancel)
+	harness.model = setupModel(t, harness.wrapper)
+	t.Cleanup(func() { cleanupModel(harness.model) })
+	harness.model.sourceHashCoordinator = sourceHashCoordinatorObserver{
+		SourceHashCoordinator: harness.model.sourceHashCoordinator,
+		submitted:             harness.submitted,
+		configured:            harness.configured,
+	}
+	for folderID, spec := range folders {
+		size := spec.size
+		if size == 0 {
+			size = protocol.MinBlockSize
+		}
+		control := harness.controls[folderID]
+		files := spec.files
+		if spec.logicalInventory {
+			files = 0
+		}
+		if files == 0 {
+			if spec.logicalInventory {
+				control.armed.Store(true)
+				continue
+			}
+			files = 1
+		}
+		for index := range files {
+			name := "payload"
+			if files > 1 {
+				name = fmt.Sprintf("payload-%d", index)
+			}
+			writeFile(t, control.filesystem, name, make([]byte, size))
+		}
+		control.armed.Store(true)
+	}
+	return harness
+}
+
+func startSourceHashModelScan(t *testing.T, harness *sourceHashModelTestHarness, folder string, submissions, starts int) <-chan error {
+	return startSourceHashModelScanWithSubmissionTimeout(t, harness, folder, submissions, starts, 5*time.Second)
+}
+
+func startSourceHashModelScanWithSubmissionTimeout(t *testing.T, harness *sourceHashModelTestHarness, folder string, submissions, starts int, timeout time.Duration) <-chan error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- harness.model.ScanFolder(folder) }()
+	awaitSourceHashCoordinatorSignal(t, harness.controls[folder].traversed, folder+" traversal")
+	for range submissions {
+		submission := awaitSourceHashSubmissionWithTimeout(t, harness.submitted, timeout)
+		if submission.folder != folder {
+			t.Fatalf("Source Hash Work submission = %q, want %s", submission.folder, folder)
+		}
+	}
+	for range starts {
+		if got := awaitSourceHashCoordinatorStart(t, harness.started); got != folder {
+			t.Fatalf("Hashing Quantum admission = %q, want %s", got, folder)
+		}
+	}
+	return result
+}
+
+func awaitSourceHashModelScan(t *testing.T, result <-chan error, description string) {
+	t.Helper()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("%s: %v", description, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func awaitCanceledSourceHashModelScan(t *testing.T, result <-chan error, description string) {
+	t.Helper()
+	select {
+	case err := <-result:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("%s: %v", description, err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func createSourceHashLogicalInventory(t *testing.T, filesystem fs.Filesystem, files int, size int64) {
+	t.Helper()
+	for index := range files {
+		file, err := filesystem.Create(fmt.Sprintf("logical-%08d", index))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Truncate(size); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertSourceHashModelFilesPublished(t *testing.T, model *testModel, folder string, files int) {
+	t.Helper()
+	for index := range files {
+		name := "payload"
+		if files > 1 {
+			name = fmt.Sprintf("payload-%d", index)
+		}
+		file, ok := model.testCurrentFolderFile(folder, name)
+		if !ok || len(file.Blocks) == 0 || len(file.BlocksHash) == 0 {
+			t.Fatalf("%s/%s complete publication = %+v, present=%v", folder, name, file, ok)
+		}
+	}
+}
+
+func assertSourceHashModelFileMatchesBaseline(t *testing.T, model *testModel, folder, name string, data []byte) {
+	t.Helper()
+	got, ok := model.testCurrentFolderFile(folder, name)
+	if !ok {
+		t.Fatalf("scheduled file %s/%s was not published", folder, name)
+	}
+	blockSize := protocol.FileInfo{Size: int64(len(data))}.BlockSize()
+	wantBlocks, err := scanner.Blocks(t.Context(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Blocks, wantBlocks) {
+		t.Errorf("scheduled blocks for %s/%s = %v, want whole-file baseline %v", folder, name, got.Blocks, wantBlocks)
+	}
+	wantBlocksHash := protocol.BlocksHash(wantBlocks)
+	if !bytes.Equal(got.BlocksHash, wantBlocksHash) {
+		t.Errorf("scheduled BlocksHash for %s/%s = %x, want whole-file baseline %x", folder, name, got.BlocksHash, wantBlocksHash)
+	}
+}
+
+func awaitSourceHashCoordinatorStart(t *testing.T, started <-chan string) string {
+	t.Helper()
+	select {
+	case folder := <-started:
+		return folder
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Hashing Quantum")
+		return ""
+	}
+}
+
+func awaitSourceHashCoordinatorSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func awaitSourceHashSubmission(t *testing.T, submitted <-chan observedSourceHashSubmission) observedSourceHashSubmission {
+	return awaitSourceHashSubmissionWithTimeout(t, submitted, 5*time.Second)
+}
+
+func awaitSourceHashSubmissionWithTimeout(t *testing.T, submitted <-chan observedSourceHashSubmission, timeout time.Duration) observedSourceHashSubmission {
+	t.Helper()
+	select {
+	case submission := <-submitted:
+		return submission
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for Source Hash Work submission")
+		return observedSourceHashSubmission{}
+	}
+}
+
+func awaitSourceHashConfiguration(t *testing.T, configured <-chan observedSourceHashConfiguration, description string) observedSourceHashConfiguration {
+	t.Helper()
+	select {
+	case configuration := <-configured:
+		return configuration
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return observedSourceHashConfiguration{}
+	}
+}
+
+func awaitSourceHashCompletion(t *testing.T, completion <-chan scanner.SourceHashCompletion, description string) scanner.SourceHashCompletion {
+	t.Helper()
+	select {
+	case result := <-completion:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return scanner.SourceHashCompletion{}
+	}
+}
+
+func closeSourceHashCoordinatorSignal(signal chan struct{}) {
+	select {
+	case <-signal:
+	default:
+		close(signal)
+	}
+}

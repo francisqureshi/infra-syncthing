@@ -66,7 +66,6 @@ type copyBlocksState struct {
 const retainBits = fs.ModeSetgid | fs.ModeSetuid | fs.ModeSticky
 
 var (
-	activity                  = newDeviceActivity()
 	errNoDevice               = errors.New("peers who had this file went away, or the file has changed while syncing. will retry later")
 	errDirPrefix              = "directory has been deleted on a remote device but "
 	errDirHasToBeScanned      = errors.New(errDirPrefix + "contains changed files, scheduling scan")
@@ -134,9 +133,13 @@ type sendReceiveFolder struct {
 	tempPullErrors map[string]string // pull errors that might be just transient
 }
 
-func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *semaphore.Semaphore) service {
+func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger) service {
+	return newSendReceiveFolderBase(model, ignores, cfg, ver, evLogger)
+}
+
+func newSendReceiveFolderBase(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger) *sendReceiveFolder {
 	f := &sendReceiveFolder{
-		folder:             newFolder(model, ignores, cfg, evLogger, ioLimiter, ver),
+		folder:             newFolder(model, ignores, cfg, evLogger, ver),
 		queue:              newJobQueue(),
 		blockPullReorderer: newBlockPullReorderer(cfg.BlockPullOrder, model.id, cfg.DeviceIDs()),
 		writeLimiter:       semaphore.New(cfg.MaxConcurrentWrites),
@@ -163,6 +166,59 @@ func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.Fold
 	}
 
 	return f
+}
+
+type neededFileAction uint8
+
+const (
+	neededFileIgnoreDelete neededFileAction = iota
+	neededFileInvalidateIgnored
+	neededFileDeleteWindowsInvalid
+	neededFileRejectWindowsInvalid
+	neededFileDelete
+	neededFileShortcut
+	neededFilePull
+	neededFileInvalidateUnsupportedSymlink
+	neededFileHandleDirectory
+	neededFileHandleSymlink
+	neededFileUnhandleable
+)
+
+func (f *sendReceiveFolder) classifyNeededFile(file protocol.FileInfo) (neededFileAction, protocol.FileInfo, bool, error) {
+	switch {
+	case f.IgnoreDelete && file.IsDeleted():
+		return neededFileIgnoreDelete, protocol.FileInfo{}, false, nil
+	case f.ignores.Match(file.Name).IsIgnored():
+		return neededFileInvalidateIgnored, protocol.FileInfo{}, false, nil
+	case build.IsWindows && fs.WindowsInvalidFilename(file.Name) != nil:
+		if file.IsDeleted() {
+			return neededFileDeleteWindowsInvalid, protocol.FileInfo{}, false, nil
+		}
+		return neededFileRejectWindowsInvalid, protocol.FileInfo{}, false, nil
+	case file.IsDeleted():
+		if file.IsDirectory() || file.IsSymlink() {
+			return neededFileDelete, protocol.FileInfo{}, false, nil
+		}
+		current, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
+		return neededFileDelete, current, ok, err
+	case file.Type == protocol.FileInfoTypeFile:
+		current, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
+		if err != nil {
+			return neededFileUnhandleable, protocol.FileInfo{}, false, err
+		}
+		if ok && current.Type == file.Type && file.BlocksEqual(current) {
+			return neededFileShortcut, current, true, nil
+		}
+		return neededFilePull, current, ok, nil
+	case (build.IsWindows || build.IsAndroid) && file.IsSymlink():
+		return neededFileInvalidateUnsupportedSymlink, protocol.FileInfo{}, false, nil
+	case file.IsDirectory() && !file.IsSymlink():
+		return neededFileHandleDirectory, protocol.FileInfo{}, false, nil
+	case file.IsSymlink():
+		return neededFileHandleSymlink, protocol.FileInfo{}, false, nil
+	default:
+		return neededFileUnhandleable, protocol.FileInfo{}, false, nil
+	}
 }
 
 // pull returns true if it manages to get all needed items from peers, i.e. get
@@ -238,6 +294,33 @@ func (f *sendReceiveFolder) pull(ctx context.Context) (bool, error) {
 	// We're done if we didn't change anything and didn't fail to change
 	// anything
 	return changed == 0 && pullErrNum == 0, nil
+}
+
+// pullRunnable reports whether a pull iteration can currently make progress.
+// In particular, needed file content does not make the folder runnable until
+// at least one connected peer has usable source data. Local metadata and
+// deletion work remains runnable without a peer.
+func (f *sendReceiveFolder) pullRunnable() (bool, error) {
+	for file, err := range itererr.Zip(f.model.sdb.AllNeededGlobalFiles(f.folderID, protocol.LocalDeviceID, f.Order, 0, 0)) {
+		if err != nil {
+			return false, err
+		}
+		action, _, _, err := f.classifyNeededFile(file)
+		if err != nil {
+			return false, err
+		}
+		switch action {
+		case neededFileIgnoreDelete, neededFileRejectWindowsInvalid:
+			continue
+		case neededFilePull:
+			if len(f.model.fileAvailability(f.FolderConfiguration, file)) > 0 {
+				return true, nil
+			}
+		default:
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // pullerIteration runs a single puller iteration for the given folder and
@@ -333,31 +416,30 @@ loop:
 		default:
 		}
 
-		if f.IgnoreDelete && file.IsDeleted() {
-			f.sl.DebugContext(ctx, "Ignoring file deletion per config", slogutil.FilePath(file.FileName()))
-			continue
+		action, current, hasCurrent, err := f.classifyNeededFile(file)
+		if err != nil {
+			return nil, nil, err
 		}
 
-		switch {
-		case f.ignores.Match(file.Name).IsIgnored():
+		switch action {
+		case neededFileIgnoreDelete:
+			f.sl.DebugContext(ctx, "Ignoring file deletion per config", slogutil.FilePath(file.FileName()))
+
+		case neededFileInvalidateIgnored:
 			file.SetIgnored()
 			f.sl.DebugContext(ctx, "Handling ignored file", file.LogAttr())
 			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
 
-		case build.IsWindows && fs.WindowsInvalidFilename(file.Name) != nil:
-			if file.IsDeleted() {
-				// Just pretend we deleted it, no reason to create an error
-				// about a deleted file that we can't have anyway.
-				// Reason we need it in the first place is, that it was
-				// ignored at some point.
-				dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
-			} else {
-				// We can't pull an invalid file. Grab the error again since
-				// we couldn't assign it directly in the case clause.
-				f.newPullError(file.Name, fs.WindowsInvalidFilename(file.Name))
-			}
+		case neededFileDeleteWindowsInvalid:
+			// Just pretend we deleted it, no reason to create an error
+			// about a deleted file that we can't have anyway. We need it
+			// because it was ignored at some point.
+			dbUpdateChan <- dbUpdateJob{file, dbUpdateDeleteFile}
 
-		case file.IsDeleted():
+		case neededFileRejectWindowsInvalid:
+			f.newPullError(file.Name, fs.WindowsInvalidFilename(file.Name))
+
+		case neededFileDelete:
 			switch {
 			case file.IsDirectory():
 				// Perform directory deletions at the end, as we may have
@@ -366,40 +448,31 @@ loop:
 			case file.IsSymlink():
 				f.deleteFile(file, dbUpdateChan, scanChan)
 			default:
-				df, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
-				if err != nil {
-					return nil, nil, err
-				}
 				// Local file can be already deleted, but with a lower version
 				// number, hence the deletion coming in again as part of
 				// WithNeed, furthermore, the file can simply be of the wrong
 				// type if we haven't yet managed to pull it.
-				if ok && !df.IsDeleted() && !df.IsSymlink() && !df.IsDirectory() && !df.IsInvalid() {
+				if hasCurrent && !current.IsDeleted() && !current.IsSymlink() && !current.IsDirectory() && !current.IsInvalid() {
 					fileDeletions[file.Name] = file
 					// Put files into buckets per first hash
-					key := string(df.BlocksHash)
-					buckets[key] = append(buckets[key], df)
+					key := string(current.BlocksHash)
+					buckets[key] = append(buckets[key], current)
 				} else {
-					f.deleteFileWithCurrent(file, df, ok, dbUpdateChan, scanChan)
+					f.deleteFileWithCurrent(file, current, hasCurrent, dbUpdateChan, scanChan)
 				}
 			}
 
-		case file.Type == protocol.FileInfoTypeFile:
-			curFile, hasCurFile, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, file.Name)
-			if err != nil {
-				return nil, nil, err
-			}
-			if hasCurFile && curFile.Type == file.Type && file.BlocksEqual(curFile) {
-				// We are supposed to copy the entire file, and then fetch nothing. We
-				// are only updating metadata, so we don't actually *need* to make the
-				// copy.
-				f.shortcutFile(file, dbUpdateChan)
-			} else {
-				// Queue files for processing after directories and symlinks.
-				f.queue.Push(file.Name, file.Size, file.ModTime())
-			}
+		case neededFileShortcut:
+			// We are supposed to copy the entire file, and then fetch nothing. We
+			// are only updating metadata, so we don't actually *need* to make the
+			// copy.
+			f.shortcutFile(file, dbUpdateChan)
 
-		case (build.IsWindows || build.IsAndroid) && file.IsSymlink():
+		case neededFilePull:
+			// Queue files for processing after directories and symlinks.
+			f.queue.Push(file.Name, file.Size, file.ModTime())
+
+		case neededFileInvalidateUnsupportedSymlink:
 			if err := f.handleSymlinkCheckExisting(file, scanChan); err != nil {
 				f.newPullError(file.Name, fmt.Errorf("handling unsupported symlink: %w", err))
 				break
@@ -408,19 +481,19 @@ loop:
 			f.sl.DebugContext(ctx, "Invalidating unsupported symlink", slogutil.FilePath(file.Name))
 			dbUpdateChan <- dbUpdateJob{file, dbUpdateInvalidate}
 
-		case file.IsDirectory() && !file.IsSymlink():
+		case neededFileHandleDirectory:
 			f.sl.DebugContext(ctx, "Handling directory", slogutil.FilePath(file.Name))
 			if f.checkParent(file.Name, scanChan) {
 				f.handleDir(file, dbUpdateChan, scanChan)
 			}
 
-		case file.IsSymlink():
+		case neededFileHandleSymlink:
 			f.sl.DebugContext(ctx, "Handling symlink", slogutil.FilePath(file.Name))
 			if f.checkParent(file.Name, scanChan) {
 				f.handleSymlink(file, dbUpdateChan, scanChan)
 			}
 
-		default:
+		case neededFileUnhandleable:
 			panic("unhandleable item type, can't happen")
 		}
 	}
@@ -1608,11 +1681,9 @@ loop:
 		default:
 		}
 
-		// Select the least busy device to pull the block from. If we found no
-		// feasible device at all, fail the block (and in the long run, the
-		// file).
-		found := activity.leastBusy(candidates)
-		if found == -1 {
+		// If we found no feasible device at all, fail the block (and in the
+		// long run, the file).
+		if len(candidates) == 0 {
 			if lastError != nil {
 				state.fail(fmt.Errorf("pull: %w", lastError))
 			} else {
@@ -1621,17 +1692,22 @@ loop:
 			break
 		}
 
-		selected := candidates[found]
+		var buf []byte
+		var selected Availability
+		blockNo := int(state.block.Offset / int64(state.file.BlockSize()))
+		req := &protocol.Request{Folder: f.folderID, Name: state.file.Name, BlockNo: blockNo, Offset: state.block.Offset, Size: state.block.Size, Hash: state.block.Hash}
+		buf, selected, lastError = f.model.requestGlobalWithAvailability(ctx, func() []Availability {
+			return slices.DeleteFunc(slices.Clone(candidates), func(candidate Availability) bool {
+				return !f.model.blockSourceAvailable(f.FolderConfiguration, state.file, state.block, candidate)
+			})
+		}, req)
+		found := slices.Index(candidates, selected)
+		if found < 0 {
+			state.fail(fmt.Errorf("pull: selected unavailable source: %w", lastError))
+			break loop
+		}
 		candidates[found] = candidates[len(candidates)-1]
 		candidates = candidates[:len(candidates)-1]
-
-		// Fetch the block, while marking the selected device as in use so that
-		// leastBusy can select another device when someone else asks.
-		activity.using(selected)
-		var buf []byte
-		blockNo := int(state.block.Offset / int64(state.file.BlockSize()))
-		buf, lastError = f.model.RequestGlobal(ctx, selected.ID, f.folderID, state.file.Name, blockNo, state.block.Offset, state.block.Size, state.block.Hash, selected.FromTemporary)
-		activity.done(selected)
 		if lastError != nil {
 			f.sl.DebugContext(ctx, "Block request returned error", slogutil.FilePath(state.file.Name), "offset", state.block.Offset, "size", state.block.Size, "device", selected.ID.Short(), slogutil.Error(lastError))
 			continue

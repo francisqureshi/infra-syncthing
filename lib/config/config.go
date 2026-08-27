@@ -283,7 +283,9 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
 	cfg.GUI.prepare()
 
 	guiPWIsSet := cfg.GUI.User != "" && cfg.GUI.Password != ""
-	cfg.Options.prepare(guiPWIsSet)
+	if err := cfg.Options.prepare(guiPWIsSet); err != nil {
+		return err
+	}
 
 	cfg.prepareIgnoredDevices(existingDevices)
 

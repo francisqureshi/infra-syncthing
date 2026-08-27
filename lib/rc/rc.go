@@ -465,6 +465,7 @@ func (p *Process) eventLoop() {
 		if err != nil {
 			if time.Since(start) < 5*time.Second {
 				// The API has probably not started yet, lets give it some time.
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
@@ -476,6 +477,7 @@ func (p *Process) eventLoop() {
 			}
 
 			log.Println("eventLoop: events:", err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
@@ -607,12 +609,26 @@ func (p *Process) Connections() (map[string]ConnectionStats, error) {
 		return nil, err
 	}
 
-	var res map[string]ConnectionStats
-	if err := json.Unmarshal(bs, &res); err != nil {
+	return decodeConnectionStats(bs)
+}
+
+func decodeConnectionStats(bs []byte) (map[string]ConnectionStats, error) {
+	var envelope struct {
+		Connections map[string]ConnectionStats `json:"connections"`
+	}
+	if err := json.Unmarshal(bs, &envelope); err != nil {
 		return nil, err
 	}
+	if envelope.Connections != nil {
+		return envelope.Connections, nil
+	}
 
-	return res, nil
+	// Older Syncthing versions returned the device map directly.
+	var connections map[string]ConnectionStats
+	if err := json.Unmarshal(bs, &connections); err != nil {
+		return nil, err
+	}
+	return connections, nil
 }
 
 type SystemStatus struct {

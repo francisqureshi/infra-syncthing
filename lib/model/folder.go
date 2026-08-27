@@ -29,7 +29,6 @@ import (
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
-	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/stats"
 	"github.com/syncthing/syncthing/lib/stringutil"
 	"github.com/syncthing/syncthing/lib/svcutil"
@@ -45,7 +44,7 @@ type folder struct {
 	config.FolderConfiguration
 	*stats.FolderStatisticsReference
 
-	ioLimiter *semaphore.Semaphore
+	ioLimiter *folderWorkScheduler
 
 	localFlags protocol.FlagLocal
 
@@ -69,6 +68,8 @@ type folder struct {
 	pullScheduled chan struct{}
 	pullPause     time.Duration
 	pullFailTimer *time.Timer
+	pullRetryAt   time.Time
+	pullRetryKind pullRetryKind
 
 	scanErrors []FileError
 	pullErrors []FileError
@@ -101,12 +102,25 @@ type puller interface {
 	pull(ctx context.Context) (bool, error) // true when successful and should not be retried
 }
 
-func newFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger, ioLimiter *semaphore.Semaphore, ver versioner.Versioner) *folder {
+type runnablePuller interface {
+	puller
+	pullRunnable() (bool, error)
+}
+
+type pullRetryKind uint8
+
+const (
+	pullRetryNone pullRetryKind = iota
+	pullRetryUnavailable
+	pullRetryFailure
+)
+
+func newFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, evLogger events.Logger, ver versioner.Versioner) *folder {
 	f := folder{
 		stateTracker:              newStateTracker(cfg.ID, evLogger),
 		FolderConfiguration:       cfg,
 		FolderStatisticsReference: stats.NewFolderStatisticsReference(db.NewTyped(model.sdb, "folderstats/"+cfg.ID)),
-		ioLimiter:                 ioLimiter,
+		ioLimiter:                 model.folderIOLimiter,
 
 		model:         model,
 		shortID:       model.shortID,
@@ -251,7 +265,7 @@ func (f *folder) Serve(ctx context.Context) error {
 
 		case fsEvents := <-f.watchChan:
 			f.sl.DebugContext(ctx, "Scan due to watcher")
-			err = f.scanSubdirs(ctx, fsEvents)
+			err = f.scanSubdirsForNetwork(ctx, fsEvents)
 
 		case <-f.restartWatchChan:
 			f.sl.DebugContext(ctx, "Restart watcher")
@@ -393,10 +407,10 @@ func (f *folder) getHealthErrorWithoutIgnores() error {
 }
 
 func (f *folder) pull(ctx context.Context) (success bool, err error) {
-	f.pullFailTimer.Stop()
-	select {
-	case <-f.pullFailTimer.C:
-	default:
+	// New schedule notifications do not bypass retry backoff after a failed
+	// pull. The timer invocation proceeds once the deadline has elapsed.
+	if f.pullRetryKind == pullRetryFailure && time.Now().Before(f.pullRetryAt) {
+		return false, nil
 	}
 
 	select {
@@ -410,6 +424,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 		if success {
 			// We're good, reset the pause interval.
 			f.pullPause = f.pullBasePause()
+			f.clearPullRetry()
 		}
 	}()
 
@@ -440,10 +455,32 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	if f.Type != config.FolderTypeSendOnly {
 		f.setState(FolderSyncWaiting)
 
-		if err := f.ioLimiter.TakeWithContext(ctx, 1); err != nil {
+		if runnable, err := f.folderPriorityPullRunnable(); err != nil {
+			return false, err
+		} else if !runnable {
+			if f.pullRetryKind != pullRetryUnavailable || !time.Now().Before(f.pullRetryAt) {
+				f.schedulePullRetry(pullRetryUnavailable, f.pullPause)
+			}
+			return false, nil
+		}
+
+		f.clearPullRetry()
+		if err := f.ioLimiter.takeWithContext(ctx, f.ID, folderWorkNetwork); err != nil {
 			return true, err
 		}
-		defer f.ioLimiter.Give(1)
+		defer f.ioLimiter.give()
+
+		// Availability may change while the folder is waiting for constrained
+		// I/O. Recheck after admission so a high-priority folder that stopped
+		// being runnable yields the slot immediately.
+		if runnable, err := f.folderPriorityPullRunnable(); err != nil {
+			return false, err
+		} else if !runnable {
+			f.schedulePullRetry(pullRetryUnavailable, f.pullPause)
+			return false, nil
+		}
+	} else {
+		f.clearPullRetry()
 	}
 
 	startTime := time.Now()
@@ -471,12 +508,46 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	// Pulling failed, try again later.
 	delay := f.pullPause + time.Since(startTime)
 	f.sl.InfoContext(ctx, "Folder failed to sync, will be retried", slog.String("wait", stringutil.NiceDurationString(delay)))
-	f.pullFailTimer.Reset(delay)
+	f.schedulePullRetry(pullRetryFailure, delay)
 
 	return false, err
 }
 
+func (f *folder) schedulePullRetry(kind pullRetryKind, delay time.Duration) {
+	f.clearPullRetry()
+	f.pullRetryKind = kind
+	f.pullRetryAt = time.Now().Add(delay)
+	f.pullFailTimer.Reset(delay)
+}
+
+func (f *folder) clearPullRetry() {
+	f.pullRetryKind = pullRetryNone
+	f.pullRetryAt = time.Time{}
+	if !f.pullFailTimer.Stop() {
+		select {
+		case <-f.pullFailTimer.C:
+		default:
+		}
+	}
+}
+
+func (f *folder) folderPriorityPullRunnable() (bool, error) {
+	puller, ok := f.puller.(runnablePuller)
+	if !ok {
+		return true, nil
+	}
+	return puller.pullRunnable()
+}
+
 func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
+	return f.scanSubdirsWithClass(ctx, subDirs, folderWorkMaintenance)
+}
+
+func (f *folder) scanSubdirsForNetwork(ctx context.Context, subDirs []string) error {
+	return f.scanSubdirsWithClass(ctx, subDirs, folderWorkNetwork)
+}
+
+func (f *folder) scanSubdirsWithClass(ctx context.Context, subDirs []string, class folderWorkClass) error {
 	f.sl.DebugContext(ctx, "Scanning")
 
 	oldHash := f.ignores.Hash()
@@ -500,10 +571,14 @@ func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
 
 	f.setState(FolderScanWaiting)
 
-	if err := f.ioLimiter.TakeWithContext(ctx, 1); err != nil {
+	if err := f.ioLimiter.takeWithContext(ctx, f.ID, class); err != nil {
 		return err
 	}
-	defer f.ioLimiter.Give(1)
+	var releaseScanAdmissionOnce sync.Once
+	releaseScanAdmission := func() {
+		releaseScanAdmissionOnce.Do(f.ioLimiter.give)
+	}
+	defer releaseScanAdmission()
 
 	metricFolderScans.WithLabelValues(f.ID).Inc()
 	scanCtx, cancel := context.WithCancel(ctx)
@@ -546,7 +621,7 @@ func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
 		}
 	}()
 
-	changesHere, err := f.scanSubdirsChangedAndNew(ctx, subDirs, batch)
+	changesHere, err := f.scanSubdirsChangedAndNew(ctx, subDirs, batch, releaseScanAdmission)
 	changes += changesHere
 	if err != nil {
 		return err
@@ -565,13 +640,19 @@ func (f *folder) scanSubdirs(ctx context.Context, subDirs []string) error {
 	// Do a scan of the database for each prefix, to check for deleted and
 	// ignored files.
 
-	changesHere, err = f.scanSubdirsDeletedAndIgnored(ctx, subDirs, batch)
-	changes += changesHere
-	if err != nil {
+	if err := f.ioLimiter.takeWithContext(ctx, f.ID, folderWorkMaintenance); err != nil {
 		return err
 	}
-
-	if err := batch.Flush(); err != nil {
+	err = func() error {
+		defer f.ioLimiter.give()
+		changesHere, err = f.scanSubdirsDeletedAndIgnored(ctx, subDirs, batch)
+		changes += changesHere
+		if err != nil {
+			return err
+		}
+		return batch.Flush()
+	}()
+	if err != nil {
 		return err
 	}
 
@@ -672,24 +753,29 @@ func (b *scanBatch) Update(fi protocol.FileInfo) (bool, error) {
 	return true, nil
 }
 
-func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string, batch *scanBatch) (int, error) {
+func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string, batch *scanBatch, releaseScanAdmission func()) (int, error) {
 	changes := 0
 
 	// If we return early e.g. due to a folder health error, the scan needs
 	// to be cancelled.
 	scanCtx, scanCancel := context.WithCancel(ctx)
-	defer scanCancel()
 
 	scanConfig := scanner.Config{
-		Folder:                f.ID,
-		Subs:                  subDirs,
-		Matcher:               f.ignores,
-		TempLifetime:          time.Duration(f.model.cfg.Options().KeepTemporariesH) * time.Hour,
-		CurrentFiler:          cFiler{db: f.db, folder: f.folderID},
-		Filesystem:            f.mtimefs,
-		IgnorePerms:           f.IgnorePerms,
-		AutoNormalize:         f.AutoNormalize,
-		Hashers:               f.model.numHashers(f.ID),
+		Folder:        f.ID,
+		Subs:          subDirs,
+		Matcher:       f.ignores,
+		TempLifetime:  time.Duration(f.model.cfg.Options().KeepTemporariesH) * time.Hour,
+		CurrentFiler:  cFiler{db: f.db, folder: f.folderID},
+		Filesystem:    f.mtimefs,
+		IgnorePerms:   f.IgnorePerms,
+		AutoNormalize: f.AutoNormalize,
+		Hashers:       f.model.numHashers(f.ID),
+		SourceHashFolder: scanner.SourceHashFolder{
+			ID:            f.ID,
+			Priority:      f.FolderPriority,
+			HasherCeiling: f.Hashers,
+		},
+		SourceHashCoordinator: f.model.sourceHashCoordinator,
 		ShortID:               f.shortID,
 		ProgressTickIntervalS: f.ScanProgressIntervalS,
 		LocalFlags:            f.localFlags,
@@ -699,48 +785,90 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 		ScanXattrs:            f.SendXattrs || f.SyncXattrs,
 		XattrFilter:           f.XattrFilter,
 	}
-	var fchan chan scanner.ScanResult
+	var walkResult scanner.WalkResult
 	if f.Type == config.FolderTypeReceiveEncrypted {
-		fchan = scanner.WalkWithoutHashing(scanCtx, scanConfig)
+		walkResult = scanner.WalkWithoutHashing(scanCtx, scanConfig)
 	} else {
-		fchan = scanner.Walk(scanCtx, scanConfig)
+		walkResult = scanner.Walk(scanCtx, scanConfig)
+	}
+	fchan := walkResult.Results
+	traversalDone := walkResult.TraversalDone
+	defer func() {
+		scanCancel()
+		if traversalDone != nil {
+			<-traversalDone
+			releaseScanAdmission()
+		}
+	}()
+	releaseScanAdmissionIfTraversalDone := func() bool {
+		if traversalDone == nil {
+			return false
+		}
+		select {
+		case <-traversalDone:
+			releaseScanAdmission()
+			traversalDone = nil
+			return true
+		default:
+			return false
+		}
 	}
 
-	for res := range fchan {
-		if res.Err != nil {
-			f.newScanError(res.Path, res.Err)
+	for fchan != nil {
+		// When traversal completion and a scan result are both ready, release
+		// admission before doing any more result-consumer work. The blocking
+		// select below still handles completion that arrives while waiting.
+		if releaseScanAdmissionIfTraversalDone() {
 			continue
 		}
-
-		if err := batch.FlushIfFull(); err != nil {
-			// Prevent a race between the scan aborting due to context
-			// cancellation and releasing the snapshot in defer here.
-			scanCancel()
-			for range fchan {
+		select {
+		case <-traversalDone:
+			releaseScanAdmission()
+			traversalDone = nil
+			continue
+		case res, ok := <-fchan:
+			if !ok {
+				fchan = nil
+				continue
 			}
-			return changes, err
-		}
+			// Traversal can finish after the pre-check but before this case is
+			// selected. Latch it again before doing any result-consumer work.
+			releaseScanAdmissionIfTraversalDone()
+			if res.Err != nil {
+				f.newScanError(res.Path, res.Err)
+				continue
+			}
 
-		if ok, err := batch.Update(res.File); err != nil {
-			return 0, err
-		} else if ok {
-			changes++
-		}
+			if err := batch.FlushIfFull(); err != nil {
+				// Prevent a race between the scan aborting due to context
+				// cancellation and releasing the snapshot in defer here.
+				scanCancel()
+				for range walkResult.Results {
+				}
+				return changes, err
+			}
 
-		switch f.Type {
-		case config.FolderTypeReceiveOnly, config.FolderTypeReceiveEncrypted:
-		default:
-			// Rename detection is comparatively expensive, so only attempt
-			// it for files that appeared as new on disk during this scan. A
-			// rename that overwrites an existing file (the destination path
-			// already had an entry, so it scans as an update rather than a
-			// new file) is not optimised as a rename.
-			if res.File.New && res.File.Size > 0 {
-				if nf, ok := f.findRename(ctx, res.File, batch); ok {
-					if ok, err := batch.Update(nf); err != nil {
-						return 0, err
-					} else if ok {
-						changes++
+			if ok, err := batch.Update(res.File); err != nil {
+				return 0, err
+			} else if ok {
+				changes++
+			}
+
+			switch f.Type {
+			case config.FolderTypeReceiveOnly, config.FolderTypeReceiveEncrypted:
+			default:
+				// Rename detection is comparatively expensive, so only attempt
+				// it for files that appeared as new on disk during this scan. A
+				// rename that overwrites an existing file (the destination path
+				// already had an entry, so it scans as an update rather than a
+				// new file) is not optimised as a rename.
+				if res.File.New && res.File.Size > 0 {
+					if nf, ok := f.findRename(ctx, res.File, batch); ok {
+						if ok, err := batch.Update(nf); err != nil {
+							return 0, err
+						} else if ok {
+							changes++
+						}
 					}
 				}
 			}
@@ -1012,7 +1140,7 @@ loop:
 }
 
 func (f *folder) scanTimerFired(ctx context.Context) error {
-	err := f.scanSubdirs(ctx, nil)
+	err := f.scanSubdirsForNetwork(ctx, nil)
 
 	select {
 	case <-f.initialScanFinished:
@@ -1036,10 +1164,10 @@ func (f *folder) scanTimerFired(ctx context.Context) error {
 func (f *folder) versionCleanupTimerFired(ctx context.Context) {
 	f.setState(FolderCleanWaiting)
 
-	if err := f.ioLimiter.TakeWithContext(ctx, 1); err != nil {
+	if err := f.ioLimiter.takeWithContext(ctx, f.ID, folderWorkMaintenance); err != nil {
 		return
 	}
-	defer f.ioLimiter.Give(1)
+	defer f.ioLimiter.give()
 
 	f.setState(FolderCleaning)
 
@@ -1081,7 +1209,7 @@ func (f *folder) scheduleWatchRestart() {
 func (f *folder) restartWatch(ctx context.Context) error {
 	f.stopWatch()
 	f.startWatch(ctx)
-	return f.scanSubdirs(ctx, nil)
+	return f.scanSubdirsForNetwork(ctx, nil)
 }
 
 // startWatch should only ever be called synchronously. If you want to use
@@ -1439,7 +1567,7 @@ func (f *folder) handleForcedRescans(ctx context.Context) error {
 		return err
 	}
 
-	return f.scanSubdirs(ctx, paths)
+	return f.scanSubdirsForNetwork(ctx, paths)
 }
 
 // The exists function is expected to return true for all known paths

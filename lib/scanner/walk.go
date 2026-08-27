@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -50,6 +51,10 @@ type Config struct {
 	AutoNormalize bool
 	// Number of routines to use for hashing
 	Hashers int
+	// Current device-local Source Hash Work scheduling policy.
+	SourceHashFolder SourceHashFolder
+	// Coordinator shared by every Folder on this node.
+	SourceHashCoordinator SourceHashCoordinator
 	// Our vector clock id
 	ShortID protocol.ShortID
 	// Optional progress tick interval which defines how often FolderScanProgress
@@ -86,11 +91,20 @@ type ScanResult struct {
 	Path string // to be set in case Err != nil and File == nil
 }
 
-func Walk(ctx context.Context, cfg Config) chan ScanResult {
+// WalkResult reports completed scan results separately from the point at
+// which filesystem traversal and discovery production have finished.
+type WalkResult struct {
+	Results <-chan ScanResult
+	// TraversalDone closes after the walker has produced every discovered item.
+	// Hashing and completed results may continue afterwards.
+	TraversalDone <-chan struct{}
+}
+
+func Walk(ctx context.Context, cfg Config) WalkResult {
 	return newWalker(cfg).walk(ctx)
 }
 
-func WalkWithoutHashing(ctx context.Context, cfg Config) chan ScanResult {
+func WalkWithoutHashing(ctx context.Context, cfg Config) WalkResult {
 	return newWalker(cfg).walkWithoutHashing(ctx)
 }
 
@@ -105,6 +119,15 @@ func newWalker(cfg Config) *walker {
 	}
 	if w.Matcher == nil {
 		w.Matcher = ignore.New(w.Filesystem)
+	}
+	if w.Hashers < 1 {
+		w.Hashers = 1
+	}
+	if w.SourceHashFolder.ID == "" {
+		w.SourceHashFolder.ID = w.Folder
+	}
+	if w.SourceHashCoordinator == nil {
+		w.SourceHashCoordinator = NewSourceHashCoordinator(w.Hashers)
 	}
 
 	registerFolderMetrics(w.Folder)
@@ -123,45 +146,88 @@ type walker struct {
 
 // Walk returns the list of files found in the local folder by scanning the
 // file system. Files are blockwise hashed.
-func (w *walker) walk(ctx context.Context) chan ScanResult {
+func (w *walker) walk(ctx context.Context) WalkResult {
 	l.Debugln(w, "Walk", w.Subs, w.Matcher)
 
 	toHashChan := make(chan protocol.FileInfo)
 	finishedChan := make(chan ScanResult)
+	traversalDone := make(chan struct{})
+	sourceHashEpoch := w.SourceHashCoordinator.BeginSourceHashEpoch(w.SourceHashFolder)
 
-	// A routine which walks the filesystem tree, and sends files which have
-	// been modified to the counter routine.
-	go w.scan(ctx, toHashChan, finishedChan)
-
-	// We're not required to emit scan progress events, just kick off hashers,
-	// and feed inputs directly from the walker.
+	// Without scan progress events, discovery can submit Source Hash Work
+	// directly through the bounded feed.
 	if w.ProgressTickIntervalS < 0 {
-		newParallelHasher(ctx, w.Folder, w.Filesystem, w.Hashers, finishedChan, toHashChan, nil, nil)
-		return finishedChan
+		// Walk the filesystem tree and submit changed-file metadata as it is
+		// discovered.
+		go w.scan(ctx, toHashChan, finishedChan, traversalDone)
+		newParallelHasher(ctx, parallelHasherConfig{
+			folder:      w.SourceHashFolder,
+			filesystem:  w.Filesystem,
+			coordinator: w.SourceHashCoordinator,
+			epoch:       sourceHashEpoch,
+			outbox:      finishedChan,
+			inbox:       toHashChan,
+		}, w.Hashers)
+		return WalkResult{Results: finishedChan, TraversalDone: traversalDone}
 	}
+
+	discoverySpool, err := newDiscoverySpool()
+	if err != nil {
+		sourceHashEpoch.Close()
+		close(traversalDone)
+		go func() {
+			handleError(ctx, "creating discovery spool", w.Folder, err, finishedChan)
+			close(finishedChan)
+		}()
+		return WalkResult{Results: finishedChan, TraversalDone: traversalDone}
+	}
+
+	// Buffered progress mode completes discovery into a scan-owned disk spool
+	// before feeding a bounded set of files to Source Hash Work.
+	go w.scan(ctx, toHashChan, finishedChan, traversalDone)
 
 	// Defaults to every 2 seconds.
 	if w.ProgressTickIntervalS == 0 {
 		w.ProgressTickIntervalS = 2
 	}
 
-	// We need to emit progress events, hence we create a routine which buffers
-	// the list of files to be hashed, counts the total number of
-	// bytes to hash, and once no more files need to be hashed (chan gets closed),
-	// start a routine which periodically emits FolderScanProgress events,
-	// until a stop signal is sent by the parallel hasher.
-	// Parallel hasher is stopped by this routine when we close the channel over
-	// which it receives the files we ask it to hash.
+	// Progress totals require discovery to finish first. Spool the changed-file
+	// metadata and total bytes, then submit Source Hash Work through the bounded
+	// feed while progress is emitted.
 	go func() {
-		var filesToHash []protocol.FileInfo
 		var total int64 = 1
+		var spoolErr error
+		defer setDiscoverySpoolSourceHashWork(sourceHashEpoch, 0)
 
 		for file := range toHashChan {
-			filesToHash = append(filesToHash, file)
+			if spoolErr == nil {
+				spoolErr = discoverySpool.Append(file)
+				if spoolErr == nil {
+					setDiscoverySpoolSourceHashWork(sourceHashEpoch, discoverySpool.Len())
+				}
+			}
 			total += file.Size
 		}
 
-		if len(filesToHash) == 0 {
+		if spoolErr == nil {
+			spoolErr = discoverySpool.Rewind()
+			if spoolErr == nil {
+				setDiscoverySpoolSourceHashWork(sourceHashEpoch, discoverySpool.Len())
+			}
+		}
+		if spoolErr != nil {
+			spoolErr = errors.Join(spoolErr, discoverySpool.Close())
+			sourceHashEpoch.Close()
+			handleError(ctx, "buffering discovery", w.Folder, spoolErr, finishedChan)
+			close(finishedChan)
+			return
+		}
+		if discoverySpool.Len() == 0 {
+			spoolErr = discoverySpool.Close()
+			sourceHashEpoch.Close()
+			if spoolErr != nil {
+				handleError(ctx, "removing discovery spool", w.Folder, spoolErr, finishedChan)
+			}
 			close(finishedChan)
 			return
 		}
@@ -169,8 +235,23 @@ func (w *walker) walk(ctx context.Context) chan ScanResult {
 		realToHashChan := make(chan protocol.FileInfo)
 		done := make(chan struct{})
 		progress := newByteCounter()
+		hasherCtx, cancelHasher := context.WithCancel(ctx)
 
-		newParallelHasher(ctx, w.Folder, w.Filesystem, w.Hashers, finishedChan, realToHashChan, progress, done)
+		newParallelHasher(hasherCtx, parallelHasherConfig{
+			folder:             w.SourceHashFolder,
+			filesystem:         w.Filesystem,
+			coordinator:        w.SourceHashCoordinator,
+			epoch:              sourceHashEpoch,
+			outbox:             finishedChan,
+			inbox:              realToHashChan,
+			counter:            progress,
+			done:               done,
+			fromDiscoverySpool: true,
+		}, w.Hashers)
+		go func() {
+			<-done
+			cancelHasher()
+		}()
 
 		// A routine which actually emits the FolderScanProgress events
 		// every w.ProgressTicker ticks, until the hasher routines terminate.
@@ -206,7 +287,16 @@ func (w *walker) walk(ctx context.Context) chan ScanResult {
 		}()
 
 	loop:
-		for _, file := range filesToHash {
+		for {
+			file, err := discoverySpool.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				spoolErr = err
+				cancelHasher()
+				break
+			}
 			l.Debugln(w, "real to hash:", file.Name)
 			select {
 			case realToHashChan <- file:
@@ -214,35 +304,51 @@ func (w *walker) walk(ctx context.Context) chan ScanResult {
 				break loop
 			}
 		}
+		spoolErr = errors.Join(spoolErr, discoverySpool.Close())
+		if spoolErr != nil {
+			handleError(ctx, "reading discovery spool", w.Folder, spoolErr, finishedChan)
+		}
 		close(realToHashChan)
 	}()
 
-	return finishedChan
+	return WalkResult{Results: finishedChan, TraversalDone: traversalDone}
 }
 
-func (w *walker) walkWithoutHashing(ctx context.Context) chan ScanResult {
+func (w *walker) walkWithoutHashing(ctx context.Context) WalkResult {
 	l.Debugln(w, "Walk without hashing", w.Subs, w.Matcher)
 
 	toHashChan := make(chan protocol.FileInfo)
 	finishedChan := make(chan ScanResult)
+	traversalDone := make(chan struct{})
 
 	// A routine which walks the filesystem tree, and sends files which have
 	// been modified to the counter routine.
-	go w.scan(ctx, toHashChan, finishedChan)
+	go w.scan(ctx, toHashChan, finishedChan, traversalDone)
 
 	go func() {
 		for file := range toHashChan {
-			finishedChan <- ScanResult{File: file}
+			select {
+			case finishedChan <- ScanResult{File: file}:
+			case <-ctx.Done():
+				// The traversal routine also sends directory and error results to
+				// finishedChan. Wait for it to stop before closing their shared
+				// output channel.
+				for range toHashChan {
+				}
+				close(finishedChan)
+				return
+			}
 		}
 		close(finishedChan)
 	}()
 
-	return finishedChan
+	return WalkResult{Results: finishedChan, TraversalDone: traversalDone}
 }
 
 const walkFailureEventDesc = "Unexpected error while walking the filesystem during scan"
 
-func (w *walker) scan(ctx context.Context, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) {
+func (w *walker) scan(ctx context.Context, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult, traversalDone chan<- struct{}) {
+	defer close(traversalDone)
 	hashFiles := w.walkAndHashFiles(ctx, toHashChan, finishedChan)
 	if len(w.Subs) == 0 {
 		if err := w.Filesystem.Walk(".", hashFiles); isWarnableError(err) {

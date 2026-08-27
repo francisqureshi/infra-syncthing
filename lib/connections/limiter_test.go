@@ -87,6 +87,126 @@ func TestLimiterInit(t *testing.T) {
 	checkActualAndExpected(t, actualR, actualW, expectedR, expectedW)
 }
 
+func TestFolderPrioritySchedulingPreservesUploadRateLimits(t *testing.T) {
+	wrapper, wrapperCancel := initConfig()
+	defer wrapperCancel()
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.MaxSendKbps = 64
+		_, index, _ := cfg.Device(device2)
+		cfg.Devices[index].MaxSendKbps = 32
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	lim := newLimiter(device1, wrapper)
+
+	globalLimit := lim.write.Limit()
+	deviceLimit := lim.deviceWriteLimiters[device2].Limit()
+	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Defaults.Folder.FolderPriority = config.FolderPriorityMax
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	if got := lim.write.Limit(); got != globalLimit {
+		t.Fatalf("global raw upload rate changed from %v to %v", globalLimit, got)
+	}
+	if got := lim.deviceWriteLimiters[device2].Limit(); got != deviceLimit {
+		t.Fatalf("per-device raw upload rate changed from %v to %v", deviceLimit, got)
+	}
+}
+
+func TestFolderPrioritySchedulingPreservesDownloadRateLimits(t *testing.T) {
+	wrapper, wrapperCancel := initConfig()
+	defer wrapperCancel()
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.MaxRecvKbps = 64
+		_, index, _ := cfg.Device(device2)
+		cfg.Devices[index].MaxRecvKbps = 32
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	lim := newLimiter(device1, wrapper)
+
+	globalLimit := lim.read.Limit()
+	deviceLimit := lim.deviceReadLimiters[device2].Limit()
+	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Defaults.Folder.FolderPriority = config.FolderPriorityMax
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	if got := lim.read.Limit(); got != globalLimit {
+		t.Fatalf("global raw download rate changed from %v to %v", globalLimit, got)
+	}
+	if got := lim.deviceReadLimiters[device2].Limit(); got != deviceLimit {
+		t.Fatalf("per-device raw download rate changed from %v to %v", deviceLimit, got)
+	}
+}
+
+func TestFolderPriorityControlledLoadPreservesRateLimitedByteTotals(t *testing.T) {
+	wrapper, wrapperCancel := initConfig()
+	defer wrapperCancel()
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.MaxSendKbps = 64 * 1024
+		cfg.Options.MaxRecvKbps = 64 * 1024
+		_, index, _ := cfg.Device(device2)
+		cfg.Devices[index].MaxSendKbps = 64 * 1024
+		cfg.Devices[index].MaxRecvKbps = 64 * 1024
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	lim := newLimiter(device1, wrapper)
+	payload := make([]byte, 2*limiterBurstSize+123)
+
+	transfer := func() (int64, int64) {
+		lim.mu.Lock()
+		reader := lim.newLimitedReaderLocked(device2, bytes.NewReader(payload), false)
+		var destination bytes.Buffer
+		writer := lim.newLimitedWriterLocked(device2, &destination, false)
+		lim.mu.Unlock()
+
+		written, err := io.Copy(writer, bytes.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		read, err := io.Copy(io.Discard, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(destination.Bytes(), payload) {
+			t.Fatal("rate-limited writer changed the transferred payload")
+		}
+		return read, written
+	}
+
+	beforeRead, beforeWritten := transfer()
+	waiter, err = wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Defaults.Folder.FolderPriority = config.FolderPriorityMax
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+	afterRead, afterWritten := transfer()
+	wantTotal := int64(2 * len(payload))
+	if got := beforeRead + afterRead; got != wantTotal {
+		t.Fatalf("rate-limited download total = %d, want %d", got, wantTotal)
+	}
+	if got := beforeWritten + afterWritten; got != wantTotal {
+		t.Fatalf("rate-limited upload total = %d, want %d", got, wantTotal)
+	}
+}
+
 func TestSetDeviceLimits(t *testing.T) {
 	wrapper, wrapperCancel := initConfig()
 	defer wrapperCancel()

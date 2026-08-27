@@ -15,10 +15,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	rdebug "runtime/debug"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/d4l3k/messagediff"
 	"golang.org/x/text/unicode/norm"
@@ -101,7 +105,7 @@ func TestWalkSub(t *testing.T) {
 	defer cancel()
 	cfg.Subs = []string{"dir2"}
 	cfg.Matcher = ignores
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 	var files []protocol.FileInfo
 	for f := range fchan {
 		if f.Err != nil {
@@ -136,7 +140,7 @@ func TestWalk(t *testing.T) {
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Matcher = ignores
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 
 	var tmp []protocol.FileInfo
 	for f := range fchan {
@@ -576,7 +580,7 @@ func walkDir(fs fs.Filesystem, dir string, cfiler CurrentFiler, matcher *ignore.
 	cfg.Matcher = matcher
 	cfg.LocalFlags = localFlags
 	cfg.ScanOwnership = true
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 
 	var tmp []protocol.FileInfo
 	for f := range fchan {
@@ -676,7 +680,8 @@ func TestStopWalk(t *testing.T) {
 	cfg.Filesystem = fs
 	cfg.Hashers = numHashers
 	cfg.ProgressTickIntervalS = -1 // Don't attempt to build the full list of files before starting to scan...
-	fchan := Walk(ctx, cfg)
+	walkResult := Walk(ctx, cfg)
+	fchan := walkResult.Results
 
 	// Receive a few entries to make sure the walker is up and running,
 	// scanning both files and dirs. Do some quick sanity tests on the
@@ -720,9 +725,962 @@ func TestStopWalk(t *testing.T) {
 	for range fchan {
 		extra++
 	}
+	awaitScannerSignal(t, walkResult.TraversalDone, "cancelled traversal completion")
 	t.Log("Extra entries:", extra)
 	if extra > numHashers+1 {
 		t.Error("unexpected extra entries received after cancel")
+	}
+}
+
+func TestBufferedWalkSignalsTraversalBeforeHashingCompletes(t *testing.T) {
+	testWalkSignalsTraversalBeforeHashingCompletes(t, 0)
+}
+
+func TestBufferedWalkOwnsDiscoverySpoolUntilBoundedFeedDrains(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"payload", "zz-queued"} {
+		if err := fs.WriteFile(underlying, name, make([]byte, 128<<10), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-readRelease:
+		default:
+			close(readRelease)
+		}
+	})
+
+	before := discoverySpoolSnapshot(t)
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-success"
+	cfg.Filesystem = &readBarrierFilesystem{
+		Filesystem: underlying,
+		started:    readStarted,
+		release:    readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.ProgressTickIntervalS = 1
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "buffered traversal completion")
+	awaitScannerSignal(t, readStarted, "buffered hashing to start")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+
+	close(readRelease)
+	var results []ScanResult
+	for result := range walkResult.Results {
+		results = append(results, result)
+	}
+	if len(results) != 2 {
+		t.Fatalf("scan results = %v, want two completed files", results)
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after success: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterResultConsumerStops(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"a", "b", "c"} {
+		if err := fs.WriteFile(underlying, name, make([]byte, 128<<10), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := discoverySpoolSnapshot(t)
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "buffered-spool-consumer-failure"
+	cfg.Filesystem = underlying
+	cfg.Hashers = 1
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "buffered traversal completion")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	select {
+	case result := <-walkResult.Results:
+		if result.Err != nil {
+			t.Fatal(result.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first buffered result")
+	}
+
+	// A model result-consumer failure cancels the scan context before it
+	// returns. Do the same while unread discovery records remain.
+	cancel()
+	for range walkResult.Results {
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after result-consumer failure: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterTraversalCancellation(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"a", "b"} {
+		if err := fs.WriteFile(underlying, name, []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	before := discoverySpoolSnapshot(t)
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "buffered-spool-traversal-cancellation"
+	cfg.Filesystem = &walkBarrierFilesystem{
+		Filesystem: underlying,
+		path:       "a",
+		blocked:    blocked,
+		release:    release,
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+
+	awaitScannerSignal(t, blocked, "buffered traversal barrier")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	cancel()
+	close(release)
+	awaitScannerSignal(t, walkResult.TraversalDone, "cancelled buffered traversal completion")
+	for range walkResult.Results {
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after traversal cancellation: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterTraversalFailure(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	before := discoverySpoolSnapshot(t)
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-traversal-failure"
+	cfg.Filesystem = &walkBarrierFilesystem{
+		Filesystem: underlying,
+		path:       "payload",
+		blocked:    blocked,
+		release:    release,
+		walkErr:    errors.New("controlled traversal failure"),
+	}
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, blocked, "buffered traversal failure barrier")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	close(release)
+	awaitScannerSignal(t, walkResult.TraversalDone, "failed buffered traversal completion")
+	for range walkResult.Results {
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after traversal failure: %v", err)
+	}
+}
+
+func TestBufferedWalkRemovesDiscoverySpoolAfterHashingFailure(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	before := discoverySpoolSnapshot(t)
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-hashing-failure"
+	cfg.Filesystem = &openErrorFilesystem{
+		Filesystem: &walkBarrierFilesystem{
+			Filesystem: underlying,
+			path:       "payload",
+			blocked:    blocked,
+			release:    release,
+		},
+		path: "payload",
+		err:  errors.New("controlled hashing failure"),
+	}
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, blocked, "buffered hashing failure barrier")
+	spoolPath := awaitNewDiscoverySpool(t, before)
+	close(release)
+	var hashingErr error
+	for result := range walkResult.Results {
+		hashingErr = errors.Join(hashingErr, result.Err)
+	}
+	if hashingErr == nil || !strings.Contains(hashingErr.Error(), "controlled hashing failure") {
+		t.Fatalf("scan error = %v, want controlled hashing failure", hashingErr)
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discovery spool still exists after hashing failure: %v", err)
+	}
+}
+
+func TestBufferedWalkBoundsSyntheticFiveTerabyteAndHighPrioritySourceHashWork(t *testing.T) {
+	const (
+		lowFiles         = 32 << 10
+		highFiles        = 320
+		logicalFileSize  = int64(160 << 20)
+		maxRetainedBytes = 8 << 20
+		window           = 2
+	)
+	workloads := []struct {
+		folder     string
+		priority   int
+		filesystem *logicalInventoryFilesystem
+		cancel     context.CancelFunc
+		walkResult WalkResult
+	}{
+		{
+			folder:   "low",
+			priority: -100,
+			filesystem: &logicalInventoryFilesystem{
+				Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
+				files:      lowFiles,
+				fileSize:   logicalFileSize,
+			},
+		},
+		{
+			folder:   "high",
+			priority: 100,
+			filesystem: &logicalInventoryFilesystem{
+				Filesystem: fs.NewFilesystem(fs.FilesystemType("error"), "."),
+				files:      highFiles,
+				fileSize:   logicalFileSize,
+			},
+		},
+	}
+	started := make(chan string, 4*window)
+	releases := map[string]chan struct{}{
+		"low":  make(chan struct{}),
+		"high": make(chan struct{}),
+	}
+	coordinator := &inventorySourceHashCoordinator{
+		SourceHashCoordinator: NewSourceHashCoordinator(window),
+		submitted:             make(chan string, 4*window),
+		started:               started,
+		releases: map[string]<-chan struct{}{
+			"low":  releases["low"],
+			"high": releases["high"],
+		},
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for index := range workloads {
+		workload := &workloads[index]
+		cfg, cfgCancel := testConfig()
+		t.Cleanup(cfgCancel)
+		cfg.Folder = "buffered-spool-logical-inventory-" + workload.folder
+		cfg.Filesystem = workload.filesystem
+		cfg.Hashers = window
+		cfg.SourceHashFolder = SourceHashFolder{
+			ID:       workload.folder,
+			Priority: workload.priority,
+		}
+		cfg.SourceHashCoordinator = coordinator
+
+		ctx, cancel := context.WithCancel(t.Context())
+		workload.cancel = cancel
+		workload.walkResult = Walk(ctx, cfg)
+		awaitScannerSignal(t, workload.walkResult.TraversalDone, workload.folder+" synthetic logical inventory traversal")
+		for range window {
+			if got := awaitCoordinatorStart(t, coordinator.submitted); got != workload.folder {
+				t.Fatalf("bounded Source Hash Work submission = %q, want %s", got, workload.folder)
+			}
+		}
+		if workload.folder == "low" {
+			for range window {
+				if got := awaitCoordinatorStart(t, started); got != "low" {
+					t.Fatalf("initial synthetic Hashing Quantum = %q, want Low", got)
+				}
+			}
+		}
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("synthetic High workload preempted active Low Hashing Quantum with %q", got)
+	default:
+	}
+	provider := coordinator.SourceHashCoordinator.(SourceHashWorkStateProvider)
+	lowState := provider.SourceHashWorkState("low")
+	highState := provider.SourceHashWorkState("high")
+	if lowState.Active != window || lowState.Queued != lowFiles-window {
+		t.Fatalf("Low synthetic coordinator state = %#v, want %d active and %d queued", lowState, window, lowFiles-window)
+	}
+	if highState.Active != 0 || highState.Queued != highFiles {
+		t.Fatalf("High synthetic coordinator state = %#v, want zero active and %d queued", highState, highFiles)
+	}
+	if lowState.RetainedHandles != window || lowState.RetainedHandleBudget != window+sourceHashLookahead {
+		t.Fatalf("synthetic retained-handle state = %#v, want %d retained within budget %d", lowState, window, window+sourceHashLookahead)
+	}
+	if got := coordinator.enrolled.Load(); got != 2*window {
+		t.Fatalf("real coordinator owns %d synthetic files, want fixed multi-Folder window %d", got, 2*window)
+	}
+	if got := coordinator.peak.Load(); got > 2*window {
+		t.Fatalf("real coordinator peak enrollment = %d, want at most fixed window %d", got, 2*window)
+	}
+
+	releases["low"] <- struct{}{}
+	if got := awaitCoordinatorStart(t, started); got != "high" {
+		t.Fatalf("synthetic admission after Low quantum = %q, want High", got)
+	}
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	var retained uint64
+	if after.HeapAlloc > before.HeapAlloc {
+		retained = after.HeapAlloc - before.HeapAlloc
+	}
+	if retained > maxRetainedBytes {
+		t.Fatalf("buffered discovery retained %d bytes for %d files, want at most %d", retained, lowFiles+highFiles, maxRetainedBytes)
+	}
+	for _, workload := range workloads {
+		if got := workload.filesystem.opens.Load(); got != 0 {
+			t.Fatalf("%s buffered discovery opened %d real source handles, want zero", workload.folder, got)
+		}
+	}
+	if logicalBytes := int64(lowFiles) * logicalFileSize; logicalBytes != 5<<40 {
+		t.Fatalf("Low synthetic inventory = %d bytes, want 5 TiB", logicalBytes)
+	}
+	if logicalBytes := int64(highFiles) * logicalFileSize; logicalBytes != 50<<30 {
+		t.Fatalf("High synthetic workload = %d bytes, want 50 GiB", logicalBytes)
+	}
+
+	for _, workload := range workloads {
+		workload.cancel()
+	}
+	for _, workload := range workloads {
+		for range workload.walkResult.Results {
+		}
+	}
+	if got := coordinator.enrolled.Load(); got != 0 {
+		t.Fatalf("real coordinator retained %d synthetic files after cancellation", got)
+	}
+	for _, folder := range []string{"low", "high"} {
+		if got := provider.SourceHashWorkState(folder); got.Active != 0 || got.Queued != 0 || got.RetainedHandles != 0 {
+			t.Fatalf("%s synthetic state after cancellation = %#v, want drained state", folder, got)
+		}
+	}
+}
+
+func TestBufferedWalkPreservesFinalScanProgressTotals(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for name, data := range map[string][]byte{
+		"a": []byte("abc"),
+		"b": []byte("12345"),
+	} {
+		if err := fs.WriteFile(underlying, name, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "buffered-spool-progress"
+	cfg.Filesystem = underlying
+	cfg.ProgressTickIntervalS = 1
+	sub := cfg.EventLogger.Subscribe(events.FolderScanProgress)
+	defer sub.Unsubscribe()
+	walkResult := Walk(t.Context(), cfg)
+	for result := range walkResult.Results {
+		if result.Err != nil {
+			t.Fatal(result.Err)
+		}
+	}
+
+	select {
+	case event := <-sub.C():
+		data, ok := event.Data.(map[string]any)
+		if !ok {
+			t.Fatalf("progress event data = %T, want map", event.Data)
+		}
+		if got, want := data["folder"], cfg.Folder; got != want {
+			t.Fatalf("progress folder = %v, want %v", got, want)
+		}
+		if got, want := data["current"], int64(8); got != want {
+			t.Fatalf("progress current = %v, want %v", got, want)
+		}
+		if got, want := data["total"], int64(9); got != want {
+			t.Fatalf("progress total = %v, want %v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for final buffered progress event")
+	}
+}
+
+func TestBufferedWalkReportsSpooledSourceHashWorkAndCleansUpState(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	for _, name := range []string{"payload", "waiting"} {
+		if err := fs.WriteFile(underlying, name, make([]byte, protocol.MinBlockSize), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-readRelease:
+		default:
+			close(readRelease)
+		}
+	})
+	now := time.Unix(1_000, 0)
+	coordinator := NewSourceHashCoordinator(1)
+	coordinator.(*sourceHashCoordinator).now = func() time.Time { return now }
+	provider := coordinator.(SourceHashWorkStateProvider)
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "alpha"
+	cfg.Filesystem = &sourceHashStateBarrierFilesystem{
+		Filesystem: underlying,
+		started:    readStarted,
+		release:    readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.SourceHashFolder = SourceHashFolder{ID: "alpha"}
+	cfg.SourceHashCoordinator = coordinator
+	cfg.ProgressTickIntervalS = 1
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "buffered traversal completion")
+	awaitScannerSignal(t, readStarted, "buffered Source Hash Work admission")
+	now = now.Add(7 * time.Second)
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 1 || got.Queued != 1 || got.OldestSchedulingWaitSeconds != 7 || got.RetainedHandles != 1 {
+		t.Fatalf("buffered Source Hash Work state = %#v, want one active, one waiting, seven seconds wait, and one handle", got)
+	}
+
+	cancel()
+	close(readRelease)
+	for range walkResult.Results {
+	}
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 0 || got.Queued != 0 || got.OldestSchedulingWaitSeconds != 0 || got.RetainedHandles != 0 {
+		t.Fatalf("buffered Source Hash Work state after cleanup = %#v", got)
+	}
+}
+
+func TestBufferedWalkReportsSpooledSourceHashWorkDuringTraversal(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", make([]byte, protocol.MinBlockSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	traversalBlocked := make(chan struct{})
+	traversalRelease := make(chan struct{})
+	spooled := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-traversalRelease:
+		default:
+			close(traversalRelease)
+		}
+	})
+	now := time.Unix(1_000, 0)
+	coordinator := NewSourceHashCoordinator(1)
+	concrete := coordinator.(*sourceHashCoordinator)
+	concrete.now = func() time.Time { return now }
+	provider := coordinator.(SourceHashWorkStateProvider)
+	observedCoordinator := &discoverySpoolObservationCoordinator{
+		SourceHashCoordinator: coordinator,
+		spooled:               spooled,
+	}
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Folder = "alpha"
+	cfg.Filesystem = &discoverySpoolObservationFilesystem{
+		Filesystem: underlying,
+		path:       "payload",
+		spooled:    spooled,
+		blocked:    traversalBlocked,
+		release:    traversalRelease,
+	}
+	cfg.Hashers = 1
+	cfg.SourceHashFolder = SourceHashFolder{ID: "alpha"}
+	cfg.SourceHashCoordinator = observedCoordinator
+	cfg.ProgressTickIntervalS = 1
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := Walk(ctx, cfg)
+
+	awaitScannerSignal(t, traversalBlocked, "discovery spool observation during traversal")
+	now = now.Add(6 * time.Second)
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 0 || got.Queued != 1 || got.OldestSchedulingWaitSeconds != 6 {
+		t.Fatalf("Source Hash Work state during buffered traversal = %#v, want one waiting for six seconds", got)
+	}
+
+	cancel()
+	close(traversalRelease)
+	for range walkResult.Results {
+	}
+	if got := provider.SourceHashWorkState("alpha"); got.Active != 0 || got.Queued != 0 || got.OldestSchedulingWaitSeconds != 0 {
+		t.Fatalf("Source Hash Work state after traversal cancellation = %#v", got)
+	}
+}
+
+func TestStreamingWalkSignalsTraversalBeforeHashingCompletes(t *testing.T) {
+	testWalkSignalsTraversalBeforeHashingCompletes(t, -1)
+}
+
+func TestStreamingWalkRunsDiscoveredFileDuringTraversalWithoutSpool(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", make([]byte, 128<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	traversalBlocked := make(chan struct{})
+	traversalRelease := make(chan struct{})
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	before := discoverySpoolSnapshot(t)
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Folder = "streaming-without-spool"
+	cfg.Filesystem = &readBarrierFilesystem{
+		Filesystem: &walkBarrierFilesystem{
+			Filesystem: underlying,
+			path:       "payload",
+			blocked:    traversalBlocked,
+			release:    traversalRelease,
+		},
+		started: readStarted,
+		release: readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.ProgressTickIntervalS = -1
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, traversalBlocked, "streaming traversal barrier")
+	awaitScannerSignal(t, readStarted, "streaming hashing during traversal")
+	assertNoNewDiscoverySpool(t, before)
+	close(traversalRelease)
+	close(readRelease)
+	for range walkResult.Results {
+	}
+}
+
+func TestWalkWithoutHashingCancellationClosesResultsWhenConsumerStops(t *testing.T) {
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, cfgCancel := testConfig()
+	defer cfgCancel()
+	cfg.Filesystem = underlying
+	ctx, cancel := context.WithCancel(t.Context())
+	walkResult := WalkWithoutHashing(ctx, cfg)
+
+	// Traversal completion proves the forwarding routine has accepted the only
+	// discovered file and is waiting for a result consumer.
+	awaitScannerSignal(t, walkResult.TraversalDone, "traversal completion")
+	cancel()
+	resultsAfterCancel := 0
+	for {
+		select {
+		case _, ok := <-walkResult.Results:
+			if !ok {
+				if resultsAfterCancel > 1 {
+					t.Fatalf("got %d results after cancellation, want at most the in-flight result", resultsAfterCancel)
+				}
+				return
+			}
+			resultsAfterCancel++
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for cancelled scan results to close")
+		}
+	}
+}
+
+func TestEmptyWalkClosesTraversalAndResults(t *testing.T) {
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Filesystem = fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "empty traversal completion")
+	if result, ok := <-walkResult.Results; ok {
+		t.Fatalf("empty scan returned a result: %v", result)
+	}
+}
+
+func TestFailedWalkClosesTraversalAndResults(t *testing.T) {
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Filesystem = fs.NewFilesystem(fs.FilesystemType("error"), ".")
+	walkResult := Walk(t.Context(), cfg)
+	resultsDone := make(chan struct{})
+	go func() {
+		for range walkResult.Results {
+		}
+		close(resultsDone)
+	}()
+
+	awaitScannerSignal(t, walkResult.TraversalDone, "failed traversal completion")
+	awaitScannerSignal(t, resultsDone, "failed scan result closure")
+}
+
+func testWalkSignalsTraversalBeforeHashingCompletes(t *testing.T, progressTickInterval int) {
+	t.Helper()
+	underlying := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(16)+"?content=true")
+	if err := fs.WriteFile(underlying, "payload", make([]byte, 128<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-readRelease:
+		default:
+			close(readRelease)
+		}
+	})
+
+	cfg, cancel := testConfig()
+	defer cancel()
+	cfg.Filesystem = &readBarrierFilesystem{
+		Filesystem: underlying,
+		started:    readStarted,
+		release:    readRelease,
+	}
+	cfg.Hashers = 1
+	cfg.ProgressTickIntervalS = progressTickInterval
+	walkResult := Walk(t.Context(), cfg)
+
+	awaitScannerSignal(t, readStarted, "hashing to start")
+	awaitScannerSignal(t, walkResult.TraversalDone, "traversal completion")
+	select {
+	case result, ok := <-walkResult.Results:
+		t.Fatalf("scan result arrived while hashing was paused: %v, open=%v", result, ok)
+	default:
+	}
+
+	close(readRelease)
+	var results []ScanResult
+	for result := range walkResult.Results {
+		results = append(results, result)
+	}
+	if len(results) != 1 || results[0].Err != nil || results[0].File.Name != "payload" {
+		t.Fatalf("scan results = %v, want one completed payload", results)
+	}
+}
+
+type readBarrierFilesystem struct {
+	fs.Filesystem
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type sourceHashStateBarrierFilesystem struct {
+	fs.Filesystem
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type discoverySpoolObservationFilesystem struct {
+	fs.Filesystem
+	path    string
+	spooled <-chan struct{}
+	blocked chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+type discoverySpoolObservationCoordinator struct {
+	SourceHashCoordinator
+	spooled chan struct{}
+	once    sync.Once
+}
+
+type discoverySpoolObservationEpoch struct {
+	SourceHashEpoch
+	owner *discoverySpoolObservationCoordinator
+}
+
+type walkBarrierFilesystem struct {
+	fs.Filesystem
+	path    string
+	blocked chan struct{}
+	release chan struct{}
+	walkErr error
+	once    sync.Once
+}
+
+type openErrorFilesystem struct {
+	fs.Filesystem
+	path string
+	err  error
+}
+
+type logicalInventoryFilesystem struct {
+	fs.Filesystem
+	files    int
+	fileSize int64
+	opens    atomic.Int64
+}
+
+func (f *logicalInventoryFilesystem) Walk(_ string, walkFn fs.WalkFunc) error {
+	if err := walkFn(".", fakeInfo{name: "."}, nil); err != nil {
+		return err
+	}
+	for i := range f.files {
+		name := fmt.Sprintf("file-%08d-%0240d", i, i)
+		if err := walkFn(name, fakeInfo{name: name, size: f.fileSize}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *logicalInventoryFilesystem) Open(string) (fs.File, error) {
+	f.opens.Add(1)
+	return nil, errors.New("synthetic source must not open during discovery")
+}
+
+func (*logicalInventoryFilesystem) PlatformData(string, bool, bool, fs.XattrFilter) (protocol.PlatformData, error) {
+	return protocol.PlatformData{}, nil
+}
+
+type inventorySourceHashCoordinator struct {
+	SourceHashCoordinator
+	submitted chan string
+	started   chan string
+	releases  map[string]<-chan struct{}
+	enrolled  atomic.Int64
+	peak      atomic.Int64
+}
+
+func (c *inventorySourceHashCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
+	request.Work.Close()
+	request.Work = &inventorySourceHashWork{
+		folder:  request.Folder.ID,
+		started: c.started,
+		release: c.releases[request.Folder.ID],
+	}
+	submission := c.SourceHashCoordinator.Submit(ctx, request)
+	current := c.enrolled.Add(1)
+	for peak := c.peak.Load(); current > peak && !c.peak.CompareAndSwap(peak, current); peak = c.peak.Load() {
+	}
+	select {
+	case c.submitted <- request.Folder.ID:
+	default:
+	}
+
+	completion := make(chan SourceHashCompletion, 1)
+	go func() {
+		result, ok := <-submission.Completion
+		if ok {
+			completion <- result
+		}
+		close(completion)
+		c.enrolled.Add(-1)
+	}()
+	return SourceHashSubmission{Admitted: submission.Admitted, Completion: completion}
+}
+
+type inventorySourceHashWork struct {
+	folder   string
+	started  chan<- string
+	release  <-chan struct{}
+	retained atomic.Bool
+}
+
+func (w *inventorySourceHashWork) HashNext(ctx context.Context) (HashingQuantumResult, error) {
+	w.retained.Store(true)
+	select {
+	case w.started <- w.folder:
+	case <-ctx.Done():
+		return HashingQuantumResult{}, ctx.Err()
+	}
+	select {
+	case <-w.release:
+		return HashingQuantumResult{
+			Bytes: 1,
+			Done:  true,
+			File:  protocol.FileInfo{Name: "synthetic-" + w.folder},
+		}, nil
+	case <-ctx.Done():
+		return HashingQuantumResult{}, ctx.Err()
+	}
+}
+
+func (*inventorySourceHashWork) NextHashingQuantumBytes() int64 {
+	return 1
+}
+
+func (w *inventorySourceHashWork) RetainedHandle() bool {
+	return w.retained.Load()
+}
+
+func (w *inventorySourceHashWork) ReleaseRetainedHandle() {
+	w.retained.Store(false)
+}
+
+func (w *inventorySourceHashWork) Close() {
+	w.retained.Store(false)
+}
+
+func (f *openErrorFilesystem) Open(name string) (fs.File, error) {
+	if name == f.path {
+		return nil, f.err
+	}
+	return f.Filesystem.Open(name)
+}
+
+func (f *walkBarrierFilesystem) Walk(root string, walkFn fs.WalkFunc) error {
+	err := f.Filesystem.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		walkErr := walkFn(path, info, err)
+		if path == f.path {
+			f.once.Do(func() {
+				close(f.blocked)
+				<-f.release
+			})
+		}
+		return walkErr
+	})
+	if err != nil {
+		return err
+	}
+	return f.walkErr
+}
+
+func (f *readBarrierFilesystem) Open(name string) (fs.File, error) {
+	file, err := f.Filesystem.Open(name)
+	if err != nil {
+		return file, err
+	}
+	return &readBarrierFile{File: file, owner: f}, nil
+}
+
+func (f *sourceHashStateBarrierFilesystem) Open(name string) (fs.File, error) {
+	file, err := f.Filesystem.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &sourceHashStateBarrierFile{File: file, owner: f}, nil
+}
+
+func (f *discoverySpoolObservationFilesystem) Walk(root string, walkFn fs.WalkFunc) error {
+	return f.Filesystem.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		walkErr := walkFn(path, info, err)
+		if path == f.path {
+			f.once.Do(func() {
+				<-f.spooled
+				close(f.blocked)
+				<-f.release
+			})
+		}
+		return walkErr
+	})
+}
+
+func (c *discoverySpoolObservationCoordinator) BeginSourceHashEpoch(folder SourceHashFolder) SourceHashEpoch {
+	return &discoverySpoolObservationEpoch{
+		SourceHashEpoch: c.SourceHashCoordinator.BeginSourceHashEpoch(folder),
+		owner:           c,
+	}
+}
+
+func (c *discoverySpoolObservationCoordinator) Submit(ctx context.Context, request SourceHashRequest) SourceHashSubmission {
+	if epoch, ok := request.DiscoverySpoolEpoch.(*discoverySpoolObservationEpoch); ok {
+		request.DiscoverySpoolEpoch = epoch.SourceHashEpoch
+	}
+	return c.SourceHashCoordinator.Submit(ctx, request)
+}
+
+func (e *discoverySpoolObservationEpoch) SetDiscoverySpoolSourceHashWork(count int) {
+	e.SourceHashEpoch.(interface{ SetDiscoverySpoolSourceHashWork(int) }).SetDiscoverySpoolSourceHashWork(count)
+	if count > 0 {
+		e.owner.once.Do(func() { close(e.owner.spooled) })
+	}
+}
+
+type sourceHashStateBarrierFile struct {
+	fs.File
+	owner *sourceHashStateBarrierFilesystem
+}
+
+func (f *sourceHashStateBarrierFile) Read(buf []byte) (int, error) {
+	f.owner.once.Do(func() {
+		close(f.owner.started)
+		<-f.owner.release
+	})
+	return f.File.Read(buf)
+}
+
+type readBarrierFile struct {
+	fs.File
+	owner *readBarrierFilesystem
+}
+
+func (f *readBarrierFile) Read(buf []byte) (int, error) {
+	f.owner.once.Do(func() {
+		close(f.owner.started)
+		<-f.owner.release
+	})
+	return f.File.Read(buf)
+}
+
+func awaitScannerSignal(t *testing.T, done <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func discoverySpoolSnapshot(t *testing.T) map[string]struct{} {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(os.TempDir(), "syncthing-discovery-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		snapshot[path] = struct{}{}
+	}
+	return snapshot
+}
+
+func newDiscoverySpools(t *testing.T, before map[string]struct{}) []string {
+	t.Helper()
+	var discovered []string
+	for path := range discoverySpoolSnapshot(t) {
+		if _, ok := before[path]; !ok {
+			discovered = append(discovered, path)
+		}
+	}
+	return discovered
+}
+
+func awaitNewDiscoverySpool(t *testing.T, before map[string]struct{}) string {
+	t.Helper()
+	paths := newDiscoverySpools(t, before)
+	if len(paths) != 0 {
+		return paths[0]
+	}
+	t.Fatal("buffered scan did not create a discovery spool")
+	return ""
+}
+
+func assertNoNewDiscoverySpool(t *testing.T, before map[string]struct{}) {
+	t.Helper()
+	if paths := newDiscoverySpools(t, before); len(paths) != 0 {
+		t.Fatalf("streaming scan created discovery spools %q", paths)
 	}
 }
 
@@ -807,7 +1765,7 @@ func TestIssue4841(t *testing.T) {
 		Version:    protocol.Vector{}.Update(1),
 	}}
 	cfg.ShortID = protocol.LocalDeviceID.Short()
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 
 	var files []protocol.FileInfo
 	for f := range fchan {
@@ -837,7 +1795,7 @@ func TestNotExistingError(t *testing.T) {
 	cfg, cancel := testConfig()
 	defer cancel()
 	cfg.Subs = []string{sub}
-	fchan := Walk(context.TODO(), cfg)
+	fchan := Walk(context.TODO(), cfg).Results
 	for f := range fchan {
 		t.Fatalf("Expected no result from scan, got %v", f)
 	}
@@ -906,7 +1864,7 @@ func TestIncludedSubdir(t *testing.T) {
 		CurrentFiler: make(fakeCurrentFiler),
 		Filesystem:   fss,
 		Matcher:      pats,
-	})
+	}).Results
 
 	found := false
 	for f := range fchan {
