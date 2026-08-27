@@ -622,13 +622,15 @@ jobs:
           go mod vendor
           go run build.go assets
 
+          source_dir="${GITHUB_WORKSPACE##*/}"
           cd ..
 
           tar c -z -f "syncthing-source-$VERSION.tar.gz" \
             --exclude .git \
-            syncthing
+            --transform "s|^${source_dir}|syncthing|" \
+            "$source_dir"
 
-          mv "syncthing-source-$VERSION.tar.gz" syncthing
+          mv "syncthing-source-$VERSION.tar.gz" "$GITHUB_WORKSPACE"
 
       - name: Archive artifacts
         uses: actions/upload-artifact@v4
